@@ -1,6 +1,6 @@
 # Madeira
-##  shoutout to @willfaust for taking ios emulation to the next level.
-##  this is a fork of his app to just fuck around and test some things.
+##  shoutout to [willfaust](https://github.com/willfaust) for taking ios emulation to the next level.
+this is a fork of his app to just fuck around and test some things.
 
 Run Windows PC games on a non-jailbroken iPhone.
 
