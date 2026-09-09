@@ -1,5 +1,6 @@
 # Madeira
-## I, Justin Theberge Jr, did not invent this project and I normally do not contribute by vibecoding but this is just for a good bit of fun and studying how to use AI as it'll be required for my university classes.
+##  shoutout to @willfaust for taking ios emulation to the next level.
+##  this is a fork of his app to just fuck around and test some things.
 
 Run Windows PC games on a non-jailbroken iPhone.
 
