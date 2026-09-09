@@ -851,6 +851,7 @@ struct ContentView: View {
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
     @ObservedObject private var touchControls = TouchControlsModel.shared
+    @ObservedObject private var perf = PerfMonitor.shared
     @State private var pointerPanel = false
     @State private var selectedTab: MadeiraTab = .library
     @State private var developerToolsExpanded = false
@@ -860,6 +861,7 @@ struct ContentView: View {
     @State private var prefixSizeText = "Calculating…"
     @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
+    @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -1205,6 +1207,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
         .statusBarHidden(true)
+        .perfMonitored()
         .onAppear {
             MetalHostView.shared.isHidden = false
             touchControls.fullScreen = true
@@ -1314,6 +1317,15 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                Section("Performance Overlay") {
+                    Toggle(isOn: $perfOverlayEnabled) {
+                        Label("Show FPS, memory and thermal readout", systemImage: "gauge.with.dots.needle.67percent")
+                    }
+                    Text("Shown beside the game surface and in full screen. Memory and thermal warnings are still logged and shown as a banner when the readout is off.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Help") {
                     NavigationLink {
                         SetupGuideView()
@@ -1368,12 +1380,26 @@ struct ContentView: View {
             }
             .padding(.horizontal)
 
+            // Warning banner sits ABOVE the surface, never over it: the
+            // Metal host is a window-level view that covers anything drawn
+            // on top of the game area.
+            PerfWarningBanner()
+                .padding(.horizontal)
+                .animation(.easeInOut(duration: 0.25), value: perf.warning)
+                .animation(.easeInOut(duration: 0.25), value: perf.warningDismissed)
+
             MadeiraMetalView()
                 .frame(maxWidth: .infinity)
                 .frame(height: hSizeClass == .regular ? 520 : 360)
                 .background(Color.black)
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
                 .padding(.horizontal)
+
+            if perfOverlayEnabled {
+                FPSOverlay()
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal)
+            }
 
             activityControls
 
@@ -1409,6 +1435,7 @@ struct ContentView: View {
         }
         .padding(.top, 8)
         .background(Color(uiColor: .systemGroupedBackground))
+        .perfMonitored()
     }
 
     private var activityControls: some View {
@@ -1465,6 +1492,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
         .background(Color.black)
+        .perfMonitored()
     }
 
     /// Hold-to-press key: VK down on touch, VK up on release — for keys
@@ -3193,6 +3221,8 @@ enum TouchControlsHost {
 
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
+    @ObservedObject private var perf = PerfMonitor.shared
+    @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     @State private var pinchBase: Double?
 
     var body: some View {
@@ -3204,6 +3234,24 @@ struct TouchControlsOverlay: View {
                             TouchControlButton(control: c, screen: geo.size)
                         }
                     }
+                    // Performance HUD: this window is the only thing that
+                    // draws above the window-level Metal host, so full
+                    // screen readouts and warnings have to live here. Kept
+                    // inside the top 100pt band that ControlsWindow.hitTest
+                    // reserves for the toolbar, so the pacing pill and the
+                    // banner's dismiss button stay tappable.
+                    HStack(alignment: .top, spacing: 10) {
+                        if perfOverlayEnabled {
+                            FPSOverlay()
+                        }
+                        PerfWarningBanner()
+                            .frame(maxWidth: 340)
+                    }
+                    .padding(.top, geo.safeAreaInsets.top + 10)
+                    .padding(.leading, geo.safeAreaInsets.leading + 12)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .animation(.easeInOut(duration: 0.25), value: perf.warning)
+                    .animation(.easeInOut(duration: 0.25), value: perf.warningDismissed)
                     topBar
                         .padding(.top, geo.safeAreaInsets.top + 10)
                         .padding(.trailing, geo.safeAreaInsets.trailing + 12)
@@ -3230,6 +3278,11 @@ struct TouchControlsOverlay: View {
             glassButton("gamecontroller", dim: !m.visible) {
                 m.visible.toggle()
                 if m.visible { m.ensureDefaultLayout() }
+            }
+            // Performance overlay on/off. Same UserDefaults key as the
+            // Settings toggle, so the two stay in sync.
+            glassButton("gauge.with.dots.needle.67percent", dim: !perfOverlayEnabled) {
+                perfOverlayEnabled.toggle()
             }
             if m.visible {
                 glassButton(m.editing ? "checkmark" : "pencil") {

@@ -29,97 +29,76 @@ final class ProMotionIntent {
     @objc private func tick(_ sender: CADisplayLink) {}
 }
 
-/// Small overlay shown over the Metal render view. Reads DXMT's present
-/// counter at 100ms intervals into a 5s rolling buffer, displays current
-/// count + smoothed FPS computed over an adaptive window.
+/// UserDefaults key for the Settings toggle and the full-screen HUD button.
+/// Defaults to on; the value is read wherever the overlay is drawn.
+let perfOverlayEnabledKey = "madeira.perfOverlayEnabled"
+
+/// Small overlay shown beside the Metal render view. All numbers come from
+/// PerfMonitor (FPS over an adaptive window, live phys_footprint, thermal
+/// state, Low Power Mode); this view only lays them out.
 ///
-/// Adaptive display logic:
-///   - Backend always samples every 100ms (50 samples in the 5s buffer).
-///   - Displayed FPS uses a window long enough to contain ≥ ~3 frame samples,
-///     so the readout is stable at any rate. At 60fps the window is ~100ms;
-///     at 1fps it's ~3s.
-///   - Display value refreshes every 250ms regardless.
-///   - Tap to hide.
+///   - Wide variant (portrait, full-screen HUD): one row —
+///     memory | thermal | present count | FPS | pacing pill.
+///   - Compact variant (landscape pillarbox bar, ~120pt): the same
+///     readouts stacked vertically, no present counter.
+///   - Tap the readout to collapse it to a dot; tap the dot to restore.
+///   - Settings → Performance overlay (or the gauge button in full screen)
+///     hides it entirely. Warnings keep flowing to the log and banner.
 struct FPSOverlay: View {
-    /// Compact = landscape side-bar variant: FPS + pacing pill stacked
-    /// vertically, no present counter (fits a ~120pt pillarbox bar).
+    /// Compact = landscape side-bar variant.
     var compact: Bool = false
-    @State private var presentCount: UInt64 = 0
-    @State private var fps: Double = 0
-    @State private var visible: Bool = true
-    @State private var timer: Timer? = nil
-    @State private var displayTimer: Timer? = nil
+    @ObservedObject private var perf = PerfMonitor.shared
+    @AppStorage(perfOverlayEnabledKey) private var enabled = true
+    @State private var collapsed: Bool = false
     /// Mirrors DXMT's g_madeira_vsync_mode (read per present, live-safe).
     /// 1 = locked 60, 0 = display max (120 ProMotion), 2 = raw (frame-skip
     /// mailbox — game unthrottled, panel shows ≤ display rate).
     @State private var vsyncMode: Int32 = 1
-    /// Ring buffer of (timestamp, count) pairs, 100ms cadence, 5s window.
-    @State private var samples: [(t: CFAbsoluteTime, c: UInt64)] = []
-    private let bufferCapacity = 50  // 5s @ 100ms
-    /// ml606: live phys_footprint in MB, refreshed on the 250ms display tick.
-    @State private var memMB: Int = 0
-
-    /// iOS jetsams this app at EXACTLY 4096MB of phys_footprint (memory:
-    /// "Jetsam = EXACTLY 4096MB"). task_info(TASK_VM_INFO) reports the very
-    /// same counter the kernel judges us on, so this is the real number and
-    /// not an approximation from resident size.
-    private static let jetsamLimitMB = 4096
-
-    private func readFootprintMB() -> Int {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
-        let kr = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return 0 }
-        return Int(info.phys_footprint / (1024 * 1024))
-    }
-
-    /// Headroom-based, because the absolute number means nothing without the
-    /// ceiling: green >768MB free, yellow >384MB, orange >128MB, red below.
-    private var memColor: Color {
-        let free = Self.jetsamLimitMB - memMB
-        if memMB == 0 { return .secondary }
-        if free > 768 { return .green }
-        if free > 384 { return .yellow }
-        if free > 128 { return .orange }
-        return .red
-    }
 
     var body: some View {
         Group {
-            if visible && compact {
+            if !enabled {
+                EmptyView()
+            } else if collapsed {
+                Circle()
+                    .fill(Color.black.opacity(0.3))
+                    .frame(width: 12, height: 12)
+                    .contentShape(Circle().scale(2.5))
+                    .onTapGesture { collapsed = false }
+            } else if compact {
                 VStack(spacing: 4) {
-                    Text(String(format: "%.1f", fps))
+                    Text(String(format: "%.1f", perf.fps))
                         .foregroundColor(fpsColor)
+                    Text("\(perf.memMB)M")
+                        .foregroundColor(perf.memColor)
+                    thermalBadge
                     pacingPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
                 .background(Color.black.opacity(0.55))
                 .cornerRadius(6)
-            } else if visible {
+                .onTapGesture { collapsed = true }
+            } else {
                 HStack(spacing: 8) {
-                    // ml606: live phys_footprint — the SAME number jetsam kills on.
-                    // ml605 died at 4080MB against a 4096MB limit with no warning
-                    // of any kind in the log, so having it on screen turns "it
-                    // vanished" into "we watched it climb".
-                    Text("\(memMB)MB")
-                        .foregroundColor(memColor)
+                    // Live phys_footprint — the SAME number jetsam kills on.
+                    // ml605 died at 4080MB against a 4096MB limit with no
+                    // warning of any kind in the log, so having it on screen
+                    // turns "it vanished" into "we watched it climb".
+                    Text("\(perf.memMB)MB")
+                        .foregroundColor(perf.memColor)
                         .frame(width: 56, alignment: .trailing)
-                    Text("|")
-                        .foregroundColor(.secondary)
+                    divider
+                    thermalBadge
+                    divider
                     Text("Present:")
                         .foregroundColor(.secondary)
-                    Text("\(presentCount)")
+                    Text("\(perf.presentCount)")
                         .foregroundColor(.primary)
-                    Text("|")
-                        .foregroundColor(.secondary)
+                    divider
                     Text("FPS:")
                         .foregroundColor(.secondary)
-                    Text(String(format: "%.1f", fps))
+                    Text(String(format: "%.1f", perf.fps))
                         .foregroundColor(fpsColor)
                         .frame(width: 40, alignment: .trailing)
                     pacingPill
@@ -129,15 +108,35 @@ struct FPSOverlay: View {
                 .padding(.vertical, 4)
                 .background(Color.black.opacity(0.55))
                 .cornerRadius(6)
-            } else {
-                Circle()
-                    .fill(Color.black.opacity(0.3))
-                    .frame(width: 12, height: 12)
+                .onTapGesture { collapsed = true }
             }
         }
-        .onTapGesture { visible.toggle() }
-        .onAppear { startTimers() }
-        .onDisappear { stopTimers() }
+        .onAppear {
+            perf.start()
+            vsyncMode = madeira_get_vsync_locked()
+            ProMotionIntent.shared.setActive(vsyncMode != 1)
+        }
+        .onDisappear { perf.stop() }
+    }
+
+    private var divider: some View {
+        Text("|").foregroundColor(.secondary)
+    }
+
+    /// Thermometer glyph + state word, coloured by ProcessInfo.thermalState.
+    /// "LPM" is appended while Low Power Mode is on, because it caps the
+    /// panel at 60 Hz exactly like a serious thermal state does and the
+    /// pacing pill would otherwise look broken.
+    private var thermalBadge: some View {
+        HStack(spacing: 2) {
+            Image(systemName: perf.thermalSymbol)
+                .font(.system(size: 10))
+            Text(perf.thermalLabel)
+            if perf.lowPower {
+                Text("LPM").foregroundColor(.yellow)
+            }
+        }
+        .foregroundColor(perf.thermalColor)
     }
 
     /// Pacing pill, cycles 60 → MAX(n) → RAW → 60. Shared by the wide
@@ -178,74 +177,11 @@ struct FPSOverlay: View {
     }
 
     private var fpsColor: Color {
+        let fps = perf.fps
         if fps >= 50 { return .green }
         if fps >= 30 { return .yellow }
         if fps >= 1  { return .orange }
         if fps > 0   { return Color(red: 1.0, green: 0.4, blue: 0.2) }
         return .secondary
-    }
-
-    private func startTimers() {
-        stopTimers()
-        let now = CFAbsoluteTimeGetCurrent()
-        let c = madeira_get_present_count()
-        samples = [(now, c)]
-        presentCount = c
-        vsyncMode = madeira_get_vsync_locked()
-        ProMotionIntent.shared.setActive(vsyncMode != 1)
-
-        // 100ms sampling — keeps the buffer fresh
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            let t = CFAbsoluteTimeGetCurrent()
-            let cur = madeira_get_present_count()
-            samples.append((t, cur))
-            if samples.count > bufferCapacity { samples.removeFirst() }
-            presentCount = cur
-        }
-
-        // 250ms display refresh — computes adaptive-window FPS
-        memMB = readFootprintMB()
-        displayTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
-            fps = computeAdaptiveFPS()
-            // ml606: piggybacks on the existing tick, so it costs one extra
-            // task_info per 250ms and no additional SwiftUI invalidation.
-            memMB = readFootprintMB()
-        }
-    }
-
-    private func stopTimers() {
-        timer?.invalidate()
-        timer = nil
-        displayTimer?.invalidate()
-        displayTimer = nil
-    }
-
-    /// Compute FPS over an adaptive window: starting from the newest sample,
-    /// walk backwards until the window holds ≥3 presents AND spans ≥1s (or we
-    /// hit buffer start). The 1s minimum matters: with 100ms sampling, a
-    /// short window quantizes the readout to presents/0.2s = multiples of
-    /// 5.0 — at a true ~19 FPS it displayed a rock-steady "20.0" (4 presents
-    /// per 0.2s) with "dips" to 15.0, which read as an artificial frame lock
-    /// (2026-07-04, cost a day of pacing-hunt confusion). ≥1s gives 1-FPS
-    /// resolution; still responsive for a debug readout.
-    private func computeAdaptiveFPS() -> Double {
-        guard samples.count >= 2 else { return 0 }
-        let latest = samples.last!
-        // Walk backwards
-        var oldest = samples[0]
-        for i in (0..<samples.count).reversed() {
-            let candidate = samples[i]
-            let delta = latest.c &- candidate.c
-            let span = latest.t - candidate.t
-            if delta >= 3 && span >= 1.0 {
-                oldest = candidate
-                break
-            }
-            oldest = candidate
-        }
-        let dt = latest.t - oldest.t
-        let dc = latest.c &- oldest.c
-        guard dt > 0.0001 else { return 0 }
-        return Double(dc) / dt
     }
 }
