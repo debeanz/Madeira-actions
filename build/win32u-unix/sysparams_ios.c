@@ -3855,6 +3855,55 @@ static BOOL ios_virtual_monitor_active(void)
     return ret;
 }
 
+/* Standard mode table for the virtual monitor. The old list was 640x480,
+ * 800x600 and the desktop size — three 4:3 entries plus one 16:9 — and
+ * games that keep only modes matching the desktop's aspect (Unity, most
+ * 16:9-native titles) were left with the single desktop entry, so their
+ * resolution menu showed exactly "960x540 @ 60Hz" and nothing else.
+ * Both aspects are listed here; everything is still capped at the
+ * desktop size because larger modes crop on the virtual desktop
+ * surface. 60 Hz only: the panel rate is governed by DXMT's pacing
+ * pill, not by the mode a game picks. */
+struct ios_mode { UINT w, h; };
+static const struct ios_mode ios_mode_table[] =
+{
+    {  640,  360 }, {  640,  480 }, {  800,  450 }, {  800,  600 },
+    {  854,  480 }, {  960,  540 }, { 1024,  576 }, { 1024,  768 },
+    { 1152,  648 }, { 1280,  720 }, { 1280,  800 }, { 1280,  960 },
+    { 1366,  768 }, { 1440,  900 }, { 1600,  900 }, { 1600, 1200 },
+    { 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 }, { 2048, 1152 },
+    { 2560, 1440 },
+};
+
+/* Mode a game selected through ChangeDisplaySettings; 0 = desktop size.
+ * The desktop surface itself does not resize (the compositor and the
+ * SM_C{X,Y}SCREEN metrics stay at MADEIRA_SCREEN_W/H), but a game that
+ * re-queries ENUM_CURRENT_SETTINGS after a successful change must see
+ * what it asked for or it re-applies forever. */
+static UINT ios_current_mode_w, ios_current_mode_h;
+
+static UINT ios_virtual_modes( struct ios_mode *out, UINT max )
+{
+    int sw, sh;
+    UINT i, n = 0;
+    BOOL have_desktop = FALSE;
+
+    ios_screen_size( &sw, &sh );
+    for (i = 0; i < ARRAY_SIZE(ios_mode_table) && n < max; i++)
+    {
+        if (ios_mode_table[i].w > (UINT)sw || ios_mode_table[i].h > (UINT)sh) continue;
+        if (ios_mode_table[i].w == (UINT)sw && ios_mode_table[i].h == (UINT)sh) have_desktop = TRUE;
+        out[n++] = ios_mode_table[i];
+    }
+    if (!have_desktop && n < max)
+    {
+        out[n].w = sw;
+        out[n].h = sh;
+        n++;
+    }
+    return n;
+}
+
 static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, DWORD flags )
 {
     int sw, sh;
@@ -3875,36 +3924,102 @@ static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, D
     {
         devmode->dmPelsWidth = sw;
         devmode->dmPelsHeight = sh;
+        if (index == ENUM_CURRENT_SETTINGS && ios_current_mode_w && ios_current_mode_h)
+        {
+            devmode->dmPelsWidth = ios_current_mode_w;
+            devmode->dmPelsHeight = ios_current_mode_h;
+        }
         {
             static int logged;
             if (logged++ < 4)
-                dprintf(2, "[vmode] synthesized %s = %dx%d\n",
-                        index == ENUM_CURRENT_SETTINGS ? "CURRENT" : "REGISTRY", sw, sh);
+                dprintf(2, "[vmode] synthesized %s = %ux%u (desktop %dx%d)\n",
+                        index == ENUM_CURRENT_SETTINGS ? "CURRENT" : "REGISTRY",
+                        (unsigned)devmode->dmPelsWidth, (unsigned)devmode->dmPelsHeight, sw, sh);
         }
         return TRUE;
     }
     if (index == WINE_ENUM_PHYSICAL_SETTINGS) return FALSE;
 
     {
-        /* Classic small modes + the desktop resolution (deduped). Nothing
-         * LARGER than the desktop — bigger modes crop on the virtual
-         * desktop surface. */
-        UINT widths[3]  = {640, 800, 0};
-        UINT heights[3] = {480, 600, 0};
-        UINT count = 2;
-        if (!((sw == 640 && sh == 480) || (sw == 800 && sh == 600)))
-        {
-            widths[2] = sw; heights[2] = sh; count = 3;
-        }
+        struct ios_mode modes[ARRAY_SIZE(ios_mode_table) + 1];
+        UINT count = ios_virtual_modes( modes, ARRAY_SIZE(modes) );
         if (idx >= count)
         {
             RtlSetLastWin32Error( ERROR_NO_MORE_FILES );
             return FALSE;
         }
-        devmode->dmPelsWidth = widths[idx];
-        devmode->dmPelsHeight = heights[idx];
+        devmode->dmPelsWidth = modes[idx].w;
+        devmode->dmPelsHeight = modes[idx].h;
     }
     return TRUE;
+}
+
+/* ChangeDisplaySettings on the virtual monitor. Previously any call that
+ * named the display (dxgi's SetFullscreenState and every game that uses
+ * the adapter name from EnumDisplayDevices) fell through to find_source,
+ * which has nothing to find in this regime, and came back BADPARAM — so
+ * exclusive-fullscreen resolution changes always failed. Accept any mode
+ * from the synthesized list, remember it as current, and report success.
+ * No WM_DISPLAYCHANGE broadcast: the desktop surface has not actually
+ * changed size, and explorer resizing its desktop window to a size the
+ * compositor does not know about would be worse than staying put. */
+static LONG ios_virtual_change_display_settings( const DEVMODEW *devmode, DWORD flags )
+{
+    struct ios_mode modes[ARRAY_SIZE(ios_mode_table) + 1];
+    UINT count, i, w, h, cur_w, cur_h;
+    int sw, sh;
+
+    ios_screen_size( &sw, &sh );
+    cur_w = ios_current_mode_w ? ios_current_mode_w : (UINT)sw;
+    cur_h = ios_current_mode_h ? ios_current_mode_h : (UINT)sh;
+
+    if (!devmode)
+    {
+        /* NULL devmode = restore the registry (desktop) mode. */
+        w = sw;
+        h = sh;
+    }
+    else
+    {
+        w = (devmode->dmFields & DM_PELSWIDTH) ? devmode->dmPelsWidth : 0;
+        h = (devmode->dmFields & DM_PELSHEIGHT) ? devmode->dmPelsHeight : 0;
+        if (!w || !h)
+        {
+            /* Frequency- or depth-only change: keep the current size. */
+            w = cur_w;
+            h = cur_h;
+        }
+        if ((devmode->dmFields & DM_BITSPERPEL) && devmode->dmBitsPerPel &&
+            devmode->dmBitsPerPel != 32)
+        {
+            dprintf(STDERR_FILENO, "[vmode] change to %ux%u bpp=%u rejected: 32bpp only\n",
+                    w, h, (unsigned)devmode->dmBitsPerPel);
+            return DISP_CHANGE_BADMODE;
+        }
+        count = ios_virtual_modes( modes, ARRAY_SIZE(modes) );
+        for (i = 0; i < count; i++)
+            if (modes[i].w == w && modes[i].h == h) break;
+        if (i == count)
+        {
+            dprintf(STDERR_FILENO, "[vmode] change to %ux%u rejected: not in mode list (desktop %dx%d)\n",
+                    w, h, sw, sh);
+            return DISP_CHANGE_BADMODE;
+        }
+    }
+
+    if (flags & (CDS_TEST | CDS_NORESET)) return DISP_CHANGE_SUCCESSFUL;
+
+    if (w == cur_w && h == cur_h) return DISP_CHANGE_SUCCESSFUL;
+
+    if (w == (UINT)sw && h == (UINT)sh) ios_current_mode_w = ios_current_mode_h = 0;
+    else
+    {
+        ios_current_mode_w = w;
+        ios_current_mode_h = h;
+    }
+    dprintf(STDERR_FILENO, "[vmode] current mode %ux%u -> %ux%u (desktop %dx%d, flags=%#x)\n",
+            cur_w, cur_h, w, h, sw, sh, (unsigned)flags);
+    return DISP_CHANGE_SUCCESSFUL;
 }
 
 static void monitor_get_interface_name( struct monitor *monitor, WCHAR *interface_name )
@@ -4640,6 +4755,13 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
             (unsigned)flags);
         return DISP_CHANGE_SUCCESSFUL;
     }
+
+#ifdef WINE_IOS
+    /* Virtual-monitor regime: there is no source to find. Validate against
+     * the synthesized mode list instead of failing. */
+    if (ios_virtual_monitor_active())
+        return ios_virtual_change_display_settings( devmode, flags );
+#endif
 
     if (!(source = find_source( devname )))
     {

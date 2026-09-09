@@ -862,6 +862,19 @@ struct ContentView: View {
     @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
+    /// Screen size of the Wine Virtual Desktop launcher, as "WxH". This is
+    /// the display games see: the win32u shim lists every standard mode up
+    /// to this size, so it also bounds what a game's own resolution menu
+    /// can offer.
+    @AppStorage("madeira.desktopResolution") private var desktopResolution = "960x540"
+    private static let desktopResolutions = [
+        "960x540", "1280x720", "1600x900", "1920x1080", "1024x768", "1280x960",
+    ]
+    private var desktopSize: (w: Int, h: Int) {
+        let parts = desktopResolution.split(separator: "x").compactMap { Int($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (960, 540) }
+        return (parts[0], parts[1])
+    }
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -1313,6 +1326,17 @@ struct ContentView: View {
                     LabeledContent("Backend", value: "Metal")
                     LabeledContent("Build", value: "Bundled")
                     Text("Per-title DXMT overrides can be supplied through madeira-dxmt.txt in Files.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Virtual Desktop") {
+                    Picker("Desktop resolution", selection: $desktopResolution) {
+                        ForEach(Self.desktopResolutions, id: \.self) { r in
+                            Text(r).tag(r)
+                        }
+                    }
+                    Text("Screen size for the Wine Virtual Desktop launcher, and the largest resolution games can pick in their own settings. Bigger desktops look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1977,7 +2001,11 @@ struct ContentView: View {
                     // Known risk: if shellwindows_init beats services.exe's
                     // RPC_Init, OpenSCManager fails → watch whether that
                     // fails fast or hits the RaiseException→CS wedge again.
-                    let deskW = 960, deskH = 540
+                    // Desktop size comes from Settings → Virtual Desktop
+                    // (default 960x540). Games launched from this desktop
+                    // get a mode list capped at this size.
+                    let (deskW, deskH) = desktopSize
+                    logStore.log("Virtual desktop: \(deskW)x\(deskH)")
                     setenv("MADEIRA_EXE", "explorer.exe", 1)
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
