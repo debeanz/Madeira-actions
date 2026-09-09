@@ -385,6 +385,20 @@ static void *wine_process_thread(void *arg) {
          * For debugging, set MADEIRA_DEBUG_VERBOSE=1 in the environment to
          * restore the full trace channel set. */
         {
+#ifdef MADEIRA_SIMULATOR_REAL_RUNTIME
+            /*
+             * Darwin reserves x18, while Windows ARM64 uses it as the TEB
+             * register. The simulator compatibility handler emulates direct
+             * TEB loads/stores, but Wine's debug formatter also derives a
+             * scratch-buffer pointer with `add xN, x18, xN`; that silent
+             * register copy cannot fault at the point where it happens. Keep
+             * PE-side Wine channel formatting off for this ARM64-only
+             * simulator experiment. Our bridge/wineserver/runtime diagnostics
+             * still go directly to madeira-log.txt.
+             */
+            setenv("WINEDEBUG", "-all", 1);
+            LOG("WINEDEBUG = -all (ARM64 Simulator x18 compatibility mode)");
+#else
             const char *verbose = getenv("MADEIRA_DEBUG_VERBOSE");
             if (verbose && *verbose && *verbose != '0') {
                 setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
@@ -403,6 +417,7 @@ static void *wine_process_thread(void *arg) {
                 setenv("WINEDEBUG", "err+all,err-virtual", 1);
                 LOG("WINEDEBUG = err+all,err-virtual (perf default — set MADEIRA_DEBUG_VERBOSE=1 for full trace)");
             }
+#endif
         }
 
         // Phase 3D investigation: re-enabled. Investigation C concluded

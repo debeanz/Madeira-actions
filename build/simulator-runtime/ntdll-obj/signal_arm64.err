@@ -1,0 +1,14 @@
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/signal_arm64_ios.c:2345:90: warning: format specifies type 'void *' but the argument has type 'uintptr_t' (aka 'unsigned long') [-Wformat]
+ 2343 |                                                     "unaligned; insn=%08x pc=%p addr=%p -> alias emulator "
+      |                                                                                      ~~
+      |                                                                                      %lu
+ 2344 |                                                     "(pc-4 preserved)\n",
+ 2345 |                                             ios_byte_skip_count, insn, (void *)fault_pc, fault_addr);
+      |                                                                                          ^~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/signal_arm64_ios.c:4861:45: warning: array index 29 is past the end of the array (that has type '__uint64_t[29]' (aka 'unsigned long long[29]')) [-Warray-bounds]
+ 4861 |                         uint64_t live_rbp = state.__x[29];
+      |                                             ^         ~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/mach/arm/_structs.h:150:2: note: array '__x' declared here
+  150 |         __uint64_t __x[29]; /* General purpose registers x0-x28 */
+      |         ^
+2 warnings generated.

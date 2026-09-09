@@ -4,12 +4,15 @@ set -e
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
 WINE_SRC="$REPO_ROOT/wine"
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-APP_LIB="$REPO_ROOT/app/Madeira/libwineserver.a"
+SDK_NAME="${MADEIRA_SDK_NAME:-iphoneos}"
+SDK=$(xcrun --sdk "$SDK_NAME" --show-sdk-path)
+if [ "$SDK_NAME" = "iphonesimulator" ]; then MIN_FLAG="-mios-simulator-version-min=17.0"; else MIN_FLAG="-miphoneos-version-min=17.0"; fi
+APP_LIB="${MADEIRA_OUTPUT_LIB:-$REPO_ROOT/app/Madeira/libwineserver.a}"
+EXTRA_CFLAGS="${MADEIRA_EXTRA_CFLAGS:-}"
 SHIMS_DIR="$REPO_ROOT/build/ntdll-unix/shims"
 
 # Object files and library go in build dir
-OBJ_DIR="$BUILD_DIR/obj"
+OBJ_DIR="${MADEIRA_OBJ_DIR:-$BUILD_DIR/obj}"
 mkdir -p "$OBJ_DIR"
 
 # Copy the base library if we don't have one yet
@@ -23,7 +26,7 @@ if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
 fi
 
 CC_FLAGS=(
-    -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+    -arch arm64 -isysroot "$SDK" "$MIN_FLAG" -O2 $EXTRA_CFLAGS
     -I"$WINE_SRC/include" -I"$WINE_SRC/include/wine"
     -I"$WINE_SRC/build-macos/include"
     -I"$BUILD_DIR" -I"$WINE_SRC/server"
@@ -48,7 +51,7 @@ compile_one() {
     local src=$1
     local name=$2
     echo -n "  $name... "
-    if xcrun -sdk iphoneos clang "${CC_FLAGS[@]}" -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/err-$name.txt"; then
+    if xcrun -sdk "$SDK_NAME" clang "${CC_FLAGS[@]}" -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/err-$name.txt"; then
         echo "OK"
     else
         echo "FAILED (see $OBJ_DIR/err-$name.txt)"
@@ -97,9 +100,9 @@ PATCHED_FILES=(
 echo "=== Building kill wrapper (without kill macro) ==="
 echo -n "  wineserver_ios_kill... "
 # Compile WITHOUT -include wineserver_ios_kill.h to avoid recursive macro
-KILL_FLAGS=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+KILL_FLAGS=(-arch arm64 -isysroot "$SDK" "$MIN_FLAG" -O2 $EXTRA_CFLAGS
     -I"$BUILD_DIR" -DWINE_IOS=1 -Wno-implicit-function-declaration)
-if xcrun -sdk iphoneos clang "${KILL_FLAGS[@]}" -c "$BUILD_DIR/wineserver_ios_kill.c" -o "$OBJ_DIR/wineserver_ios_kill.o" 2>"$OBJ_DIR/err-kill.txt"; then
+if xcrun -sdk "$SDK_NAME" clang "${KILL_FLAGS[@]}" -c "$BUILD_DIR/wineserver_ios_kill.c" -o "$OBJ_DIR/wineserver_ios_kill.o" 2>"$OBJ_DIR/err-kill.txt"; then
     echo "OK"
 else
     echo "FAILED"; cat "$OBJ_DIR/err-kill.txt"; exit 1

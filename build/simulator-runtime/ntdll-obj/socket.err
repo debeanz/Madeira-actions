@@ -1,0 +1,13 @@
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/socket.c:1257:51: warning: address of array 'async->iov' will always evaluate to 'true' [-Wpointer-bool-conversion]
+ 1257 |     ios_sock_wire( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+      |                                         ~~ ~~~~~~~^~~
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/socket.c:1258:49: warning: address of array 'async->iov' will always evaluate to 'true' [-Wpointer-bool-conversion]
+ 1258 |     ios_sock_tl( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+      |                                       ~~ ~~~~~~~^~~
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/socket.c:1563:51: warning: address of array 'async->iov' will always evaluate to 'true' [-Wpointer-bool-conversion]
+ 1563 |     ios_sock_wire( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+      |                                         ~~ ~~~~~~~^~~
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/socket.c:1564:49: warning: address of array 'async->iov' will always evaluate to 'true' [-Wpointer-bool-conversion]
+ 1564 |     ios_sock_tl( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+      |                                       ~~ ~~~~~~~^~~
+4 warnings generated.

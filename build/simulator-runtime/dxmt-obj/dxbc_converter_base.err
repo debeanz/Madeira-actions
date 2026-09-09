@@ -1,0 +1,56 @@
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:1:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.hpp:8:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/../dxbc_instructions.hpp:2:
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:149:49: warning: first argument in call to 'memcpy' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::COperandBase' [-Wnontrivial-memcall]
+  149 |   COperandBase(const COperandBase &Op) { memcpy(this, &Op, sizeof(*this)); }
+      |                                                 ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:149:49: note: explicitly cast the pointer to silence this warning
+  149 |   COperandBase(const COperandBase &Op) { memcpy(this, &Op, sizeof(*this)); }
+      |                                                 ^
+      |                                                 (void*)
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:152:14: warning: first argument in call to 'memcpy' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::COperandBase' [-Wnontrivial-memcall]
+  152 |       memcpy(this, &Op, sizeof(*this));
+      |              ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:152:14: note: explicitly cast the pointer to silence this warning
+  152 |       memcpy(this, &Op, sizeof(*this));
+      |              ^
+      |              (void*)
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:265:25: warning: first argument in call to 'memset' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::COperandBase' [-Wnontrivial-memcall]
+  265 |   void Clear() { memset(this, 0, sizeof(*this)); }
+      |                         ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:265:25: note: explicitly cast the pointer to silence this warning
+  265 |   void Clear() { memset(this, 0, sizeof(*this)); }
+      |                         ^
+      |                         (void*)
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:1280:12: warning: first argument in call to 'memset' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::CInstruction' [-Wnontrivial-memcall]
+ 1280 |     memset(this, 0, sizeof(*this));
+      |            ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:1280:12: note: explicitly cast the pointer to silence this warning
+ 1280 |     memset(this, 0, sizeof(*this));
+      |            ^
+      |            (void*)
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:2:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/../dxbc_converter.hpp:11:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/DXBCUtils.h:5:
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/include/native/directx/d3d11.h:801:1: warning: empty struct has size 0 in C, size 1 in C++ [-Wextern-c-compat]
+  801 | struct CD3D11_DEFAULT {};
+      | ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:26:16: warning: ISO C++ requires field designators to be specified in declaration order; field 'phase' will be initialized after field 'regid' [-Wreorder-init-list]
+   26 |       .regid = SrcOpIndex.regid,
+      |       ~~~~~~~~~^~~~~~~~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:25:16: note: previous initialization for field 'phase' is here
+   25 |       .phase = SrcOpIndex.phase,
+      |                ^~~~~~~~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:38:19: warning: ISO C++ requires field designators to be specified in declaration order; field 'phase' will be initialized after field 'regindex' [-Wreorder-init-list]
+   38 |       .regindex = SrcOpIndex.regid,
+      |       ~~~~~~~~~~~~^~~~~~~~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:37:16: note: previous initialization for field 'phase' is here
+   37 |       .phase = SrcOpIndex.phase,
+      |                ^~~~~~~~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:39:18: warning: ISO C++ requires field designators to be specified in declaration order; field 'regindex' will be initialized after field 'regfile' [-Wreorder-init-list]
+   39 |       .regfile = SrcOpIndex.regfile,
+      |       ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/nt/dxbc_converter_base.cpp:38:19: note: previous initialization for field 'regindex' is here
+   38 |       .regindex = SrcOpIndex.regid,
+      |                   ^~~~~~~~~~~~~~~~
+8 warnings generated.

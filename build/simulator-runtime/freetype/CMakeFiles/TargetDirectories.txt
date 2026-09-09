@@ -1,0 +1,9 @@
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/freetype.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/package.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/package_source.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/edit_cache.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/rebuild_cache.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/list_install_components.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/install.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/install/local.dir
+/Users/justin/Documents/GitHub/Madeira-actions/build/simulator-runtime/freetype/CMakeFiles/install/strip.dir

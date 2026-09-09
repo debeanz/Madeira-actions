@@ -1,0 +1,59 @@
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:168:20: warning: 'os_sync_wait_on_address_with_timeout' is only available on iOS 17.4 or newer [-Wunguarded-availability-new]
+  168 |             return os_sync_wait_on_address_with_timeout( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE,
+      |                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/os/os_sync_wait_on_address.h:268:1: note: 'os_sync_wait_on_address_with_timeout' has been marked as being introduced in iOS 17.4 here, but the deployment target is iOS 17.0.0
+  268 | os_sync_wait_on_address_with_timeout(void *addr,
+      | ^
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:168:20: note: enclose 'os_sync_wait_on_address_with_timeout' in a __builtin_available check to silence this warning
+  168 |             return os_sync_wait_on_address_with_timeout( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE,
+      |                    ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  169 |                                                          OS_CLOCK_MACH_ABSOLUTE_TIME, ns_timeout );
+      |                                                                                                    
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:168:90: warning: 'OS_SYNC_WAIT_ON_ADDRESS_NONE' is only available on iOS 17.4 or newer [-Wunguarded-availability-new]
+  168 |             return os_sync_wait_on_address_with_timeout( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE,
+      |                                                                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/os/os_sync_wait_on_address.h:62:2: note: 'OS_SYNC_WAIT_ON_ADDRESS_NONE' has been marked as being introduced in iOS 17.4 here, but the deployment target is iOS 17.0.0
+   62 |         OS_SYNC_WAIT_ON_ADDRESS_NONE
+      |         ^
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:168:90: note: enclose 'OS_SYNC_WAIT_ON_ADDRESS_NONE' in a __builtin_available check to silence this warning
+  168 |             return os_sync_wait_on_address_with_timeout( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE,
+      |                                                                                          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  169 |                                                          OS_CLOCK_MACH_ABSOLUTE_TIME, ns_timeout );
+      |                                                                                                    
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:172:16: warning: 'os_sync_wait_on_address' is only available on iOS 17.4 or newer [-Wunguarded-availability-new]
+  172 |         return os_sync_wait_on_address( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE );
+      |                ^~~~~~~~~~~~~~~~~~~~~~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/os/os_sync_wait_on_address.h:154:1: note: 'os_sync_wait_on_address' has been marked as being introduced in iOS 17.4 here, but the deployment target is iOS 17.0.0
+  154 | os_sync_wait_on_address(void *addr,
+      | ^
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:172:16: note: enclose 'os_sync_wait_on_address' in a __builtin_available check to silence this warning
+  172 |         return os_sync_wait_on_address( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE );
+      |                ^~~~~~~~~~~~~~~~~~~~~~~                                                                 
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:172:73: warning: 'OS_SYNC_WAIT_ON_ADDRESS_NONE' is only available on iOS 17.4 or newer [-Wunguarded-availability-new]
+  172 |         return os_sync_wait_on_address( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE );
+      |                                                                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/os/os_sync_wait_on_address.h:62:2: note: 'OS_SYNC_WAIT_ON_ADDRESS_NONE' has been marked as being introduced in iOS 17.4 here, but the deployment target is iOS 17.0.0
+   62 |         OS_SYNC_WAIT_ON_ADDRESS_NONE
+      |         ^
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:172:73: note: enclose 'OS_SYNC_WAIT_ON_ADDRESS_NONE' in a __builtin_available check to silence this warning
+  172 |         return os_sync_wait_on_address( (void *)addr, (uint64_t)val, 4, OS_SYNC_WAIT_ON_ADDRESS_NONE );
+      |                                                                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~   
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:196:16: warning: 'os_sync_wake_by_address_any' is only available on iOS 17.4 or newer [-Wunguarded-availability-new]
+  196 |         return os_sync_wake_by_address_any( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/os/os_sync_wait_on_address.h:339:1: note: 'os_sync_wake_by_address_any' has been marked as being introduced in iOS 17.4 here, but the deployment target is iOS 17.0.0
+  339 | os_sync_wake_by_address_any(void *addr,
+      | ^
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:196:16: note: enclose 'os_sync_wake_by_address_any' in a __builtin_available check to silence this warning
+  196 |         return os_sync_wake_by_address_any( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+      |                ^~~~~~~~~~~~~~~~~~~~~~~~~~~                                                  
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:196:62: warning: 'OS_SYNC_WAKE_BY_ADDRESS_NONE' is only available on iOS 17.4 or newer [-Wunguarded-availability-new]
+  196 |         return os_sync_wake_by_address_any( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+      |                                                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/os/os_sync_wait_on_address.h:296:2: note: 'OS_SYNC_WAKE_BY_ADDRESS_NONE' has been marked as being introduced in iOS 17.4 here, but the deployment target is iOS 17.0.0
+  296 |         OS_SYNC_WAKE_BY_ADDRESS_NONE
+      |         ^
+/Users/justin/Documents/GitHub/Madeira-actions/wine/dlls/ntdll/unix/sync.c:196:62: note: enclose 'OS_SYNC_WAKE_BY_ADDRESS_NONE' in a __builtin_available check to silence this warning
+  196 |         return os_sync_wake_by_address_any( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+      |                                                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~   
+6 warnings generated.

@@ -1,0 +1,37 @@
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/dxbc_instructions.cpp:1:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/dxbc_instructions.hpp:2:
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:149:49: warning: first argument in call to 'memcpy' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::COperandBase' [-Wnontrivial-memcall]
+  149 |   COperandBase(const COperandBase &Op) { memcpy(this, &Op, sizeof(*this)); }
+      |                                                 ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:149:49: note: explicitly cast the pointer to silence this warning
+  149 |   COperandBase(const COperandBase &Op) { memcpy(this, &Op, sizeof(*this)); }
+      |                                                 ^
+      |                                                 (void*)
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:152:14: warning: first argument in call to 'memcpy' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::COperandBase' [-Wnontrivial-memcall]
+  152 |       memcpy(this, &Op, sizeof(*this));
+      |              ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:152:14: note: explicitly cast the pointer to silence this warning
+  152 |       memcpy(this, &Op, sizeof(*this));
+      |              ^
+      |              (void*)
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:265:25: warning: first argument in call to 'memset' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::COperandBase' [-Wnontrivial-memcall]
+  265 |   void Clear() { memset(this, 0, sizeof(*this)); }
+      |                         ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:265:25: note: explicitly cast the pointer to silence this warning
+  265 |   void Clear() { memset(this, 0, sizeof(*this)); }
+      |                         ^
+      |                         (void*)
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:1280:12: warning: first argument in call to 'memset' is a pointer to non-trivially copyable type 'microsoft::D3D10ShaderBinary::CInstruction' [-Wnontrivial-memcall]
+ 1280 |     memset(this, 0, sizeof(*this));
+      |            ^
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/ShaderBinary.h:1280:12: note: explicitly cast the pointer to silence this warning
+ 1280 |     memset(this, 0, sizeof(*this));
+      |            ^
+      |            (void*)
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/dxbc_instructions.cpp:4:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/airconv/dxbc_converter.hpp:11:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/DXBCUtils.h:5:
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/include/native/directx/d3d11.h:801:1: warning: empty struct has size 0 in C, size 1 in C++ [-Wextern-c-compat]
+  801 | struct CD3D11_DEFAULT {};
+      | ^
+5 warnings generated.

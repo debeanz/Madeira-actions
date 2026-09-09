@@ -5,9 +5,12 @@ BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
 WINE_SRC="$REPO_ROOT/wine"
 WINE_BUILD="$WINE_SRC/build-macos"
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-OBJ_DIR="$BUILD_DIR/obj"
-APP_LIB="$REPO_ROOT/app/Madeira/libntdll_unix.a"
+SDK_NAME="${MADEIRA_SDK_NAME:-iphoneos}"
+SDK=$(xcrun --sdk "$SDK_NAME" --show-sdk-path)
+if [ "$SDK_NAME" = "iphonesimulator" ]; then MIN_FLAG="-mios-simulator-version-min=17.0"; else MIN_FLAG="-miphoneos-version-min=17.0"; fi
+OBJ_DIR="${MADEIRA_OBJ_DIR:-$BUILD_DIR/obj}"
+APP_LIB="${MADEIRA_OUTPUT_LIB:-$REPO_ROOT/app/Madeira/libntdll_unix.a}"
+EXTRA_CFLAGS="${MADEIRA_EXTRA_CFLAGS:-}"
 
 mkdir -p "$OBJ_DIR"
 
@@ -20,8 +23,8 @@ compile_one() {
     local name=$2
     echo -n "  $name... "
 
-    if xcrun -sdk iphoneos clang \
-        -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+    if xcrun -sdk "$SDK_NAME" clang \
+        -arch arm64 -isysroot "$SDK" "$MIN_FLAG" $EXTRA_CFLAGS \
         -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
@@ -58,8 +61,8 @@ compile_unixlib() {
     local src=$1 name=$2 prefix=$3
     shift 3
     echo -n "  $name... "
-    if xcrun -sdk iphoneos clang \
-        -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+    if xcrun -sdk "$SDK_NAME" clang \
+        -arch arm64 -isysroot "$SDK" "$MIN_FLAG" $EXTRA_CFLAGS \
         -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
@@ -96,9 +99,11 @@ compile_unixlib "$WINE_SRC/dlls/ws2_32/unixlib.c" "ws2_32_unixlib" "ws2_32" \
     -I"$WINE_SRC/dlls/ws2_32"
 compile_unixlib "$WINE_SRC/dlls/bcrypt/gnutls.c" "bcrypt_unixlib" "bcrypt" \
     -I"$WINE_SRC/dlls/bcrypt" -I"$GNUTLS_PREFIX/include" \
+    -DHAVE_GNUTLS_CIPHER_INIT=1 -DSONAME_LIBGNUTLS=\"libgnutls.so.30\" \
     -include "$CRYPTO_DIR/ios_gnutls_shim.h"
 compile_unixlib "$WINE_SRC/dlls/secur32/schannel_gnutls.c" "secur32_unixlib" "secur32" \
     -I"$WINE_SRC/dlls/secur32" -I"$GNUTLS_PREFIX/include" \
+    -DSONAME_LIBGNUTLS=\"libgnutls.so.30\" \
     -include "$CRYPTO_DIR/ios_gnutls_shim.h"
 # iOS-Madeira ml494 (#61 text wall): dwrite had NO unixlib, so every
 # __wine_unix_call from dwrite.dll failed and get_glyph_bbox never ran —

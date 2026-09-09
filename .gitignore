@@ -126,3 +126,16 @@ research/remote-metal/guest/rmreplay
 research/remote-metal/guest/rmres
 research/remote-metal/guest/rmclient_test
 research/remote-metal/host/rmetald
+
+# local build (build-local.sh)
+.build-stamps/
+.build-tmp/
+build-logs/
+out/
+artifacts/
+toolchains/
+research/freetype/
+wine/build-macos/
+wine/build-arm64ec
+build/dxmt-ios/shader-headers/
+research/dxmt/build-pe/

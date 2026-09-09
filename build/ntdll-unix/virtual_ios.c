@@ -5489,6 +5489,7 @@ extern const void *dxmt_winemetal_unix_call_funcs[];
  * to advance past audio-gated splash/intro sequences. See audio_null_ios.c */
 extern const void *audio_null_ios_unix_call_funcs[];
 
+#ifndef MADEIRA_SIMULATOR_RUNTIME
 /* iOS-Madeira 2026-07-05 (Steam S0): network + crypto unix tables,
  * compiled from wine/dlls/<dll>/ sources into libntdll_unix.a with
  * -D__wine_unix_call_funcs=<dll>_unix_call_funcs (build/ntdll-unix/
@@ -5511,6 +5512,7 @@ extern const void *nsi_unix_call_funcs[];
  * ml494 measured exactly that (12/12 [dwrite-bounds] EMPTY, [dwrite-ink]
  * never called). Chromium drew no text anywhere as a result. */
 extern const void *dwrite_unix_call_funcs[];
+#endif
 
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
@@ -5575,7 +5577,9 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             ERR("iOS: module %p (%s) -> audio_null_ios_unix_call_funcs (%p)\n",
                 module, match, audio_null_ios_unix_call_funcs);
             status = STATUS_SUCCESS;
-        } else if (match && strstr(match, "ws2_32")) {
+        }
+#ifndef MADEIRA_SIMULATOR_RUNTIME
+        else if (match && strstr(match, "ws2_32")) {
             *funcs = (const void *)ws2_32_unix_call_funcs;
             dprintf(2, "[unixlib] module %p (%s) -> ws2_32_unix_call_funcs (%p)\n",
                 module, match, (void *)ws2_32_unix_call_funcs);
@@ -5608,7 +5612,9 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             dprintf(2, "[unixlib] module %p (%s) -> nsi_unix_call_funcs (%p) rev=ml472\n",
                 module, match, (void *)nsi_unix_call_funcs);
             status = STATUS_SUCCESS;
-        } else if (match && strstr(match, "win32u")) {
+        }
+#endif
+        else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.
              * Activating this causes user32 process_attach to crash until
              * wineserver shared-memory bringup is complete; gated on the

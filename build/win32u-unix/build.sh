@@ -13,9 +13,12 @@ REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
 WINE_SRC="$REPO_ROOT/wine"
 WINE_BUILD="$WINE_SRC/build-macos"
 NTDLL_SHIMS="$REPO_ROOT/build/ntdll-unix/shims"
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-OBJ_DIR="$BUILD_DIR/obj"
-APP_LIB="$REPO_ROOT/app/Madeira/libwin32u_unix.a"
+SDK_NAME="${MADEIRA_SDK_NAME:-iphoneos}"
+SDK=$(xcrun --sdk "$SDK_NAME" --show-sdk-path)
+if [ "$SDK_NAME" = "iphonesimulator" ]; then MIN_FLAG="-mios-simulator-version-min=17.0"; else MIN_FLAG="-miphoneos-version-min=17.0"; fi
+OBJ_DIR="${MADEIRA_OBJ_DIR:-$BUILD_DIR/obj}"
+APP_LIB="${MADEIRA_OUTPUT_LIB:-$REPO_ROOT/app/Madeira/libwin32u_unix.a}"
+EXTRA_CFLAGS="${MADEIRA_EXTRA_CFLAGS:-}"
 
 mkdir -p "$OBJ_DIR"
 
@@ -23,7 +26,7 @@ SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
 
-FREETYPE_DIR="$REPO_ROOT/build/freetype-ios"
+FREETYPE_DIR="${MADEIRA_FREETYPE_DIR:-$REPO_ROOT/build/freetype-ios}"
 
 compile_one() {
     local src=$1
@@ -31,8 +34,8 @@ compile_one() {
     shift 2
     echo -n "  $name... "
 
-    if xcrun -sdk iphoneos clang \
-        -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+    if xcrun -sdk "$SDK_NAME" clang \
+        -arch arm64 -isysroot "$SDK" "$MIN_FLAG" $EXTRA_CFLAGS \
         -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$BUILD_DIR/config_ios.h" \

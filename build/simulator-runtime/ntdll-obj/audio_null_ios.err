@@ -1,0 +1,7 @@
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/audio_null_ios.c:66:9: warning: 'AUDCLNT_E_NOT_INITIALIZED' macro redefined [-Wmacro-redefined]
+   66 | #define AUDCLNT_E_NOT_INITIALIZED 0x88890001L
+      |         ^
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/audio_null_ios.c:63:9: note: previous definition is here
+   63 | #define AUDCLNT_E_NOT_INITIALIZED ((HRESULT)0x88890001L)
+      |         ^
+1 warning generated.

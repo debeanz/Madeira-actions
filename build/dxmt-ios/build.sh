@@ -10,15 +10,23 @@ REPO_ROOT="$(cd "$BUILD_DIR/../.." && pwd)"
 DXMT_SRC="$REPO_ROOT/research/dxmt/src"
 DXMT_ROOT="$REPO_ROOT/research/dxmt"
 LLVM_SRC="$REPO_ROOT/toolchains/llvm-project/llvm"
-LLVM_BUILD="$REPO_ROOT/toolchains/llvm-ios-build"
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-OBJ_DIR="$BUILD_DIR/obj"
-OUT_LIB="$BUILD_DIR/libdxmt_unix.a"
+LLVM_BUILD="${MADEIRA_LLVM_BUILD:-$REPO_ROOT/toolchains/llvm-ios-build}"
+SDK_NAME="${MADEIRA_SDK_NAME:-iphoneos}"
+SDK=$(xcrun --sdk "$SDK_NAME" --show-sdk-path)
+if [ "$SDK_NAME" = "iphonesimulator" ]; then
+    MIN_FLAG="-mios-simulator-version-min=18.0"
+    PLATFORM_DEFS="-DMADEIRA_SIMULATOR_RUNTIME=1"
+else
+    MIN_FLAG="-miphoneos-version-min=18.0"
+    PLATFORM_DEFS=""
+fi
+OBJ_DIR="${MADEIRA_OBJ_DIR:-$BUILD_DIR/obj}"
+OUT_LIB="${MADEIRA_OUTPUT_LIB:-$BUILD_DIR/libdxmt_unix.a}"
 
 mkdir -p "$OBJ_DIR"
 
-COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks -O2"
-INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
+COMMON_FLAGS="-arch arm64 -isysroot $SDK $MIN_FLAG -fblocks -O2 $PLATFORM_DEFS"
+INCLUDES="-I$OBJ_DIR -I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"
 INCLUDES_SHADERS="-I$BUILD_DIR/shader-headers"
 LLVM_INCLUDES="-I$LLVM_BUILD/include -I$LLVM_SRC/include"
@@ -29,10 +37,22 @@ SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
 
+if [ "$SDK_NAME" = "iphonesimulator" ]; then
+    # dxmt_command.metal is embedded in the Windows-side DXMT library, which is
+    # built for the device/macOS Metal ABI. Embed a Simulator-native copy in
+    # the Unix bridge so it can be substituted without changing device DLLs.
+    xcrun -sdk iphonesimulator metal -std=metal4.1 -c \
+        "$DXMT_SRC/dxmt/dxmt_command.metal" -o "$OBJ_DIR/dxmt_command_sim.air"
+    xcrun -sdk iphonesimulator metallib "$OBJ_DIR/dxmt_command_sim.air" \
+        -o "$OBJ_DIR/dxmt_command_sim.metallib"
+    xxd -i -n dxmt_command_sim "$OBJ_DIR/dxmt_command_sim.metallib" \
+        "$OBJ_DIR/dxmt_command_sim.h"
+fi
+
 compile_objc() {
     local src=$1 name=$2
     printf "  %-40s " "$name"
-    if xcrun -sdk iphoneos clang $COMMON_FLAGS -x objective-c $INCLUDES \
+    if xcrun -sdk "$SDK_NAME" clang $COMMON_FLAGS -x objective-c $INCLUDES \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"; SUCCEEDED=$((SUCCEEDED+1))
     else
@@ -43,7 +63,7 @@ compile_objc() {
 compile_cxx() {
     local src=$1 name=$2 extra="${3:-}"
     printf "  %-40s " "$name"
-    if xcrun -sdk iphoneos clang++ $COMMON_FLAGS $CXX_FLAGS $INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $LLVM_INCLUDES $AIRCONV_DEFS $extra \
+    if xcrun -sdk "$SDK_NAME" clang++ $COMMON_FLAGS $CXX_FLAGS $INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $LLVM_INCLUDES $AIRCONV_DEFS $extra \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"; SUCCEEDED=$((SUCCEEDED+1))
     else
@@ -72,7 +92,7 @@ for cpp in BlobContainer.cpp DXBCUtils.cpp ShaderBinary.cpp; do
     name=dxbc_$(basename "$cpp" .cpp)
     # ShaderBinary uses `throw`, so we can't use -fno-exceptions from CXX_FLAGS.
     printf "  %-40s " "$name"
-    if xcrun -sdk iphoneos clang++ $COMMON_FLAGS -std=c++20 -fno-rtti \
+    if xcrun -sdk "$SDK_NAME" clang++ $COMMON_FLAGS -std=c++20 -fno-rtti \
             $INCLUDES $INCLUDES_DIRECTX $AIRCONV_DEFS \
             -c "$DXMT_ROOT/libs/DXBCParser/$cpp" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"; SUCCEEDED=$((SUCCEEDED+1))
@@ -91,5 +111,5 @@ fi
 
 echo ""
 echo "=== Archiving libdxmt_unix.a ==="
-xcrun -sdk iphoneos ar rcs "$OUT_LIB" "$OBJ_DIR"/*.o
+xcrun -sdk "$SDK_NAME" ar rcs "$OUT_LIB" "$OBJ_DIR"/*.o
 echo "Built: $OUT_LIB ($(wc -c < "$OUT_LIB" | tr -d ' ') bytes)"

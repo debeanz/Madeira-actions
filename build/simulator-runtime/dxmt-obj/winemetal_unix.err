@@ -1,0 +1,21 @@
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/winemetal/unix/winemetal_unix.c:1167:44: warning: format specifies type 'void *' but the argument has type 'obj_handle_t' (aka 'unsigned long long') [-Wformat]
+ 1166 |               "(raster=%u vertex=%p fragment=%p samples=%lu)\n",
+      |                                  ~~
+      |                                  %llu
+ 1167 |               info->rasterization_enabled, info->vertex_function,
+      |                                            ^~~~~~~~~~~~~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/winemetal/unix/winemetal_unix.c:1168:15: warning: format specifies type 'void *' but the argument has type 'obj_handle_t' (aka 'unsigned long long') [-Wformat]
+ 1166 |               "(raster=%u vertex=%p fragment=%p samples=%lu)\n",
+      |                                              ~~
+      |                                              %llu
+ 1167 |               info->rasterization_enabled, info->vertex_function,
+ 1168 |               info->fragment_function, (unsigned long)descriptor.rasterSampleCount);
+      |               ^~~~~~~~~~~~~~~~~~~~~~~
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/winemetal/unix/winemetal_unix.c:1283:
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/winemetal/unix/wmt_remote_pack.h:105:35: warning: result of comparison of constant 256 with expression of type 'const uint8_t' (aka 'const unsigned char') is always false [-Wtautological-constant-out-of-range-compare]
+  105 |             if (b->viewport_count > WMTW_MAX_ARRAY_COUNT) FAIL(WMTW_PACK_BAD_ARRAY_COUNT);
+      |                 ~~~~~~~~~~~~~~~~~ ^ ~~~~~~~~~~~~~~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/src/winemetal/unix/wmt_remote_pack.h:115:31: warning: result of comparison of constant 256 with expression of type 'const uint8_t' (aka 'const unsigned char') is always false [-Wtautological-constant-out-of-range-compare]
+  115 |             if (b->rect_count > WMTW_MAX_ARRAY_COUNT) FAIL(WMTW_PACK_BAD_ARRAY_COUNT);
+      |                 ~~~~~~~~~~~~~ ^ ~~~~~~~~~~~~~~~~~~~~
+4 warnings generated.

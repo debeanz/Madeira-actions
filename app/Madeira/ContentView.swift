@@ -850,10 +850,20 @@ struct ContentView: View {
     @State private var entitlements: EntitlementStatus?
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
+    @ObservedObject private var touchControls = TouchControlsModel.shared
     @State private var pointerPanel = false
+    @State private var selectedTab: MadeiraTab = .library
+    @State private var developerToolsExpanded = false
+    @State private var desktopFullScreen = false
+    @State private var showActivityLogs = false
+    @State private var showRuntimeStatus = false
+    @State private var prefixSizeText = "Calculating…"
+    @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
+    @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
+    @Environment(\.horizontalSizeClass) private var hSizeClass
 
     enum JITStatus {
         case unknown
@@ -863,103 +873,569 @@ struct ContentView: View {
         case unavailable
     }
 
+    private enum MadeiraTab: Hashable {
+        case library, containers, activity, settings
+    }
+
     var body: some View {
-        /* ml658: was NavigationView, which is deprecated and — the reason this
-         * matters — defaults to a SPLIT VIEW on iPad. TARGETED_DEVICE_FAMILY is
-         * "1,2", so iPad is a shipping target, and the whole UI was being forced
-         * into a sidebar/detail arrangement it was never laid out for.
-         * NavigationStack is single-column on every device. Safe here: there are
-         * no NavigationLinks anywhere in the app, so nothing depended on the
-         * two-column selection behaviour. */
+        Group {
+            // Keep full screen inside the app's existing UIWindow. A
+            // fullScreenCover creates a presentation host above the raw,
+            // window-owned CAMetalLayer, so the cover is opaque black even
+            // though DXMT continues presenting underneath it.
+            if desktopFullScreen {
+                fullScreenDesktop
+            } else if vSizeClass == .compact && selectedTab == .activity {
+                landscapeBody
+            } else {
+                TabView(selection: $selectedTab) {
+                    libraryScreen
+                        .tabItem { Label("Library", systemImage: "square.grid.2x2.fill") }
+                        .tag(MadeiraTab.library)
+                    containersScreen
+                        .tabItem { Label("Containers", systemImage: "shippingbox.fill") }
+                        .tag(MadeiraTab.containers)
+                    Group {
+                        if selectedTab == .activity {
+                            activityScreen
+                        } else {
+                            Color.clear
+                        }
+                    }
+                        .tabItem { Label("Activity", systemImage: "waveform.path.ecg") }
+                        .tag(MadeiraTab.activity)
+                    settingsScreen
+                        .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+                        .tag(MadeiraTab.settings)
+                }
+                .tint(.indigo)
+            }
+        }
+        .onAppear {
+            jit_install_trap_handler()
+            entitlements = EntitlementStatus.check()
+            logEntitlementStatus()
+            MetalHostView.shared.isHidden = selectedTab != .activity
+        }
+        .onChange(of: selectedTab) { _, tab in
+            MetalHostView.shared.isHidden = tab != .activity
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: Notification.Name("MadeiraExitFullScreen"))) { _ in
+            desktopFullScreen = false
+        }
+    }
+
+    private var libraryScreen: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Your games, one tap away.")
+                            .font(.title2.bold())
+                        Text("No imported games yet. Use the developer launchers below for the current test targets.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Steam handoff")
+                                .font(.headline)
+                            Spacer()
+                            Text(steamMinimalLayout ? "MINIMAL" : "DESKTOP")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.indigo)
+                        }
+                        Toggle(isOn: $steamMinimalLayout) {
+                            Label("Game-first layout", systemImage: "rectangle.grid.2x2")
+                        }
+                        Text("Saves the preferred presentation for CEF handoff. The current Steam test launcher remains in Developer tools.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(17)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground),
+                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Launch profile")
+                                .font(.headline)
+                            Spacer()
+                            Picker("Launch profile", selection: $compatibilityMode) {
+                                Text("Stability").tag("Stability")
+                                Text("Performance").tag("Performance")
+                            }
+                            .pickerStyle(.menu)
+                        }
+                        Text(compatibilityMode == "Stability"
+                             ? "Uses Madeira's validated defaults. Additional conservative FEX overrides are not enabled yet."
+                             : "Uses the current high-throughput FEX defaults.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(17)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground),
+                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        DisclosureGroup(isExpanded: $developerToolsExpanded) {
+                            actionButtons
+                                .padding(.top, 10)
+                        } label: {
+                            Label("Developer launchers", systemImage: "hammer.fill")
+                                .font(.headline)
+                        }
+                        Text("Wine launch targets, JIT setup, and low-level runtime tests.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(17)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground),
+                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                }
+                .padding()
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("Library")
+        }
+    }
+
+    private var containersScreen: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 18) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        HStack(alignment: .top) {
+                            Image(systemName: "shippingbox.fill")
+                                .font(.title2)
+                                .foregroundStyle(.indigo)
+                                .frame(width: 52, height: 52)
+                                .background(.indigo.opacity(0.1), in: RoundedRectangle(cornerRadius: 16))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Default")
+                                    .font(.title3.bold())
+                                Text("Windows 64-bit · DXMT")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text("READY")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.green)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .background(.green.opacity(0.11), in: Capsule())
+                        }
+                        Divider()
+                        containerDetail("Translation", value: "FEX · ARM64EC", icon: "arrow.triangle.2.circlepath")
+                        containerDetail("Graphics", value: "DXMT · Metal", icon: "sparkles.rectangle.stack")
+                        containerDetail("Storage", value: prefixSizeText, icon: "internaldrive")
+                        containerDetail("Prefix", value: "Documents/wine", icon: "folder")
+                        Button {
+                            openDocumentsInFiles()
+                        } label: {
+                            Label("Open Madeira in Files", systemImage: "folder.badge.gearshape")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .padding(18)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground),
+                                in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Runtime components").font(.headline)
+                        dependencyRow("Visual C++ runtime", detail: "Provided by the prefix", available: true)
+                        Divider()
+                        dependencyRow("Wine Mono", detail: "Install workflow not available yet", available: false)
+                    }
+                    .padding(18)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground),
+                                in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                }
+                .padding()
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("Containers")
+            .task { calculatePrefixSize() }
+        }
+    }
+
+    private func dependencyRow(_ title: String, detail: String, available: Bool) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: available ? "checkmark.circle.fill" : "arrow.down.circle")
+                .foregroundStyle(available ? .green : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.subheadline.bold())
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    private func containerDetail(_ title: String, value: String, icon: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .foregroundStyle(.secondary)
+                .frame(width: 24)
+            Text(title)
+            Spacer()
+            Text(value)
+                .foregroundStyle(.secondary)
+        }
+        .font(.subheadline)
+    }
+
+    private var activityScreen: some View {
+        NavigationStack {
+            portraitBody
+                .navigationTitle("Activity")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    Menu {
+                        Button("Runtime Status", systemImage: "gauge.with.dots.needle.50percent") {
+                            showRuntimeStatus = true
+                        }
+                        Button("View Logs", systemImage: "text.alignleft") {
+                            showActivityLogs = true
+                        }
+                        Button("Clear Log", systemImage: "trash", role: .destructive) {
+                            logStore.clear()
+                        }
+                        Button("Runtime Settings", systemImage: "gearshape") {
+                            selectedTab = .settings
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+                .sheet(isPresented: $showActivityLogs) {
+                    activityLogsSheet
+                }
+                .sheet(isPresented: $showRuntimeStatus) {
+                    runtimeStatusSheet
+                }
+        }
+    }
+
+    private var activityLogsSheet: some View {
         NavigationStack {
             Group {
-                if vSizeClass == .compact {
-                    landscapeBody
+                if logStore.entries.isEmpty {
+                    ContentUnavailableView("No Activity Yet",
+                                           systemImage: "text.alignleft",
+                                           description: Text("Runtime messages will appear here."))
                 } else {
-                    portraitBody
+                    logConsole
                 }
             }
-            // Rotation destroys/recreates the UIViewRepresentable across
-            // this if/else (two SwiftUI identities) — HARMLESS since
-            // 2026-07-05: MetalHostView is a process-lifetime singleton;
-            // a fresh placeholder only re-parents the same CAMetalLayer.
-            .navigationTitle("Madeira")
+            .navigationTitle("Session Log")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationBarHidden(vSizeClass == .compact)
-            .onAppear {
-                jit_install_trap_handler()
-                entitlements = EntitlementStatus.check()
-                logEntitlementStatus()
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Clear", role: .destructive) { logStore.clear() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { showActivityLogs = false }
+                }
             }
         }
     }
 
-    /// Portrait: classic tooling layout — header, badges, 240pt game strip,
-    /// key row, action buttons, log console.
-    private var portraitBody: some View {
-        VStack(spacing: 0) {
-            // Readouts sit ABOVE the game strip, closest to the surface they
-            // describe: entitlement indicators, then the present/FPS readout,
-            // then the surface itself. (Only the KEY row stays below — it is
-            // input, not instrumentation.)
-            //
-            // NOTE: the surface is a raw window-level view positioned over the
-            // placeholder (MetalHostView.shared), so SwiftUI content laid "on
-            // top" of the strip is covered — these rows must be siblings above
-            // it, never overlays on it.
-            if let ents = entitlements {
-                entitlementBadges(ents)
-            }
-            HStack(spacing: 6) {
-                FPSOverlay()
-                Spacer()
-            }
-            .padding(.horizontal, 8)
-            .padding(.bottom, 4)
-            MadeiraMetalView()
-                .frame(height: 240)
-                .background(Color.black)
-                .onAppear { TouchControlsHost.attach() }
-                .onReceive(NotificationCenter.default.publisher(
-                    for: UIDevice.orientationDidChangeNotification)) { _ in
-                    TouchControlsHost.attach()   // re-frame to the new bounds
+    private var runtimeStatusSheet: some View {
+        NavigationStack {
+            List {
+                Section("Session") {
+                    LabeledContent("Desktop", value: wineserver_is_running() != 0 ? "Running" : "Ready")
+                    LabeledContent("Architecture", value: "ARM64EC")
+                    LabeledContent("Graphics", value: "DXMT · Metal")
                 }
-            HStack(spacing: 6) {
-                if pointerPanel {
-                    // The cursor button has slid to the leftmost slot and become
-                    // the close control; matchedGeometryEffect animates the slide.
-                    pointerToggleButton
-                    pointerModeToggle
-                    pointerSensSlider
-                } else {
-                    Group {
-                        keyButton("⏎", vk: 0x0D)   // VK_RETURN
-                        keyButton("␣", vk: 0x20)   // VK_SPACE
-                        keyButton("Esc", vk: 0x1B) // VK_ESCAPE
-                        Button { MetalBackedView.toggleKeyboard() } label: {
-                            Text("⌨").font(.system(size: 20))
-                                .frame(minWidth: 40, minHeight: 32)
-                                .background(Color.secondary.opacity(0.25))
-                                .cornerRadius(6)
-                        }
-                        JoystickKeyView()
+                Section("Runtime Pipeline") {
+                    pipelineRow("wineserver", detail: "Single-process service thread",
+                                state: wineserver_is_running() != 0 ? "Running" : "Idle",
+                                color: wineserver_is_running() != 0 ? .green : .secondary)
+                    pipelineRow("FEX", detail: "x86-64 translation and JIT",
+                                state: debuggerAttached ? "Ready" : "Needs JIT",
+                                color: debuggerAttached ? .green : .orange)
+                    pipelineRow("DXMT", detail: "Direct3D 11 to Metal",
+                                state: wineserver_is_running() != 0 ? "Attached" : "Standby",
+                                color: wineserver_is_running() != 0 ? .green : .secondary)
+                }
+                Section("Diagnostics") {
+                    LabeledContent("Frame pacing", value: "Visible during a session")
+                    LabeledContent("Termination reports", value: "iPadOS Diagnostics")
+                    Text("Pipeline states reflect real session availability. Detailed per-thread timing is not exposed by the current runtime.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Device Capabilities") {
+                    if let ents = entitlements {
+                        capabilityRow("JIT", enabled: debuggerAttached)
+                        capabilityRow("Increased memory", enabled: ents.increasedMemory)
+                        capabilityRow("64-bit address space", enabled: ents.extendedVA)
                     }
-                    .transition(.opacity)
-                    pointerToggleButton
-                    diagToggleButton
-                    Spacer()
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            // The expanded pad overflows this row; without a raised zIndex the
-            // later VStack siblings (action buttons, log) would draw over it.
-            .zIndex(10)
-            Divider()
-            actionButtons
-            Divider()
-            logConsole
+            .navigationTitle("Runtime Status")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                Button("Done") { showRuntimeStatus = false }
+            }
         }
+    }
+
+    private func pipelineRow(_ title: String, detail: String, state: String, color: Color) -> some View {
+        HStack(spacing: 12) {
+            Circle().fill(color).frame(width: 9, height: 9)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.subheadline.bold())
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(state).font(.caption.bold()).foregroundStyle(color)
+        }
+    }
+
+    private var fullScreenDesktop: some View {
+        ZStack {
+            Color.black
+            MadeiraMetalView()
+        }
+        .ignoresSafeArea()
+        .statusBarHidden(true)
+        .onAppear {
+            MetalHostView.shared.isHidden = false
+            touchControls.fullScreen = true
+            if touchControls.visible { touchControls.ensureDefaultLayout() }
+            TouchControlsHost.attach()
+            requestOrientation(.landscape)
+        }
+        .onDisappear {
+            touchControls.editing = false
+            touchControls.fullScreen = false
+            requestOrientation(MadeiraAppDelegate.normalOrientations)
+        }
+    }
+
+    private func requestOrientation(_ orientations: UIInterfaceOrientationMask) {
+        MadeiraAppDelegate.orientationLock = orientations
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) else { return }
+        let root = scene.keyWindow?.rootViewController
+        // UIKit caches supportedInterfaceOrientations. Invalidate it before
+        // asking the scene for new geometry, then repeat on the next run-loop
+        // turn after SwiftUI has completed its full-screen layout swap.
+        root?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        if #available(iOS 16.0, *) {
+            DispatchQueue.main.async {
+                root?.setNeedsUpdateOfSupportedInterfaceOrientations()
+                scene.requestGeometryUpdate(
+                    UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: orientations)
+                ) { error in
+                    LogStore.shared.log("Orientation request failed: \(error.localizedDescription)",
+                                        level: .error)
+                }
+                // The controller overlay lives in its own transparent UIWindow.
+                // UIKit updates the app window when scene geometry changes, but
+                // this manually framed auxiliary window can retain the old
+                // portrait bounds. Re-attach on the next layout turns so its
+                // safe-area toolbar follows the landscape scene instead of
+                // landing in the middle of the display.
+                TouchControlsHost.attach()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    TouchControlsHost.attach()
+                }
+            }
+        }
+    }
+
+    private var settingsScreen: some View {
+        NavigationStack {
+            Form {
+                Section("Input") {
+                    Picker("Pointer mode", selection: $input.relative) {
+                        Text("Absolute").tag(false)
+                        Text("Relative").tag(true)
+                    }
+                    HStack {
+                        Text("Sensitivity")
+                        Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8.0)
+                        Text(String(format: "%.1f", input.relative ? input.sensRel : input.sensAbs))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .frame(width: 28)
+                    }
+                    Toggle(isOn: $touchControls.visible) {
+                        Label("Touch controller overlay", systemImage: "gamecontroller")
+                    }
+                    Button {
+                        touchControls.visible = true
+                        touchControls.ensureDefaultLayout()
+                        touchControls.editing = true
+                        desktopFullScreen = true
+                    } label: {
+                        Label("Open layout editor", systemImage: "rectangle.and.hand.point.up.left")
+                    }
+                }
+
+                Section("FEX Engine") {
+                    Picker("Default profile", selection: $compatibilityMode) {
+                        Text("Stability").tag("Stability")
+                        Text("Performance").tag("Performance")
+                    }
+                    LabeledContent("Translation", value: "x86-64 → ARM64")
+                    LabeledContent("JIT", value: statusText)
+                    NavigationLink("Engine diagnostics") {
+                        List {
+                            Section("Capabilities") {
+                                if let ents = entitlements {
+                                    capabilityRow("JIT", enabled: debuggerAttached)
+                                    capabilityRow("Increased memory", enabled: ents.increasedMemory)
+                                    capabilityRow("64-bit address space", enabled: ents.extendedVA)
+                                }
+                            }
+                            Section("Diagnostics") {
+                                Toggle("Detailed runtime diagnostics", isOn: $input.diagnostics)
+                            }
+                        }
+                        .navigationTitle("FEX Engine")
+                    }
+                }
+
+                Section("DXMT Renderer") {
+                    LabeledContent("API", value: "Direct3D 11")
+                    LabeledContent("Backend", value: "Metal")
+                    LabeledContent("Build", value: "Bundled")
+                    Text("Per-title DXMT overrides can be supplied through madeira-dxmt.txt in Files.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Help") {
+                    NavigationLink {
+                        SetupGuideView()
+                    } label: {
+                        Label("Setup guide", systemImage: "book.closed")
+                    }
+                }
+
+                Section("About") {
+                    LabeledContent("Madeira", value: "0.1.0")
+                    LabeledContent("Device", value: deviceInfo)
+                }
+            }
+            .navigationTitle("Settings")
+        }
+    }
+
+    private func capabilityRow(_ title: String, enabled: Bool) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Image(systemName: enabled ? "checkmark.circle.fill" : "xmark.circle")
+                .foregroundStyle(enabled ? .green : .orange)
+        }
+    }
+
+    /// Portrait session overview. Detailed capabilities and logs deliberately
+    /// live in sheets so the primary surface stays focused on the desktop.
+    private var portraitBody: some View {
+        VStack(spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: "desktopcomputer")
+                    .font(.title3.bold())
+                    .foregroundStyle(.indigo)
+                    .frame(width: 46, height: 46)
+                    .background(.indigo.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Windows Desktop")
+                        .font(.headline)
+                    Label(wineserver_is_running() != 0 ? "Session running" : "Ready to launch",
+                          systemImage: "circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(wineserver_is_running() != 0 ? .green : .secondary)
+                }
+                Spacer()
+                Button {
+                    showRuntimeStatus = true
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.title3)
+                }
+            }
+            .padding(.horizontal)
+
+            MadeiraMetalView()
+                .frame(maxWidth: .infinity)
+                .frame(height: hSizeClass == .regular ? 520 : 360)
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .padding(.horizontal)
+
+            activityControls
+
+            Button {
+                showActivityLogs = true
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "text.alignleft")
+                        .foregroundStyle(.indigo)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Session Log")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.primary)
+                        Text(logStore.entries.isEmpty
+                             ? "No runtime messages"
+                             : "\(logStore.entries.count) recent events")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.bold())
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(15)
+                .background(Color(uiColor: .secondarySystemGroupedBackground),
+                            in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 8)
+        .background(Color(uiColor: .systemGroupedBackground))
+    }
+
+    private var activityControls: some View {
+        HStack(spacing: 10) {
+            Button {
+                touchControls.visible.toggle()
+                if touchControls.visible { touchControls.ensureDefaultLayout() }
+            } label: {
+                Label(touchControls.visible ? "Controller On" : "Controller",
+                      systemImage: touchControls.visible ? "gamecontroller.fill" : "gamecontroller")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .tint(touchControls.visible ? .indigo : .secondary)
+
+            Button {
+                desktopFullScreen = true
+            } label: {
+                Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.indigo)
+        }
+        .controlSize(.large)
+        .padding(.horizontal)
+        .padding(.bottom, 10)
     }
 
     /// Landscape: game mode. Full-height 4:3 surface centered (aspect-fit
@@ -1129,6 +1605,53 @@ struct ContentView: View {
         if !ents.extendedVA {
             logStore.log("  Tip: Use GetMoreRam to inject extended-virtual-addressing", level: .info)
         }
+    }
+
+    private func openDocumentsInFiles() {
+        guard let url = URL(string: "shareddocuments://") else { return }
+        UIApplication.shared.open(url) { opened in
+            if !opened {
+                logStore.log("Files could not be opened. Madeira Documents remains available under On My iPad.", level: .error)
+            }
+        }
+    }
+
+    private func calculatePrefixSize() {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let prefix = documents.appendingPathComponent("wine", isDirectory: true)
+        DispatchQueue.global(qos: .utility).async {
+            let keys: Set<URLResourceKey> = [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
+            let enumerator = FileManager.default.enumerator(at: prefix,
+                                                            includingPropertiesForKeys: Array(keys),
+                                                            options: [.skipsHiddenFiles])
+            var bytes: Int64 = 0
+            while let file = enumerator?.nextObject() as? URL {
+                guard let values = try? file.resourceValues(forKeys: keys),
+                      values.isRegularFile == true else { continue }
+                bytes += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+            }
+            let text = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            DispatchQueue.main.async { prefixSizeText = text }
+        }
+    }
+
+    private func prepareLibraryLaunch(_ title: String) {
+        selectedTab = .activity
+        logStore.log("\(title): \(compatibilityMode) launch profile selected")
+        if compatibilityMode == "Performance" {
+            // The production path's tested FEX defaults remain the performance
+            // profile. Stability is intentionally metadata-only until a
+            // conservative flag set has been validated on real titles.
+            unsetenv("FEX_O0")
+        }
+    }
+
+    private func launchThumper() {
+        prepareLibraryLaunch("Thumper")
+        setenv("MADEIRA_EXE", "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
+        unsetenv("MADEIRA_ARGS")
+        unsetenv("MADEIRA_DESKTOP")
+        runWineFullSequence()
     }
 
     private var actionButtons: some View {
@@ -1466,14 +1989,7 @@ struct ContentView: View {
                 .tint(.orange)
 
                 Button("Thumper (standalone)") {
-                    // Game lives at Documents/wine/drive_c/Program Files/Thumper/
-                    // (push via scripts/deploy-thumper.sh during development;
-                    // bundled as resource for distribution later).
-                    setenv("MADEIRA_EXE",
-                           "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
-                    unsetenv("MADEIRA_ARGS")
-                    unsetenv("MADEIRA_DESKTOP")
-                    runWineFullSequence()
+                    launchThumper()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
@@ -1514,17 +2030,29 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .tint(.red)
             }
-            .padding()
+            .padding(.vertical, 6)
         }
+        .defaultScrollAnchor(.leading)
     }
 
     private func runTriangleTest() {
         logStore.log("D3D11 triangle test: full sequence", level: .info)
-        // Reuse the existing full Wine sequence but target triangle.exe.
-        // WineProcessBridge has the program baked in for now — to flip it
-        // requires a signature change. For this iteration we rely on the
-        // build's WineProcessBridge.m pointing at triangle.exe.
+        setenv("MADEIRA_EXE", "cube.exe", 1)
+        unsetenv("MADEIRA_USE_ARM64EC")
+        unsetenv("MADEIRA_DESKTOP")
+#if MADEIRA_SIMULATOR_REAL_RUNTIME
+        // The simulator and cube.exe are both ARM64, so this path needs Wine
+        // and DXMT but no FEX translation or executable JIT pool.
+        selectedTab = .activity
+        logStore.log("Simulator ARM64 path: starting Wine without FEX/JIT", level: .success)
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.startWineserver()
+            Thread.sleep(forTimeInterval: 1.0)
+            self.startWineProcess()
+        }
+#else
         runWineFullSequence()
+#endif
     }
 
     private var logConsole: some View {
@@ -2546,7 +3074,8 @@ final class TouchControlsModel: ObservableObject {
     static let baseDiameter: CGFloat = 64
 
     @Published var controls: [TouchControl] = [] { didSet { save() } }
-    @Published var visible = true               { didSet { save() } }
+    @Published var visible = false              { didSet { save() } }
+    @Published var fullScreen = false           // transient; overlay belongs to the desktop
     @Published var editing = false              // transient, never persisted
     @Published var selected: UUID?              // transient
 
@@ -2580,6 +3109,16 @@ final class TouchControlsModel: ObservableObject {
         return controls.firstIndex { $0.id == id }
     }
 
+    func ensureDefaultLayout() {
+        guard controls.isEmpty else { return }
+        controls = [
+            TouchControl(nx: 0.16, ny: 0.72, scale: 1.35, action: .joystickWASD),
+            TouchControl(nx: 0.84, ny: 0.72, scale: 1.05, action: .mouseLeft),
+            TouchControl(nx: 0.73, ny: 0.60, scale: 0.88, action: .key(0x20)),
+            TouchControl(nx: 0.90, ny: 0.55, scale: 0.78, action: .key(0x1B)),
+        ]
+    }
+
     /// ml644: does this WINDOW point land on something interactive?
     ///
     /// Hit-test geometrically, never by walking the UIView hierarchy. SwiftUI
@@ -2590,12 +3129,10 @@ final class TouchControlsModel: ObservableObject {
     /// touch in the window. Nothing responded, and edit mode — whose branch
     /// captured everything — could never be entered to mask it.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
-        // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down.
-        // Padded generously; a few points of slop costs nothing and a missed tap
-        // costs a build.
-        let barW: CGFloat = 2 * 44 + 10
-        if CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
-                  width: barW + 20, height: 68).contains(p) { return true }
+        // The full-screen toolbar is safe-area-aligned at the top trailing
+        // edge. Reserve its shallow row for the controls window; below it,
+        // empty overlay space remains click-through to the Windows surface.
+        if p.y < 100 { return true }
         guard visible else { return false }
         for c in controls {
             let r = Self.baseDiameter * CGFloat(c.scale) / 2
@@ -2619,8 +3156,7 @@ final class ControlsWindow: UIWindow {
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
-        // Portrait draws nothing here, so it must consume nothing.
-        guard bounds.width > bounds.height else { return nil }
+        guard m.fullScreen else { return nil }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
         return super.hitTest(point, with: event)
     }
@@ -2661,22 +3197,23 @@ struct TouchControlsOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            // Landscape only; portrait keeps the existing key row and joystick.
-            let landscape = geo.size.width > geo.size.height
-            ZStack(alignment: .top) {
-                if landscape {
+            ZStack(alignment: .topTrailing) {
+                if m.fullScreen {
                     if m.visible || m.editing {
                         ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
                         }
                     }
                     topBar
+                        .padding(.top, geo.safeAreaInsets.top + 10)
+                        .padding(.trailing, geo.safeAreaInsets.trailing + 12)
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
                 }
             }
-            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            .frame(width: geo.size.width, height: geo.size.height,
+                   alignment: .topTrailing)
             .contentShape(Rectangle())
             .gesture(scalePinch)
         }
@@ -2685,24 +3222,33 @@ struct TouchControlsOverlay: View {
 
     private var topBar: some View {
         HStack(spacing: 10) {
-            glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
-            glassButton(m.editing ? "checkmark" : "pencil") {
-                m.editing.toggle()
-                if !m.editing { m.selected = nil }
+            glassButton("xmark") {
+                m.editing = false
+                NotificationCenter.default.post(
+                    name: Notification.Name("MadeiraExitFullScreen"), object: nil)
             }
-            if m.editing {
-                glassButton("plus") {
-                    var c = TouchControl()
-                    // Stagger, so repeated adds do not stack invisibly.
-                    c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
-                    c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
-                    m.controls.append(c)
-                    m.selected = c.id
+            glassButton("gamecontroller", dim: !m.visible) {
+                m.visible.toggle()
+                if m.visible { m.ensureDefaultLayout() }
+            }
+            if m.visible {
+                glassButton(m.editing ? "checkmark" : "pencil") {
+                    m.editing.toggle()
+                    if !m.editing { m.selected = nil }
                 }
-                .transition(.opacity.combined(with: .scale))
+                if m.editing {
+                    glassButton("plus") {
+                        var c = TouchControl()
+                        // Stagger, so repeated adds do not stack invisibly.
+                        c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
+                        c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
+                        m.controls.append(c)
+                        m.selected = c.id
+                    }
+                    .transition(.opacity.combined(with: .scale))
+                }
             }
         }
-        .padding(.top, 10)
         .animation(.easeInOut(duration: 0.22), value: m.editing)
     }
 

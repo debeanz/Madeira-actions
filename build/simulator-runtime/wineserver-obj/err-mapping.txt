@@ -1,0 +1,4 @@
+/Users/justin/Documents/GitHub/Madeira-actions/build/wineserver/mapping_ios.c:366:36: warning: '/*' within block comment [-Wcomment]
+  366 |  * file opens (e.g. Thumper's cache/*.pc). Exec-dir probing is gone with it:
+      |                                    ^
+1 warning generated.

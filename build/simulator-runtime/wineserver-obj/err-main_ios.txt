@@ -1,0 +1,7 @@
+/Users/justin/Documents/GitHub/Madeira-actions/build/wineserver/main_ios.c:4:9: warning: 'main' macro redefined [-Wmacro-redefined]
+    4 | #define main wineserver_main_original
+      |         ^
+<command line>:5:9: note: previous definition is here
+    5 | #define main wineserver_main
+      |         ^
+1 warning generated.

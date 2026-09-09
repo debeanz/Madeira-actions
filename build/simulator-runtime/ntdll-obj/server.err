@@ -1,0 +1,16 @@
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/server_ios.c:1888:21: warning: 'pipe2' is only available on iOS 27.0 or newer [-Wunguarded-availability-new]
+ 1888 |         if (!(ret = pipe2( fd, O_CLOEXEC ))) return ret;
+      |                     ^~~~~
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk/usr/include/sys/unistd.h:219:9: note: 'pipe2' has been marked as being introduced in iOS 27.0 here, but the deployment target is iOS 17.0.0
+  219 | int     pipe2(int [2], int);
+      |         ^
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/server_ios.c:1888:21: note: enclose 'pipe2' in a __builtin_available check to silence this warning
+ 1888 |         if (!(ret = pipe2( fd, O_CLOEXEC ))) return ret;
+      |                     ^~~~~                               
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/server_ios.c:2054:67: warning: using 'public' format specifier annotation outside of os_log()/os_trace() [-Wformat]
+ 2054 |             wine_log_write("[Wine connect] socket lstat failed: %{public}s", strerror(errno));
+      |                                                                 ~~^~~~~~~~
+/Users/justin/Documents/GitHub/Madeira-actions/build/ntdll-unix/server_ios.c:2095:58: warning: using 'public' format specifier annotation outside of os_log()/os_trace() [-Wformat]
+ 2095 |         wine_log_write("[Wine connect] connect failed: %{public}s", strerror(errno));
+      |                                                        ~~^~~~~~~~
+3 warnings generated.

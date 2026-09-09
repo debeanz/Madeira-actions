@@ -1946,7 +1946,88 @@ static void *ios_mach_exception_thread( void *arg )
                      *  - base reg VALUE vs fault_addr: equal => the register
                      *    literally held the small offset.
                      * Capped at 4 reports so a fault storm can't flood. */
-                    if (rn != 18)
+                    /* Some Windows ARM64 helpers materialise a TEB-relative
+                     * pointer with ADD (shifted/extended register or immediate)
+                     * and use that temporary a couple of instructions later.
+                     * The ADD itself cannot fault when Darwin supplies x18=0,
+                     * so recognize the producing instruction close behind the
+                     * fault and restore the omitted TEB base to its destination.
+                     * Requiring both Rn==x18 and Rd==the faulting base register
+                     * keeps this tied to an actual x18 data-flow instruction. */
+                    if (rn != 18 && rn < 29)
+                    {
+                        const uint32_t *words = (const uint32_t *)(uintptr_t)fault_pc;
+                        int back, produced_from_x18 = 0;
+
+                        for (back = 1; back <= 4; back++)
+                        {
+                            uint32_t prev = words[-back];
+                            int prev_rn = (prev >> 5) & 0x1f;
+                            int prev_rd = prev & 0x1f;
+                            int is_add_reg = ((prev & 0xff200000) == 0x8b000000) ||
+                                             ((prev & 0xff200000) == 0x8b200000);
+                            int is_add_imm = (prev & 0xff000000) == 0x91000000;
+
+                            if (prev_rn == 18 && prev_rd == rn &&
+                                (is_add_reg || is_add_imm))
+                            {
+                                produced_from_x18 = 1;
+                                break;
+                            }
+                        }
+                        if (produced_from_x18)
+                        {
+                            static volatile int indirect_add_count;
+                            uint64_t old_base = state.__x[rn];
+                            int n = __sync_add_and_fetch( &indirect_add_count, 1 );
+
+                            state.__x[rn] += thread_teb;
+                            if (n <= 20)
+                                dprintf( STDERR_FILENO,
+                                    "[x18-indirect-add] #%d pc=%p rn=%d 0x%llx -> 0x%llx "
+                                    "producer=-%d\n", n, (void *)(uintptr_t)fault_pc, rn,
+                                    (unsigned long long)old_base,
+                                    (unsigned long long)state.__x[rn], back );
+                            ios_exc_x18_fixes++;
+                            handled = 1;
+                        }
+                    }
+
+                    /* Two ABI-defined TEB regions can also escape farther
+                     * than the four-instruction producer window: the static
+                     * Unicode string at +0x1258 and Wine's debug-string ring
+                     * at +0x3008. Their bounded ranges are safe to distinguish
+                     * from ordinary low-address faults. The debug ring's
+                     * ARM64 implementation first materialises that address
+                     * with `add xN,x18,xN`, then tail-calls memcpy. Darwin
+                     * silently evaluates the ADD with its reserved x18=0,
+                     * so memcpy later faults through xN rather than x18. This
+                     * tightly bounded range identifies that one TEB scratch
+                     * buffer without treating ordinary near-NULL accesses as
+                     * TEB references. Restore the missing base and retry the
+                     * faulting memory instruction unchanged. */
+                    if (!handled && rn != 18 && rn < 29 &&
+                        (((state.__x[rn] >= 0x1200 && state.__x[rn] < 0x1300) &&
+                          (fault_addr >= 0x1200 && fault_addr < 0x1300)) ||
+                         ((state.__x[rn] >= 0x3000 && state.__x[rn] < 0x4008) &&
+                          (fault_addr >= 0x2ff0 && fault_addr < 0x4008))))
+                    {
+                        static volatile int indirect_teb_count;
+                        uint64_t old_base = state.__x[rn];
+                        int n = __sync_add_and_fetch( &indirect_teb_count, 1 );
+
+                        state.__x[rn] += thread_teb;
+                        if (n <= 12)
+                            dprintf( STDERR_FILENO,
+                                "[x18-indirect] #%d pc=%p rn=%d 0x%llx -> 0x%llx "
+                                "(known TEB range)\n", n, (void *)(uintptr_t)fault_pc, rn,
+                                (unsigned long long)old_base,
+                                (unsigned long long)state.__x[rn] );
+                        ios_exc_x18_fixes++;
+                        handled = 1;
+                    }
+
+                    if (!handled && rn != 18)
                     {
                         static int ios_x18_decline_reports;
                         if (ios_x18_decline_reports < 4)
@@ -1975,7 +2056,7 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                     }
 
-                    if (rn == 18)
+                    if (!handled && rn == 18)
                     {
                         uintptr_t ea = thread_teb + fault_addr;
                         int rt = insn & 0x1f;

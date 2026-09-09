@@ -1,0 +1,6 @@
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/BlobContainer.cpp:3:
+In file included from /Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/libs/DXBCParser/DXBCUtils.h:5:
+/Users/justin/Documents/GitHub/Madeira-actions/research/dxmt/include/native/directx/d3d11.h:801:1: warning: empty struct has size 0 in C, size 1 in C++ [-Wextern-c-compat]
+  801 | struct CD3D11_DEFAULT {};
+      | ^
+1 warning generated.

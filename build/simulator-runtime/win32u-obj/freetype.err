@@ -1,0 +1,4 @@
+/Users/justin/Documents/GitHub/Madeira-actions/build/win32u-unix/freetype_ios.c:37:5: warning: null returned from function that requires a non-null return value [-Wnonnull]
+   37 |     return NULL;
+      |     ^      ~~~~
+1 warning generated.
