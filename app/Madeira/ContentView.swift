@@ -1133,6 +1133,11 @@ struct ContentView: View {
                         Button("Clear Log", systemImage: "trash", role: .destructive) {
                             logStore.clear()
                         }
+                        // The full Wine log on disk (Documents/madeira-log.txt),
+                        // for sending a crash trace without the Files app.
+                        ShareLink(item: wineLogFileURL) {
+                            Label("Export Log File", systemImage: "square.and.arrow.up")
+                        }
                         Button("Runtime Settings", systemImage: "gearshape") {
                             selectedTab = .settings
                         }
@@ -1500,6 +1505,19 @@ struct ContentView: View {
 
     private var activityControls: some View {
         HStack(spacing: 10) {
+            // Same launch as Library → Developer tools → Wine Virtual Desktop,
+            // reachable from the tab where the desktop is actually shown.
+            Button {
+                launchVirtualDesktop()
+            } label: {
+                Label(wineserver_is_running() != 0 ? "Running" : "Start Desktop",
+                      systemImage: wineserver_is_running() != 0 ? "desktopcomputer.and.arrow.down" : "play.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.mint)
+            .disabled(wineserver_is_running() != 0)
+
             Button {
                 touchControls.visible.toggle()
                 if touchControls.visible { touchControls.ensureDefaultLayout() }
@@ -1732,6 +1750,47 @@ struct ContentView: View {
             // conservative flag set has been validated on real titles.
             unsetenv("FEX_O0")
         }
+    }
+
+    /// Documents/madeira-log.txt, written by wine_log_set_file in
+    /// WineProcessBridge.m. Survives a crash, unlike the in-memory session log.
+    private var wineLogFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("madeira-log.txt")
+    }
+
+    /// Explorer shell desktop with services.exe as its child.
+    ///
+    /// S3-pre R2v2: raw rpcss.exe CANNOT run standalone — its wmain
+    /// unconditionally StartServiceCtrlDispatcherW's (rpcss_main.c:282),
+    /// which RPCs back to the SCM; without services.exe it raised + wedged
+    /// in service_run_main_thread, and explorer's CoRegisterClassObject
+    /// wedged behind it (seq-3680 run). Proper bootstrap: explorer's
+    /// cmdline child = services.exe (SCM host, windows-subsystem = no
+    /// console). It creates \pipe\svcctl early, runs auto-start services
+    /// (MountMgr/Eventlog/NDIS/nsiproxy/PlugPlay — winedevice/plugplay are
+    /// bundled; failures tolerated), and combase's start_rpcss then
+    /// demand-starts RpcSs through the SCM with a 30s start-pending wait →
+    /// rpcss runs as services' child (3-deep tree, proven depth) with a
+    /// proper dispatcher connection → epmapper up → real COM. Known risk:
+    /// if shellwindows_init beats services.exe's RPC_Init, OpenSCManager
+    /// fails → watch whether that fails fast or hits the
+    /// RaiseException→CS wedge again.
+    ///
+    /// Desktop size comes from Settings → Virtual Desktop (default
+    /// 960x540). Games launched from this desktop get a mode list capped
+    /// at this size.
+    private func launchVirtualDesktop() {
+        selectedTab = .activity
+        let (deskW, deskH) = desktopSize
+        logStore.log("Virtual desktop: \(deskW)x\(deskH)")
+        setenv("MADEIRA_EXE", "explorer.exe", 1)
+        setenv("MADEIRA_ARGS",
+               "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
+        setenv("MADEIRA_DESKTOP", "1", 1)
+        setenv("MADEIRA_SCREEN_W", String(deskW), 1)
+        setenv("MADEIRA_SCREEN_H", String(deskH), 1)
+        runWineFullSequence()
     }
 
     private func launchThumper() {
@@ -2019,36 +2078,7 @@ struct ContentView: View {
                 .tint(.green)
 
                 Button("Wine Virtual Desktop") {
-                    // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
-                    // its wmain unconditionally StartServiceCtrlDispatcherW's
-                    // (rpcss_main.c:282), which RPCs back to the SCM; without
-                    // services.exe it raised + wedged in
-                    // service_run_main_thread, and explorer's
-                    // CoRegisterClassObject wedged behind it (seq-3680 run).
-                    // Proper bootstrap: explorer's cmdline child = services.exe
-                    // (SCM host, windows-subsystem = no console). It creates
-                    // \pipe\svcctl early, runs auto-start services (MountMgr/
-                    // Eventlog/NDIS/nsiproxy/PlugPlay — winedevice/plugplay
-                    // are bundled; failures tolerated), and combase's
-                    // start_rpcss then demand-starts RpcSs through the SCM
-                    // with a 30s start-pending wait → rpcss runs as services'
-                    // child (3-deep tree, proven depth) with a proper
-                    // dispatcher connection → epmapper up → real COM.
-                    // Known risk: if shellwindows_init beats services.exe's
-                    // RPC_Init, OpenSCManager fails → watch whether that
-                    // fails fast or hits the RaiseException→CS wedge again.
-                    // Desktop size comes from Settings → Virtual Desktop
-                    // (default 960x540). Games launched from this desktop
-                    // get a mode list capped at this size.
-                    let (deskW, deskH) = desktopSize
-                    logStore.log("Virtual desktop: \(deskW)x\(deskH)")
-                    setenv("MADEIRA_EXE", "explorer.exe", 1)
-                    setenv("MADEIRA_ARGS",
-                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
-                    setenv("MADEIRA_DESKTOP", "1", 1)
-                    setenv("MADEIRA_SCREEN_W", String(deskW), 1)
-                    setenv("MADEIRA_SCREEN_H", String(deskH), 1)
-                    runWineFullSequence()
+                    launchVirtualDesktop()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.mint)

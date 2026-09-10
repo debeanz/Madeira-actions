@@ -48,7 +48,7 @@ typedef struct { WORD VirtualKey; WCHAR Unicode; WORD Flags; BYTE UserIndex, Hid
 /* ---- unix call bootstrap ------------------------------------------------- */
 
 typedef LONG NTSTATUS;
-typedef NTSTATUS (WINAPI *unix_call_fn)(UINT64 handle, unsigned int code, void *args);
+typedef NTSTATUS (*unix_call_fn)(UINT64 handle, unsigned int code, void *args);
 typedef NTSTATUS (WINAPI *nt_qvm_fn)(HANDLE process, PVOID addr, int info_class,
                                      PVOID buffer, SIZE_T len, SIZE_T *res_len);
 #define MEMORY_WINE_LOAD_UNIX_LIB 1000   /* MemoryWineLoadUnixLib, wine include/winternl.h */
@@ -56,14 +56,34 @@ typedef NTSTATUS (WINAPI *nt_qvm_fn)(HANDLE process, PVOID addr, int info_class,
 extern IMAGE_DOS_HEADER __ImageBase;
 
 static UINT64 g_unix_handle;
-static unix_call_fn g_unix_call;
+/* Not static: the naked thunk below references it by symbol name. */
+unix_call_fn madeira_xinput_unix_dispatcher;
 static volatile LONG g_init_state;       /* 0 untried, 1 ok, -1 failed */
 static BOOL g_enabled = TRUE;            /* XInputEnable */
+
+/* ntdll exports no callable unix-call FUNCTION, only the dispatcher
+ * pointer variables (`@ extern -private __wine_unix_call_dispatcher` and
+ * the arm64ec twin in ntdll.spec). The arm64ec slot holds the native
+ * ARM64 unix dispatcher, which is what ARM64EC code must use.
+ *
+ * It has to be reached with a plain branch, exactly as winecrt0's
+ * __wine_unix_call_arm64ec does: an ordinary C indirect call in ARM64EC
+ * code goes through __os_arm64x_check_icall, which classifies a target
+ * outside any PE image as x64 code and would run the unix dispatcher
+ * under the emulator. */
+__attribute__((naked)) static NTSTATUS unix_call(UINT64 handle, unsigned int code, void *args)
+{
+    __asm__(
+        "adrp x16, madeira_xinput_unix_dispatcher\n\t"
+        "ldr  x16, [x16, :lo12:madeira_xinput_unix_dispatcher]\n\t"
+        "br   x16\n\t");
+}
 
 static BOOL init_unix(void)
 {
     HMODULE ntdll;
     nt_qvm_fn qvm;
+    unix_call_fn *slot;
     NTSTATUS st;
 
     if (g_init_state == 1) return TRUE;
@@ -71,16 +91,15 @@ static BOOL init_unix(void)
 
     ntdll = GetModuleHandleW(L"ntdll.dll");
     qvm = ntdll ? (nt_qvm_fn)GetProcAddress(ntdll, "NtQueryVirtualMemory") : NULL;
-    /* On ARM64EC the generic entry is an inline wrapper around the
-     * arm64ec-specific export (wine/unixlib.h); prefer that, fall back. */
-    g_unix_call = ntdll ? (unix_call_fn)GetProcAddress(ntdll, "__wine_unix_call_arm64ec") : NULL;
-    if (!g_unix_call && ntdll) g_unix_call = (unix_call_fn)GetProcAddress(ntdll, "__wine_unix_call");
-    if (!qvm || !g_unix_call)
+    slot = ntdll ? (unix_call_fn *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher_arm64ec") : NULL;
+    if (!slot && ntdll) slot = (unix_call_fn *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher");
+    if (!qvm || !slot || !*slot)
     {
-        OutputDebugStringA("madeira xinput: ntdll unix-call exports missing\n");
+        OutputDebugStringA("madeira xinput: ntdll unix-call dispatcher missing\n");
         g_init_state = -1;
         return FALSE;
     }
+    madeira_xinput_unix_dispatcher = *slot;
     /* ntdll resolves the module to the statically linked table by the
      * name in our export directory ("xinput..."), see virtual_ios.c. */
     st = qvm(GetCurrentProcess(), &__ImageBase, MEMORY_WINE_LOAD_UNIX_LIB,
@@ -104,7 +123,7 @@ static DWORD fetch(DWORD index, struct madeira_xinput_state *s)
     a.index = index;
     a.pad_ = 0;
     a.state = s;
-    if (g_unix_call(g_unix_handle, MADEIRA_XINPUT_CALL_GET_STATE, &a) != 0) return ERROR_DEVICE_NOT_CONNECTED;
+    if (unix_call(g_unix_handle, MADEIRA_XINPUT_CALL_GET_STATE, &a) != 0) return ERROR_DEVICE_NOT_CONNECTED;
     if (!s->connected) return ERROR_DEVICE_NOT_CONNECTED;
     return ERROR_SUCCESS;
 }
@@ -160,7 +179,7 @@ DWORD WINAPI XInputSetState(DWORD index, XINPUT_VIBRATION *vibration)
     a.index = index;
     a.low = vibration->wLeftMotorSpeed;
     a.high = vibration->wRightMotorSpeed;
-    g_unix_call(g_unix_handle, MADEIRA_XINPUT_CALL_SET_RUMBLE, &a);
+    unix_call(g_unix_handle, MADEIRA_XINPUT_CALL_SET_RUMBLE, &a);
     return ERROR_SUCCESS;
 }
 
