@@ -852,6 +852,7 @@ struct ContentView: View {
     @ObservedObject private var input = InputSettings.shared
     @ObservedObject private var touchControls = TouchControlsModel.shared
     @ObservedObject private var perf = PerfMonitor.shared
+    @ObservedObject private var gamepad = GamepadBridge.shared
     @State private var pointerPanel = false
     @State private var selectedTab: MadeiraTab = .library
     @State private var developerToolsExpanded = false
@@ -930,6 +931,7 @@ struct ContentView: View {
             jit_install_trap_handler()
             entitlements = EntitlementStatus.check()
             logEntitlementStatus()
+            GamepadBridge.shared.start()
             MetalHostView.shared.isHidden = selectedTab != .activity
         }
         .onChange(of: selectedTab) { _, tab in
@@ -1283,6 +1285,16 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
                             .frame(width: 28)
+                    }
+                    NavigationLink {
+                        GamepadSettingsView()
+                    } label: {
+                        HStack {
+                            Label("Physical controller", systemImage: "gamecontroller.fill")
+                            Spacer()
+                            Text(gamepad.controllerName ?? "None")
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     Toggle(isOn: $touchControls.visible) {
                         Label("Touch controller overlay", systemImage: "gamecontroller")
@@ -3655,8 +3667,9 @@ struct MappingPanel: View {
 
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("XInput isn't wired up yet. These save with your layout but do "
-                 + "nothing when pressed — controller support lands with the Wine HID stack.")
+            Text("These chips are placeholders for XInput, which needs the Wine HID stack "
+                 + "and isn't wired up yet. A physical controller works today: bind its "
+                 + "buttons to keys in Settings → Physical controller.")
                 .font(.system(size: 11))
                 .foregroundStyle(.orange.opacity(0.95))
                 .fixedSize(horizontal: false, vertical: true)
