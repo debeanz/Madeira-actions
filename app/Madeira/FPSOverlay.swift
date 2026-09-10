@@ -50,10 +50,10 @@ struct FPSOverlay: View {
     @ObservedObject private var perf = PerfMonitor.shared
     @AppStorage(perfOverlayEnabledKey) private var enabled = true
     @State private var collapsed: Bool = false
-    /// Mirrors DXMT's g_madeira_vsync_mode (read per present, live-safe).
-    /// 1 = locked 60, 0 = display max (120 ProMotion), 2 = raw (frame-skip
-    /// mailbox — game unthrottled, panel shows ≤ display rate).
-    @State private var vsyncMode: Int32 = 1
+    /// DXMT's g_madeira_vsync_mode, read fresh on every redraw (the perf
+    /// monitor publishes 4×/s) so a thermal throttle or a Settings change
+    /// shows here without a local copy going stale.
+    private var cap: FrameCap { FrameCap.current }
 
     var body: some View {
         Group {
@@ -113,8 +113,7 @@ struct FPSOverlay: View {
         }
         .onAppear {
             perf.start()
-            vsyncMode = madeira_get_vsync_locked()
-            ProMotionIntent.shared.setActive(vsyncMode != 1)
+            ProMotionIntent.shared.setActive(cap == .max || cap == .raw)
         }
         .onDisappear { perf.stop() }
     }
@@ -139,40 +138,30 @@ struct FPSOverlay: View {
         .foregroundColor(perf.thermalColor)
     }
 
-    /// Pacing pill, cycles 60 → MAX(n) → RAW → 60. Shared by the wide
-    /// (portrait) and compact (landscape bar) overlay variants.
-    ///   60: presents paced to exactly 60Hz.
+    /// Pacing pill, cycles 60 → 40 → 30 → MAX(n) → RAW → 60. Shared by the
+    /// wide (portrait) and compact (landscape bar) overlay variants.
+    ///   60/40/30: presents paced to exactly that rate (30 and 40 are the
+    ///     cool-running options; 40 sits on every third refresh at 120 Hz).
     ///   MAX(n): free-run to display refresh; n = current cap
     ///     (120 = ProMotion; 60 = thermal/LPM capped).
     ///   RAW: game unthrottled (frame-skip mailbox) — FPS readout =
     ///     raw stack throughput.
+    /// A thermometer glyph is added while the auto cool-down holds the cap
+    /// at 30; tapping then still works and clears the throttle's choice.
     private var pacingPill: some View {
-        Text(pillLabel)
-            .foregroundColor(pillColor)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .overlay(RoundedRectangle(cornerRadius: 4)
-                .stroke(pillColor, lineWidth: 1))
-            .onTapGesture {
-                vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
-                madeira_set_vsync_locked(vsyncMode)
-                ProMotionIntent.shared.setActive(vsyncMode != 1)
+        HStack(spacing: 2) {
+            if perf.thermalThrottled {
+                Image(systemName: "thermometer.medium").font(.system(size: 9))
             }
-    }
-
-    private var pillLabel: String {
-        switch vsyncMode {
-        case 1: return "60"
-        case 0: return "MAX(\(UIScreen.main.maximumFramesPerSecond))"
-        default: return "RAW"
+            Text(cap.label)
         }
-    }
-
-    private var pillColor: Color {
-        switch vsyncMode {
-        case 1: return .cyan
-        case 0: return .pink
-        default: return .orange
+        .foregroundColor(cap.color)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .overlay(RoundedRectangle(cornerRadius: 4)
+            .stroke(cap.color, lineWidth: 1))
+        .onTapGesture {
+            FrameCap.apply(cap.next, persist: true)
         }
     }
 

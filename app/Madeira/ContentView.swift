@@ -862,6 +862,12 @@ struct ContentView: View {
     @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
+    /// Present pacing default (FrameCap raw value) and the thermal throttle.
+    @AppStorage(FrameCap.key) private var frameCapSetting: Int = 1
+    @AppStorage(FrameCap.autoCoolKey) private var autoCoolDown = true
+    /// FEX_TSOENABLED=0: skip x86 memory-ordering emulation. Big CPU saving,
+    /// not safe for every title. Applied by runWineFullSequence.
+    @AppStorage("madeira.fexNoTSO") private var fexNoTSO = false
     /// Screen size of the Wine Virtual Desktop launcher, as "WxH". This is
     /// the display games see: the win32u shim lists every standard mode up
     /// to this size, so it also bounds what a game's own resolution menu
@@ -932,6 +938,7 @@ struct ContentView: View {
             entitlements = EntitlementStatus.check()
             logEntitlementStatus()
             GamepadBridge.shared.start()
+            FrameCap.apply(FrameCap.saved, persist: false)
             MetalHostView.shared.isHidden = selectedTab != .activity
             winios_set_compositor_hidden(selectedTab != .activity ? 1 : 0)
         }
@@ -1315,11 +1322,30 @@ struct ContentView: View {
                     }
                 }
 
+                Section("Performance") {
+                    Picker("Frame rate cap", selection: $frameCapSetting) {
+                        ForEach(FrameCap.allCases) { c in
+                            Text(c.settingsLabel).tag(Int(c.rawValue))
+                        }
+                    }
+                    .onChange(of: frameCapSetting) { _, v in
+                        if let c = FrameCap(rawValue: Int32(v)) { FrameCap.apply(c, persist: true) }
+                    }
+                    Toggle("Cool down automatically", isOn: $autoCoolDown)
+                    Text("A lower cap is the biggest heat saver: the game's frame loop waits on the display, so the CPU translation work per second falls with it. Auto cool-down drops to 30 fps while iOS reports the phone as hot and restores your cap once it is cool. The pill in the overlay changes the cap too.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("FEX Engine") {
                     Picker("Default profile", selection: $compatibilityMode) {
                         Text("Stability").tag("Stability")
                         Text("Performance").tag("Performance")
                     }
+                    Toggle("Skip x86 memory-ordering emulation", isOn: $fexNoTSO)
+                    Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     LabeledContent("Translation", value: "x86-64 → ARM64")
                     LabeledContent("JIT", value: statusText)
                     NavigationLink("Engine diagnostics") {
@@ -2337,6 +2363,16 @@ struct ContentView: View {
         }
 
         logStore.log("Running full Wine sequence...")
+
+        // FEX reads FEX_* from the process environment (ARM64EC Module.cpp
+        // passes _environ to FEX::Config::LoadConfig), and Wine imports the
+        // unix env, so this reaches the game-side translator.
+        if fexNoTSO {
+            setenv("FEX_TSOENABLED", "0", 1)
+            logStore.log("FEX: TSO emulation OFF (experimental, Settings → FEX Engine)")
+        } else {
+            unsetenv("FEX_TSOENABLED")
+        }
 
         // Start a main thread heartbeat to diagnose hang
         var heartbeatCount = 0

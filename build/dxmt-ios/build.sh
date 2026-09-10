@@ -25,6 +25,9 @@ OUT_LIB="${MADEIRA_OUTPUT_LIB:-$BUILD_DIR/libdxmt_unix.a}"
 
 mkdir -p "$OBJ_DIR"
 
+# In-place, idempotent submodule patch: 30/40 fps present caps (modes 3/4).
+python3 "$BUILD_DIR/patch_present_cap.py" "$DXMT_SRC/winemetal/unix/winemetal_unix.c"
+
 COMMON_FLAGS="-arch arm64 -isysroot $SDK $MIN_FLAG -fblocks -O2 $PLATFORM_DEFS"
 INCLUDES="-I$OBJ_DIR -I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"

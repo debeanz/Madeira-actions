@@ -551,7 +551,11 @@ BOOL winios_pProcessEvents(DWORD mask) {
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
         pthread_mutex_unlock(&g_input_q.lock);
 
-        fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        /* One write+flush per input event; with a stick driving mouse-look
+         * that is 60/s of real I/O. Same quiet gate as the pump log above. */
+        if (!quiet) {
+            fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
         else

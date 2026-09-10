@@ -572,7 +572,9 @@ jobs:
             build/dxmt-ios/obj
             app/Madeira/libdxmt_combined.a
             app/Madeira/aarch64-windows
-          key: dxmt-b4b89f0-${{ env.CACHE_V }}
+          # Hashes the unix-side build script and its in-place submodule
+          # patches so a pacing change actually rebuilds libdxmt_combined.a.
+          key: dxmt-b4b89f0-${{ hashFiles('build/dxmt-ios/build.sh', 'build/dxmt-ios/*.py') }}-${{ env.CACHE_V }}
 
       - name: DXMT
         if: steps.dxmt.outputs.cache-hit != 'true'

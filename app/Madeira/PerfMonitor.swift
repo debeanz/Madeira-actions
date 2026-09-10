@@ -2,6 +2,84 @@ import Foundation
 import SwiftUI
 import UIKit
 
+/// DXMT present pacing (g_madeira_vsync_mode). Raw values are the mode
+/// numbers the unix side switches on; 3 and 4 come from
+/// build/dxmt-ios/patch_present_cap.py.
+enum FrameCap: Int32, CaseIterable, Identifiable {
+    case locked60 = 1
+    case cap40 = 4
+    case cap30 = 3
+    case max = 0
+    case raw = 2
+
+    static let key = "madeira.frameCap"
+    static let autoCoolKey = "madeira.autoCoolDown"
+
+    var id: Int32 { rawValue }
+
+    var label: String {
+        switch self {
+        case .locked60: return "60"
+        case .cap40:    return "40"
+        case .cap30:    return "30"
+        case .max:      return "MAX(\(UIScreen.main.maximumFramesPerSecond))"
+        case .raw:      return "RAW"
+        }
+    }
+
+    var settingsLabel: String {
+        switch self {
+        case .locked60: return "60 fps"
+        case .cap40:    return "40 fps (cooler)"
+        case .cap30:    return "30 fps (coolest)"
+        case .max:      return "Display max (\(UIScreen.main.maximumFramesPerSecond) Hz)"
+        case .raw:      return "Unthrottled (benchmark)"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .locked60: return .cyan
+        case .cap40:    return .mint
+        case .cap30:    return .green
+        case .max:      return .pink
+        case .raw:      return .orange
+        }
+    }
+
+    /// Pill tap order: 60 → 40 → 30 → MAX → RAW → 60.
+    var next: FrameCap {
+        switch self {
+        case .locked60: return .cap40
+        case .cap40:    return .cap30
+        case .cap30:    return .max
+        case .max:      return .raw
+        case .raw:      return .locked60
+        }
+    }
+
+    static var current: FrameCap {
+        FrameCap(rawValue: madeira_get_vsync_locked()) ?? .locked60
+    }
+
+    /// The user's chosen cap (Settings / pill), independent of any
+    /// temporary thermal throttle.
+    static var saved: FrameCap {
+        let v = UserDefaults.standard.object(forKey: key) as? Int
+        return v.flatMap { FrameCap(rawValue: Int32($0)) } ?? .locked60
+    }
+
+    static func apply(_ cap: FrameCap, persist: Bool) {
+        madeira_set_vsync_locked(cap.rawValue)
+        ProMotionIntent.shared.setActive(cap == .max || cap == .raw)
+        if persist { UserDefaults.standard.set(Int(cap.rawValue), forKey: key) }
+    }
+
+    static var autoCoolDown: Bool {
+        UserDefaults.standard.object(forKey: autoCoolKey) as? Bool ?? true
+    }
+}
+
 /// Process-wide performance sampler shared by every overlay variant.
 ///
 /// One set of timers feeds FPS, memory footprint, thermal state and low-power
@@ -150,6 +228,11 @@ final class PerfMonitor: ObservableObject {
     private var lastMemoryTier: MemoryTier = .ok
     private var lastThermal: ProcessInfo.ThermalState = .nominal
 
+    /// Thermal throttle: cap dropped to 30 while the state is serious or
+    /// worse, and the user's cap restored once it is nominal again. The
+    /// gap between the two thresholds is the hysteresis.
+    @Published private(set) var thermalThrottled = false
+
     private init() {}
 
     /// Reference-counted so multiple overlays can be on screen at once and the
@@ -238,6 +321,24 @@ final class PerfMonitor: ObservableObject {
                 LogStore.shared.log("Thermal state back to nominal", level: .success)
             }
             lastThermal = thermal
+        }
+        applyThermalThrottle()
+    }
+
+    private func applyThermalThrottle() {
+        let hot = thermal.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+        if hot && !thermalThrottled && FrameCap.autoCoolDown {
+            let current = FrameCap.current
+            // Nothing to gain below 30; leave RAW alone too, it is a benchmark.
+            guard current != .cap30, current != .raw else { return }
+            thermalThrottled = true
+            FrameCap.apply(.cap30, persist: false)
+            LogStore.shared.log("Auto cool-down: frame cap \(current.label) → 30 until the phone is cool")
+        } else if thermalThrottled && (thermal == .nominal || !FrameCap.autoCoolDown) {
+            thermalThrottled = false
+            let saved = FrameCap.saved
+            FrameCap.apply(saved, persist: false)
+            LogStore.shared.log("Auto cool-down over: frame cap back to \(saved.label)", level: .success)
         }
     }
 
