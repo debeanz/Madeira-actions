@@ -294,7 +294,19 @@ final class MetalBackedView: UIView {
         (event?.allTouches ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
     }
 
+    /// Quick-tap detection shared by both modes, purely for the full-screen
+    /// chrome: a short, still touch on the surface posts .madeiraSurfaceTap
+    /// so the auto-hidden toolbar can reappear. Game input is unaffected.
+    private var chromeTapStart = CGPoint.zero
+    private var chromeTapTime: TimeInterval = 0
+    private var chromeTapCount = 0
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let t = touches.first {
+            chromeTapCount = activeTouches(event).count
+            chromeTapStart = t.location(in: self)
+            chromeTapTime = Date().timeIntervalSinceReferenceDate
+        }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -415,6 +427,13 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let t = touches.first, chromeTapCount == 1 {
+            let p = t.location(in: self)
+            let dt = Date().timeIntervalSinceReferenceDate - chromeTapTime
+            if dt < 0.3 && hypot(p.x - chromeTapStart.x, p.y - chromeTapStart.y) < 12 {
+                NotificationCenter.default.post(name: .madeiraSurfaceTap, object: nil)
+            }
+        }
         guard desktopMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
@@ -1578,17 +1597,8 @@ struct ContentView: View {
             .tint(.mint)
             .disabled(wineserver_is_running() != 0)
 
-            Button {
-                touchControls.visible.toggle()
-                if touchControls.visible { touchControls.ensureDefaultLayout() }
-            } label: {
-                Label(touchControls.visible ? "Controller On" : "Controller",
-                      systemImage: touchControls.visible ? "gamecontroller.fill" : "gamecontroller")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .tint(touchControls.visible ? .indigo : .secondary)
-
+            // The touch-controller toggle lives in the full-screen toolbar
+            // and Settings → Input; it was redundant here.
             Button {
                 desktopFullScreen = true
             } label: {
@@ -3389,10 +3399,31 @@ enum TouchControlsHost {
     }
 }
 
+extension Notification.Name {
+    /// Posted by MetalBackedView on a quick, still tap of the game surface.
+    static let madeiraSurfaceTap = Notification.Name("MadeiraSurfaceTap")
+}
+
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     @State private var pinchBase: Double?
+    /// Auto-hiding toolbar: shown on entry, on a quick tap of the surface,
+    /// on a tap along the top edge, and while the layout editor is open;
+    /// fades a few seconds after the last interaction.
+    @State private var chromeVisible = true
+    @State private var chromeHideWork: DispatchWorkItem?
+    private var chromeShown: Bool { chromeVisible || m.editing }
+
+    private func showChrome() {
+        withAnimation(.easeInOut(duration: 0.2)) { chromeVisible = true }
+        chromeHideWork?.cancel()
+        let work = DispatchWorkItem {
+            withAnimation(.easeInOut(duration: 0.35)) { chromeVisible = false }
+        }
+        chromeHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -3402,6 +3433,16 @@ struct TouchControlsOverlay: View {
                         ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
                         }
+                    }
+                    // Tap catcher along the top edge while the toolbar is
+                    // hidden (the band ControlsWindow.hitTest reserves), so
+                    // there is always an obvious way to bring it back.
+                    if !chromeShown {
+                        Color.clear
+                            .frame(height: 100)
+                            .contentShape(Rectangle())
+                            .frame(maxWidth: .infinity, alignment: .top)
+                            .onTapGesture { showChrome() }
                     }
                     // Performance HUD: this window is the only thing that
                     // draws above the window-level Metal host, so the full
@@ -3417,6 +3458,8 @@ struct TouchControlsOverlay: View {
                     topBar
                         .padding(.top, geo.safeAreaInsets.top + 10)
                         .padding(.trailing, geo.safeAreaInsets.trailing + 12)
+                        .opacity(chromeShown ? 1 : 0)
+                        .allowsHitTesting(chromeShown)
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
@@ -3428,6 +3471,11 @@ struct TouchControlsOverlay: View {
             .gesture(scalePinch)
         }
         .ignoresSafeArea()
+        .onAppear { showChrome() }
+        .onChange(of: m.fullScreen) { _, on in if on { showChrome() } }
+        .onReceive(NotificationCenter.default.publisher(for: .madeiraSurfaceTap)) { _ in
+            showChrome()
+        }
     }
 
     private var topBar: some View {
@@ -3488,6 +3536,7 @@ struct TouchControlsOverlay: View {
                              _ action: @escaping () -> Void) -> some View {
         Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            showChrome()                       // any toolbar use restarts the hide timer
             withAnimation(.easeInOut(duration: 0.22)) { action() }
         } label: {
             // Stroke only — never a .fill variant.
