@@ -19,6 +19,11 @@ int wine_process_is_running(void);
 // detached the JIT debugger and switched VPNs. Returns 0 on success.
 int madeira_write_continue_flag(void);
 
+/* 32-bit feasibility probe: can this process map memory below 4GB? Returns
+ * a one-line human-readable summary (static storage) and prints the same
+ * under [pagezero] on stderr. Decides whether WoW64 is even possible here. */
+const char *madeira_low_memory_probe(void);
+
 #ifdef __cplusplus
 }
 #endif

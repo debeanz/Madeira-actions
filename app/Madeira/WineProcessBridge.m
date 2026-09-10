@@ -24,6 +24,58 @@
 
 static void madeira_ensure_runtime_profile(NSString *prefix);
 
+/* 2026-09-10: 32-bit (WoW64) feasibility. A 32-bit Windows process needs
+ * its whole address space below 4GB. On iOS the app's __PAGEZERO segment
+ * normally covers exactly that range, so nothing can be mapped there — the
+ * assumption every "above 4GB" constant in the runtime rests on. A build
+ * linked with -pagezero_size 0x4000 (workflow input) frees the range IF
+ * iOS lets such a binary run. This probe answers the second half: it
+ * tries a fixed mapping at 64KB and at 1GB and reports what the kernel
+ * says. Read-only diagnostic, runs once at launch. */
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <sys/mman.h>
+const char *madeira_low_memory_probe(void)
+{
+    static char summary[256];
+    static int done;
+    if (done) return summary;
+    done = 1;
+
+    const uintptr_t tries[] = { 0x10000, 0x40000000 };
+    char parts[2][96];
+    for (int i = 0; i < 2; i++)
+    {
+        void *want = (void *)tries[i];
+        void *got = mmap(want, 0x10000, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        if (got == MAP_FAILED)
+        {
+            int e = errno;
+            /* mmap FIXED refused: ask Mach for the region's owner. */
+            vm_address_t addr = (vm_address_t)want; vm_size_t size = 0;
+            vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj = MACH_PORT_NULL;
+            kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                                            (vm_region_info_t)&info, &cnt, &obj);
+            snprintf(parts[i], sizeof(parts[i]), "0x%lx: mmap FAILED errno=%d%s region@0x%lx+0x%lx prot=%d",
+                     (unsigned long)tries[i], e, kr == KERN_SUCCESS ? "," : ", no region;",
+                     (unsigned long)addr, (unsigned long)size, kr == KERN_SUCCESS ? info.protection : -1);
+        }
+        else
+        {
+            *(volatile int *)got = 42;          /* touch it: is it really usable? */
+            int ok = *(volatile int *)got == 42;
+            snprintf(parts[i], sizeof(parts[i]), "0x%lx: mapped at %p, %s",
+                     (unsigned long)tries[i], got, ok ? "READ/WRITE OK" : "write did not stick");
+            munmap(got, 0x10000);
+        }
+    }
+    snprintf(summary, sizeof(summary), "[pagezero] %s | %s", parts[0], parts[1]);
+    dprintf(STDERR_FILENO, "%s\n", summary);
+    return summary;
+}
+
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
 #include "PrefixExtractor.h"

@@ -1022,6 +1022,8 @@ struct ContentView: View {
             jit_install_trap_handler()
             // First line of every session log: which build produced it.
             logStore.log("Madeira \(Self.appVersionText)")
+            // 32-bit feasibility: can memory below 4GB be mapped in this build?
+            logStore.log(String(cString: madeira_low_memory_probe()))
             entitlements = EntitlementStatus.check()
             logEntitlementStatus()
             GamepadBridge.shared.start()

@@ -2,6 +2,11 @@ name: Build Madeira IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      pagezero_experiment:
+        description: "32-bit feasibility: link with a 16KB __PAGEZERO instead of iOS's 4GB (app may refuse to launch; reinstall a normal build if so)"
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -650,8 +655,12 @@ jobs:
           P=app/Madeira/Info.plist
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 0.1.${GITHUB_RUN_NUMBER}" "$P"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" "$P"
-          /usr/libexec/PlistBuddy -c "Add :MadeiraBuildCommit string ${GITHUB_SHA:0:7}" "$P" \
-            || /usr/libexec/PlistBuddy -c "Set :MadeiraBuildCommit ${GITHUB_SHA:0:7}" "$P"
+          TAG="${GITHUB_SHA:0:7}"
+          if [ "${PAGEZERO_EXPERIMENT:-false}" = "true" ]; then TAG="${TAG}+pz"; fi
+          /usr/libexec/PlistBuddy -c "Add :MadeiraBuildCommit string ${TAG}" "$P" \
+            || /usr/libexec/PlistBuddy -c "Set :MadeiraBuildCommit ${TAG}" "$P"
+        env:
+          PAGEZERO_EXPERIMENT: ${{ inputs.pagezero_experiment }}
           /usr/libexec/PlistBuddy -c "Print" "$P" | grep -E "Version|Commit"
 
       # Replacement XInput DLLs (ARM64EC). Overwrites the checked-in Wine
@@ -669,12 +678,23 @@ jobs:
           bash build/dcomp/build.sh
 
       - name: Build Madeira.app
+        env:
+          PAGEZERO_EXPERIMENT: ${{ inputs.pagezero_experiment }}
         run: |
           set -uxo pipefail
           # The runner launches bash with -e; switch it off or the failing
           # pipeline aborts the step before the diagnostics below run.
           set +e
           rm -rf out
+          # 32-bit feasibility experiment (manual runs only): a 16KB
+          # __PAGEZERO frees the low 4GB that WoW64 would need. Whether iOS
+          # launches such a binary, and whether mmap below 4GB then works, is
+          # answered by the [pagezero] probe line in the session log.
+          EXTRA_LD=""
+          if [ "${PAGEZERO_EXPERIMENT:-false}" = "true" ]; then
+            EXTRA_LD="OTHER_LDFLAGS=-Wl,-pagezero_size,0x4000"
+            echo "::notice::PAGEZERO EXPERIMENT BUILD: linked with -pagezero_size 0x4000"
+          fi
           # Compiler errors are re-emitted as GitHub annotations so they show
           # on the run summary (readable without signing in, unlike the log).
           xcodebuild \
@@ -685,6 +705,7 @@ jobs:
             CONFIGURATION_BUILD_DIR="$PWD/out" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            $EXTRA_LD \
             build 2>&1 | tee /tmp/xcodebuild.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
