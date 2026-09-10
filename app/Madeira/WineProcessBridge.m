@@ -20,6 +20,9 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <string.h>
+#include <pwd.h>
+
+static void madeira_ensure_runtime_profile(NSString *prefix);
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -340,7 +343,59 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         madeira_repair_profile( prefix );
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
+        madeira_ensure_runtime_profile( prefix );
     }
+}
+
+/* 2026-09-10: create the AppData skeleton for the profile Wine ACTUALLY uses.
+ *
+ * Three different user names were in play and none of them matched:
+ *   - prefix-template.tar.gz ships drive_c/users/mythic (the build machine),
+ *   - madeira_repair_profile creates the skeleton under users/madeira,
+ *   - at runtime ntdll's set_home_dir (loader_ios.c) takes $USER, else
+ *     getpwuid(), which on iOS is "mobile" — so %USERPROFILE% is
+ *     C:\users\mobile and the User Shell Folders (%USERPROFILE%\AppData\...)
+ *     resolve there.
+ * Nothing created users/mobile/AppData, so SHGetKnownFolderPath's targets did
+ * not exist. Unity 2018 (Blasphemous) checks LocalLow with GetFileAttributes,
+ * gets "not found", falls back to a RELATIVE "<Company>\<Product>" path and
+ * its recursive CreateDirectory then walks up to an empty parent forever —
+ * the stack overflow in UnityPlayer.dll seen in madeira-log.txt. Newer Unity
+ * (Hollow Knight) creates the absolute path itself, which is why it worked.
+ *
+ * Idempotent, runs every launch: a handful of mkdir(2) calls. Resolves the
+ * name with the same rules as set_home_dir so the two can never disagree. */
+static void madeira_ensure_runtime_profile(NSString *prefix)
+{
+    const char *name = getenv( "USER" );
+    if (!name || !*name)
+    {
+        struct passwd *pwd = getpwuid( getuid() );
+        name = (pwd && pwd->pw_name) ? pwd->pw_name : "wine";
+    }
+    const char *slash = strrchr( name, '/' );  if (slash) name = slash + 1;
+    slash = strrchr( name, '\\' );             if (slash) name = slash + 1;
+
+    NSString *user = [prefix stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"drive_c/users/%s", name]];
+    static const char *leaves[] = {
+        "AppData/Roaming", "AppData/Local", "AppData/Local/Temp", "AppData/LocalLow",
+        "AppData/Roaming/Microsoft/Windows/Start Menu/Programs",
+        "Documents", "Desktop", "Downloads", "Music", "Pictures", "Videos",
+        "Saved Games", "Favorites", "Temp",
+    };
+    NSFileManager *fm = [NSFileManager defaultManager];
+    int created = 0;
+    for (size_t i = 0; i < sizeof(leaves) / sizeof(leaves[0]); i++)
+    {
+        NSString *p = [user stringByAppendingPathComponent:[NSString stringWithUTF8String:leaves[i]]];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:p isDirectory:&isDir] && isDir) continue;
+        if ([fm createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil]) created++;
+    }
+    if (created)
+        dprintf( STDERR_FILENO, "[profile] created %d missing folder(s) under drive_c/users/%s (runtime profile)\n",
+                 created, name );
 }
 
 static void *wine_process_thread(void *arg) {
