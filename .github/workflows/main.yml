@@ -661,6 +661,13 @@ jobs:
           set -euxo pipefail
           bash build/xinput/build.sh
 
+      # Stub DirectComposition so native plugins that import dcomp.dll can
+      # load (Rhythm Doctor's multiwindow_unity). See build/dcomp/dcomp.c.
+      - name: Build dcomp stub (ARM64EC)
+        run: |
+          set -euxo pipefail
+          bash build/dcomp/build.sh
+
       - name: Build Madeira.app
         run: |
           set -uxo pipefail
