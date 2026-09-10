@@ -1876,15 +1876,35 @@ NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **mod
     USHORT search_machine;
 
     status = open_main_image( nt_name, module, &main_image_info, loadorder, load_machine );
-    if (status != STATUS_DLL_NOT_FOUND) return status;
-
-    /* if path is in system dir, we can load the builtin even if the file itself doesn't exist */
-    if (loadorder != LO_NATIVE && is_builtin_path( nt_name, &search_machine ))
+    if (status == STATUS_DLL_NOT_FOUND &&
+        /* if path is in system dir, we can load the builtin even if the file itself doesn't exist */
+        loadorder != LO_NATIVE && is_builtin_path( nt_name, &search_machine ))
     {
         status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0,
                                    search_machine, load_machine, FALSE, 0 );
         dprintf(2, "[main-exe] builtin-path retry: find_builtin_dll(search_machine=0x%x) = 0x%x Machine=0x%x\n",
                 search_machine, (unsigned)status, main_image_info.Machine);
+    }
+
+    /* 2026-09-10: no WoW64 on this port — FEX runs 64-bit x86 only and there
+     * is no 32-bit ntdll or below-4GB address-space setup. This is the ONE
+     * place both startup paths (the session's build_initial_params and a
+     * spawned child's init_startup_info) load the main image, so reject
+     * 32-bit images here. Celeste.exe (Machine=0x14c chars=0x102) passed
+     * map_image_into_view's header checks, reached init_peb →
+     * build_wow64_parameters, and its 4GB-window VA scan asserted — killing
+     * the launch thread before the server learned the process died, which
+     * hung the explorer that spawned it. Undertale (chars=0x123) was caught
+     * earlier by luck of its section layout. */
+    if (NT_SUCCESS(status) && !is_machine_64bit( main_image_info.Machine ))
+    {
+        dprintf(2, "[main-exe] REJECT %s: 32-bit image (Machine=0x%x) — this port runs 64-bit x86 programs only\n",
+                debugstr_us(nt_name), main_image_info.Machine);
+        MESSAGE( "wine: %s is a 32-bit (machine 0x%x) image; this port runs 64-bit x86 programs only\n",
+                 debugstr_us(nt_name), main_image_info.Machine );
+        NtUnmapViewOfSection( NtCurrentProcess(), *module );
+        *module = NULL;
+        return STATUS_INVALID_IMAGE_FORMAT;
     }
     return status;
 }
