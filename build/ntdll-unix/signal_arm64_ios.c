@@ -2772,23 +2772,95 @@ static void *ios_mach_exception_thread( void *arg )
                         *(uint16_t *)rw_addr = (uint16_t)IOS_STORE_SRC(rt);
                         emulated = 1;
                     }
-                    /* STP (signed offset, 64-bit): 10101001 00 imm7 Rt2 Rn Rt */
-                    else if ((insn & 0xffc00000) == 0xa9000000)
+                    /* STP / STNP (general registers) — ALL FOUR ADDRESSING MODES.
+                     *
+                     * Encoding: opc 101 V=0 mode(bits25:23) L(bit22) imm7 Rt2 Rn Rt
+                     *   opc=10 → 64-bit X pair (scale 8), opc=00 → 32-bit W pair (scale 4)
+                     *   000 non-temporal   no writeback
+                     *   001 post-index     writeback; store at the OLD base
+                     *   010 signed offset  no writeback
+                     *   011 pre-index      writeback; store at the NEW base
+                     * Mask 0xfe400000 fixes opc/101/V and L=0, leaving the mode free.
+                     *
+                     * Until ml785 only the signed-offset form (0xa9000000/0x29000000)
+                     * was decoded. OneShot: World Machine Edition (Wine Mono) faulted in
+                     * ntdll's critical-section init with the PRE-INDEXED form
+                     *     0xa9882149 = STP X9, X8, [X10, #0x80]!
+                     * targeting an anon-RWX region aliased into the JIT pool, so it fell
+                     * through to [store-undecoded] and the Mach exception went unhandled.
+                     * As with the Q-pair handler above, fault_addr is the effective
+                     * address the CPU used, so rw_addr is already right in every mode;
+                     * only Rn's writeback must be synthesised. Rn==31 is SP. */
+                    else if ((insn & 0xfe400000) == 0xa8000000 ||
+                             (insn & 0xfe400000) == 0x28000000)
                     {
-                        int rt = insn & 0x1f;
-                        int rt2 = (insn >> 10) & 0x1f;
-                        *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
-                        *(uint64_t *)(rw_addr + 8) = IOS_STORE_SRC(rt2);
-                        emulated = 1;
-                    }
-                    /* STP (signed offset, 32-bit): 00101001 00 imm7 Rt2 Rn Rt */
-                    else if ((insn & 0xffc00000) == 0x29000000)
-                    {
-                        int rt = insn & 0x1f;
-                        int rt2 = (insn >> 10) & 0x1f;
-                        *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
-                        *(uint32_t *)(rw_addr + 4) = (uint32_t)IOS_STORE_SRC(rt2);
-                        emulated = 1;
+                        const int is64 = (insn >> 31) & 1;
+                        const int mode = (insn >> 23) & 0x3; /* 0 stnp, 1 post, 2 offset, 3 pre */
+                        const int rt   = insn & 0x1f;
+                        const int rt2  = (insn >> 10) & 0x1f;
+                        const int rn   = (insn >> 5) & 0x1f;
+                        const int size = is64 ? 8 : 4;
+                        int64_t imm7   = (int64_t)((insn >> 15) & 0x7f);
+                        if (imm7 & 0x40) imm7 -= 0x80;          /* sign-extend 7 bits */
+                        const int64_t off = imm7 * size;
+
+                        /* Both halves must land in the same alias. */
+                        uintptr_t span = 2 * size - 1;
+                        uintptr_t rw_end = in_jit ? (uintptr_t)(rw + ((fault_addr + span) - rx))
+                                                  : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + span );
+                        if (!rw_end || rw_end != (uintptr_t)rw_addr + span)
+                        {
+                            static int stp_gpr_span_n;
+                            if (stp_gpr_span_n < 4)
+                                dprintf(STDERR_FILENO,
+                                    "[stp-emul] ml785 #%d REFUSING: %dB pair leaves the alias "
+                                    "(insn=0x%08x addr=0x%llx rw=0x%llx rw_end=0x%llx)\n",
+                                    ++stp_gpr_span_n, 2 * size, insn, (unsigned long long)fault_addr,
+                                    (unsigned long long)rw_addr, (unsigned long long)rw_end);
+                        }
+                        else
+                        {
+                            const int wb = (mode == 1 || mode == 3);
+                            uint64_t base_old = (mode == 3) ? (uint64_t)fault_addr - (uint64_t)off
+                                                            : (uint64_t)fault_addr;
+                            uint64_t base_new = base_old;
+
+                            if (is64)
+                            {
+                                *(uint64_t *)rw_addr = IOS_STORE_SRC(rt);
+                                *(uint64_t *)(rw_addr + 8) = IOS_STORE_SRC(rt2);
+                            }
+                            else
+                            {
+                                *(uint32_t *)rw_addr = (uint32_t)IOS_STORE_SRC(rt);
+                                *(uint32_t *)(rw_addr + 4) = (uint32_t)IOS_STORE_SRC(rt2);
+                            }
+
+                            if (wb)
+                            {
+                                base_new = base_old + (uint64_t)off;
+                                if (rn == 31) state.__sp = base_new;
+                                else          state.__x[rn] = base_new;
+                            }
+                            emulated = 1;
+                            if (mode != 2)
+                            {
+                                /* Signed-offset is the hot, long-established path; only
+                                 * the newly decoded modes get a (capped) breadcrumb. */
+                                static int stp_gpr_n;
+                                if (stp_gpr_n < 8)
+                                    dprintf(STDERR_FILENO,
+                                        "[stp-emul] ml785 #%d insn=0x%08x mode=%s off=%+lld Rt=%c%d Rt2=%c%d "
+                                        "Rn=%s%d addr=0x%llx rw=0x%llx base 0x%llx -> 0x%llx%s\n",
+                                        ++stp_gpr_n, insn,
+                                        mode == 0 ? "stnp" : mode == 1 ? "post" : "pre",
+                                        (long long)off, is64 ? 'x' : 'w', rt, is64 ? 'x' : 'w', rt2,
+                                        rn == 31 ? "s" : "x", rn,
+                                        (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                        (unsigned long long)base_old, (unsigned long long)base_new,
+                                        wb ? " (writeback)" : " (no writeback)");
+                            }
+                        }
                     }
                     /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
                     else if ((insn & 0xffe00c00) == 0xf8200800)
