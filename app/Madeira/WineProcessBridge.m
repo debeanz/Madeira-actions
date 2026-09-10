@@ -396,6 +396,41 @@ static void madeira_ensure_runtime_profile(NSString *prefix)
     if (created)
         dprintf( STDERR_FILENO, "[profile] created %d missing folder(s) under drive_c/users/%s (runtime profile)\n",
                  created, name );
+
+    /* 2026-09-10: desktop launchers. The explorer /desktop=shell session
+     * shows the profile's Desktop folder as icons, so a handful of .bat
+     * files there give one-tap access to Wine's own tools — none of
+     * which were reachable before without the Run dialog:
+     *   File Explorer  -> explorer.exe C:\   (Wine's explorer is also the
+     *                     shell file browser when given a path)
+     *   Notepad        -> notepad.exe        (edit boot.config & co in place)
+     *   Task Manager   -> taskmgr.exe        (kill a stuck game)
+     *   Wine Config    -> winecfg.exe
+     * .bat rather than .lnk: a shortcut is a binary IShellLink blob, a
+     * batch file is text that cmd.exe (bundled) runs via ShellExecute.
+     * Rewritten every launch so edits to this table ship without a
+     * prefix reset; users' own desktop files are never touched. */
+    {
+        static const struct { const char *file; const char *cmd; } launchers[] = {
+            { "File Explorer.bat", "explorer.exe C:\\" },
+            { "Notepad.bat",       "notepad.exe" },
+            { "Task Manager.bat",  "taskmgr.exe" },
+            { "Wine Config.bat",   "winecfg.exe" },
+        };
+        NSString *desktop = [user stringByAppendingPathComponent:@"Desktop"];
+        int written = 0;
+        for (size_t i = 0; i < sizeof(launchers) / sizeof(launchers[0]); i++)
+        {
+            NSString *body = [NSString stringWithFormat:
+                @"@echo off\r\nstart \"\" %s\r\n", launchers[i].cmd];
+            NSString *p = [desktop stringByAppendingPathComponent:[NSString stringWithUTF8String:launchers[i].file]];
+            NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            if (old && [old isEqualToString:body]) continue;
+            if ([body writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) written++;
+        }
+        if (written)
+            dprintf( STDERR_FILENO, "[profile] wrote %d desktop launcher(s) to users/%s/Desktop\n", written, name );
+    }
 }
 
 static void *wine_process_thread(void *arg) {
