@@ -635,8 +635,10 @@ jobs:
 
       - name: Build Madeira.app
         run: |
-          set -euxo pipefail
+          set -uxo pipefail
           rm -rf out
+          # Compiler errors are re-emitted as GitHub annotations so they show
+          # on the run summary (readable without signing in, unlike the log).
           xcodebuild \
             -project app/Madeira.xcodeproj \
             -target Madeira \
@@ -645,7 +647,15 @@ jobs:
             CONFIGURATION_BUILD_DIR="$PWD/out" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            build
+            build 2>&1 | tee /tmp/xcodebuild.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            grep -E "^[^ ]+\.(swift|m|mm|c|h):[0-9]+:[0-9]+: error:|error: " /tmp/xcodebuild.log \
+              | sort -u | head -40 | while IFS= read -r line; do
+                echo "::error::$line"
+              done
+          fi
+          exit "$rc"
 
       - name: Embed entitlements (ad-hoc sign)
         run: |
