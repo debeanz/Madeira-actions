@@ -5489,6 +5489,11 @@ extern const void *dxmt_winemetal_unix_call_funcs[];
  * to advance past audio-gated splash/intro sequences. See audio_null_ios.c */
 extern const void *audio_null_ios_unix_call_funcs[];
 
+/* iOS-Madeira 2026-09-10: controller state for the replacement
+ * xinput1_x.dll (build/xinput/xinput.c). Filled by the app from
+ * GameController; see xinput_ios.c. */
+extern const void *madeira_xinput_unix_call_funcs[];
+
 #ifndef MADEIRA_SIMULATOR_RUNTIME
 /* iOS-Madeira 2026-07-05 (Steam S0): network + crypto unix tables,
  * compiled from wine/dlls/<dll>/ sources into libntdll_unix.a with
@@ -5571,6 +5576,11 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             *funcs = (const void *)dxmt_winemetal_unix_call_funcs;
             WARN_(module)("iOS: module %p (%s) -> dxmt_winemetal_unix_call_funcs (%p)\n",
                           module, match, dxmt_winemetal_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && (strstr(match, "xinput") || strstr(match, "XInput"))) {
+            *funcs = (const void *)madeira_xinput_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> madeira_xinput_unix_call_funcs (%p)\n",
+                module, match, (void *)madeira_xinput_unix_call_funcs);
             status = STATUS_SUCCESS;
         } else if (match && (strstr(match, "wineios.drv") || strstr(match, "winecoreaudio") || strstr(match, "winealsa") || strstr(match, "winepulse"))) {
             *funcs = (const void *)audio_null_ios_unix_call_funcs;

@@ -25,3 +25,7 @@ int madeira_get_vsync_locked(void);
 
 /* ml526: startup phase timeline (Winios.m) */
 void winios_phase(const char *name);
+
+/* Native XInput: controller state table the replacement xinput1_x.dll
+ * reads (build/ntdll-unix/xinput_ios.c). Gamepad.swift fills it. */
+#include "../../build/xinput/madeira_xinput.h"

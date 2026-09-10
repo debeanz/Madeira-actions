@@ -1,3 +1,4 @@
+import CoreHaptics
 import Foundation
 import GameController
 import SwiftUI
@@ -16,11 +17,22 @@ import UIKit
 // plug into yet. When that lands, this bridge becomes the fallback for
 // games without native controller support.
 //
-// Buttons map to a ControlAction (the touch overlay's vocabulary: a VK code,
-// a mouse button, nothing). Each stick is either a four-key cluster with
-// 8-way snapping (identical to the touch sticks) or relative mouse motion
-// (identical to trackpad mouse-look). Mapping is persisted as JSON in
-// Documents/ next to the touch layout so it survives the weekly reinstall.
+// Two modes, switchable in Settings:
+//
+//   XInput (native, default) — the raw pad state is published every frame
+//   to the table in build/ntdll-unix/xinput_ios.c, which Madeira's
+//   replacement xinput1_x.dll (build/xinput) serves to the game. The game
+//   sees a wired Xbox 360 controller; rumble requests come back through
+//   the same table and drive the pad's haptics.
+//
+//   Keyboard & mouse — for games without pad support. Buttons map to a
+//   ControlAction (the touch overlay's vocabulary: a VK code, a mouse
+//   button, nothing). Each stick is either a four-key cluster with 8-way
+//   snapping (identical to the touch sticks) or relative mouse motion
+//   (identical to trackpad mouse-look).
+//
+// Mapping is persisted as JSON in Documents/ next to the touch layout so it
+// survives the weekly reinstall.
 // ============================================================================
 
 /// Every input on an extended gamepad that can be bound.
@@ -148,7 +160,21 @@ final class GamepadBridge: ObservableObject {
     static let shared = GamepadBridge()
 
     @Published private(set) var controllerName: String? = nil
-    @Published var enabled: Bool = true { didSet { save(); if !enabled { releaseAll(using: mapping) } } }
+    @Published var enabled: Bool = true {
+        didSet {
+            save()
+            if !enabled { releaseAll(using: mapping) }
+            madeira_xinput_set_connected(0, (enabled && native && controller != nil) ? 1 : 0)
+        }
+    }
+    /// true = XInput (game sees an Xbox pad); false = keyboard & mouse mapping.
+    @Published var native: Bool = true {
+        didSet {
+            save()
+            releaseAll(using: mapping)
+            madeira_xinput_set_connected(0, (enabled && native && controller != nil) ? 1 : 0)
+        }
+    }
     /// Release with the OLD mapping: a held button rebound mid-press must
     /// key-up the key it actually pressed, not the one it now maps to.
     @Published var mapping: GamepadMapping = .generic { didSet { save(); releaseAll(using: oldValue) } }
@@ -169,17 +195,25 @@ final class GamepadBridge: ObservableObject {
     private var leftDir = -1, rightDir = -1
     private var carryX: CGFloat = 0, carryY: CGFloat = 0
 
+    /// Rumble: one looping continuous haptic whose intensity/sharpness are
+    /// driven by the motor speeds the game sets through XInputSetState.
+    private var hapticEngine: CHHapticEngine?
+    private var hapticPlayer: CHHapticAdvancedPatternPlayer?
+
     private static var url: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("madeira-gamepad.json")
     }
-    private struct Saved: Codable { var enabled: Bool; var mapping: GamepadMapping }
+    /// `native` is optional so files written before the XInput mode existed
+    /// still decode (they default to native).
+    private struct Saved: Codable { var enabled: Bool; var native: Bool?; var mapping: GamepadMapping }
 
     private init() {
         loading = true
         if let d = try? Data(contentsOf: Self.url),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             enabled = s.enabled
+            native = s.native ?? true
             mapping = s.mapping
         }
         loading = false
@@ -187,7 +221,7 @@ final class GamepadBridge: ObservableObject {
 
     private func save() {
         guard !loading else { return }
-        guard let d = try? JSONEncoder().encode(Saved(enabled: enabled, mapping: mapping)) else { return }
+        guard let d = try? JSONEncoder().encode(Saved(enabled: enabled, native: native, mapping: mapping)) else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
 
@@ -228,7 +262,10 @@ final class GamepadBridge: ObservableObject {
         controller = c
         c.playerIndex = .index1
         controllerName = c.vendorName ?? "Controller"
-        LogStore.shared.log("Controller connected: \(controllerName ?? "?")", level: .success)
+        LogStore.shared.log("Controller connected: \(controllerName ?? "?") (\(native ? "XInput" : "keyboard/mouse") mode)",
+                            level: .success)
+        if enabled && native { madeira_xinput_set_connected(0, 1) }
+        setupHaptics(c)
 
         func bind(_ button: GCControllerButtonInput?, _ el: GamepadElement) {
             button?.pressedChangedHandler = { [weak self] _, _, pressed in
@@ -272,6 +309,7 @@ final class GamepadBridge: ObservableObject {
 
     private func detach() {
         releaseAll(using: mapping)
+        madeira_xinput_set_connected(0, 0)
         if let name = controllerName {
             LogStore.shared.log("Controller disconnected: \(name)")
         }
@@ -279,12 +317,90 @@ final class GamepadBridge: ObservableObject {
         controllerName = nil
         link?.invalidate()
         link = nil
+        hapticPlayer = nil
+        hapticEngine?.stop(completionHandler: nil)
+        hapticEngine = nil
+    }
+
+    // MARK: Native XInput path
+
+    /// Publish the whole pad every frame. The unix table dedupes, so the
+    /// packet number only advances on real changes.
+    private func publishNative(_ pad: GCExtendedGamepad) {
+        var s = madeira_xinput_state()
+        s.connected = 1
+        var bits: UInt16 = 0
+        if pad.dpad.up.isPressed { bits |= 0x0001 }
+        if pad.dpad.down.isPressed { bits |= 0x0002 }
+        if pad.dpad.left.isPressed { bits |= 0x0004 }
+        if pad.dpad.right.isPressed { bits |= 0x0008 }
+        if pad.buttonMenu.isPressed { bits |= 0x0010 }                       // START
+        if pad.buttonOptions?.isPressed ?? false { bits |= 0x0020 }          // BACK
+        if pad.leftThumbstickButton?.isPressed ?? false { bits |= 0x0040 }
+        if pad.rightThumbstickButton?.isPressed ?? false { bits |= 0x0080 }
+        if pad.leftShoulder.isPressed { bits |= 0x0100 }
+        if pad.rightShoulder.isPressed { bits |= 0x0200 }
+        if pad.buttonHome?.isPressed ?? false { bits |= 0x0400 }             // GUIDE
+        if pad.buttonA.isPressed { bits |= 0x1000 }
+        if pad.buttonB.isPressed { bits |= 0x2000 }
+        if pad.buttonX.isPressed { bits |= 0x4000 }
+        if pad.buttonY.isPressed { bits |= 0x8000 }
+        s.buttons = bits
+        s.left_trigger = UInt8(max(0, min(255, Int(pad.leftTrigger.value * 255))))
+        s.right_trigger = UInt8(max(0, min(255, Int(pad.rightTrigger.value * 255))))
+        s.lx = Self.axis(pad.leftThumbstick.xAxis.value)
+        s.ly = Self.axis(pad.leftThumbstick.yAxis.value)
+        s.rx = Self.axis(pad.rightThumbstick.xAxis.value)
+        s.ry = Self.axis(pad.rightThumbstick.yAxis.value)
+        madeira_xinput_set_state(0, &s)
+    }
+
+    private static func axis(_ v: Float) -> Int16 {
+        Int16(max(-32768, min(32767, Int(v * 32767))))
+    }
+
+    private func setupHaptics(_ c: GCController) {
+        hapticPlayer = nil
+        hapticEngine?.stop(completionHandler: nil)
+        hapticEngine = nil
+        guard let haptics = c.haptics,
+              let engine = haptics.createEngine(withLocality: .default) else { return }
+        do {
+            try engine.start()
+            let event = CHHapticEvent(eventType: .hapticContinuous,
+                                      parameters: [
+                                        CHHapticEventParameter(parameterID: .hapticIntensity, value: 0),
+                                        CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.5),
+                                      ],
+                                      relativeTime: 0, duration: 60)
+            let pattern = try CHHapticPattern(events: [event], parameters: [])
+            let player = try engine.makeAdvancedPlayer(with: pattern)
+            player.loopEnabled = true
+            try player.start(atTime: CHHapticTimeImmediate)
+            hapticEngine = engine
+            hapticPlayer = player
+        } catch {
+            LogStore.shared.log("Controller haptics unavailable: \(error.localizedDescription)")
+        }
+    }
+
+    private func applyRumble(low: UInt16, high: UInt16) {
+        guard let player = hapticPlayer else { return }
+        // XInput: left motor = heavy/low, right = light/high. Fold both into
+        // one actuator: strength from the stronger, sharpness from the mix.
+        let lo = Float(low) / 65535, hi = Float(high) / 65535
+        let intensity = max(lo, hi)
+        let sharpness = intensity > 0 ? (0.2 + 0.6 * hi / max(lo + hi, 0.0001)) : 0.5
+        try? player.sendParameters([
+            CHHapticDynamicParameter(parameterID: .hapticIntensityControl, value: intensity, relativeTime: 0),
+            CHHapticDynamicParameter(parameterID: .hapticSharpnessControl, value: sharpness, relativeTime: 0),
+        ], atTime: CHHapticTimeImmediate)
     }
 
     // MARK: Buttons
 
     private func setHeld(_ el: GamepadElement, _ down: Bool) {
-        guard enabled else { return }
+        guard enabled, !native else { return }
         if down {
             guard !held.contains(el) else { return }
             held.insert(el)
@@ -326,6 +442,12 @@ final class GamepadBridge: ObservableObject {
 
     @objc private func tick(_ sender: CADisplayLink) {
         guard enabled, let pad = controller?.extendedGamepad else { return }
+        if native {
+            publishNative(pad)
+            var low: UInt16 = 0, high: UInt16 = 0
+            if madeira_xinput_get_rumble(0, &low, &high) != 0 { applyRumble(low: low, high: high) }
+            return
+        }
         evaluate(pad.leftThumbstick, mode: mapping.leftStick, dir: &leftDir)
         evaluate(pad.rightThumbstick, mode: mapping.rightStick, dir: &rightDir)
     }
@@ -434,11 +556,34 @@ struct GamepadSettingsView: View {
                         .foregroundStyle(pad.controllerName == nil ? .secondary : .primary)
                 }
                 Toggle("Use controller", isOn: $pad.enabled)
-                Text("Pair a controller in iOS Settings → Bluetooth, or plug one in. Buttons and sticks are sent to the game as keyboard and mouse input, so bind them to whatever the game's keyboard controls are.")
+                Text("Pair a controller in iOS Settings → Bluetooth, or plug one in.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
+            Section("Send to game as") {
+                Picker("Mode", selection: $pad.native) {
+                    Text("Xbox controller (XInput)").tag(true)
+                    Text("Keyboard & mouse").tag(false)
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+                Text(pad.native
+                     ? "The game sees a wired Xbox 360 pad with analog sticks, triggers and rumble. Use the game's own controller settings. Switch to keyboard & mouse for games without controller support."
+                     : "Buttons and sticks are sent as keyboard and mouse input. Bind them below to whatever the game's keyboard controls are.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !pad.native {
+                keyboardMappingSections
+            }
+        }
+        .navigationTitle("Controller")
+    }
+
+    @ViewBuilder
+    private var keyboardMappingSections: some View {
             Section("Presets") {
                 Button("Generic (WASD + mouse look)") { pad.mapping = .generic }
                 Button("Hollow Knight") { pad.mapping = .hollowKnight }
@@ -477,8 +622,6 @@ struct GamepadSettingsView: View {
                     .pickerStyle(.navigationLink)
                 }
             }
-        }
-        .navigationTitle("Controller")
     }
 
     private func binding(for el: GamepadElement) -> Binding<ControlAction> {
