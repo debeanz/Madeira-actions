@@ -1733,7 +1733,24 @@ void abort_thread( int status )
  */
 void abort_process( int status )
 {
+#ifdef WINE_IOS
+    /* 2026-09-10: a Wine "process" here is a thread group inside the ONE
+     * Mach process, so upstream's _exit() took the whole app down with it.
+     * Every abnormal end of a game went this way: a failed start
+     * (env.c: "wine: failed to start" -> NtTerminateProcess(-1) with the
+     * exiting flag clear), an unhandled exception ("starting debugger..."),
+     * TerminateProcess(GetCurrentProcess()), and abort_thread on the last
+     * thread. The user saw Undertale's 32-bit exe and Blasphemous's stack
+     * overflow as "the app crashed". Route through the same pseudo-process
+     * teardown exit_process uses: close this process's server socket so
+     * wineserver signals its death, reclaim its JIT pool, then the exit()
+     * shim longjmps back to the child thread's entry (wine_ios_exit.h). */
+    ERR("abort_process: status=0x%x -> pseudo-process exit instead of _exit()\n", (unsigned)status);
+    pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+    process_exit_wrapper( get_unix_exit_code( status ));
+#else
     _exit( get_unix_exit_code( status ));
+#endif
 }
 
 

@@ -3392,6 +3392,11 @@ struct TouchControlsOverlay: View {
             glassButton("gauge.with.dots.needle.67percent", dim: !perfOverlayEnabled) {
                 perfOverlayEnabled.toggle()
             }
+            // iOS keyboard → Wine key events (same path as the portrait
+            // pointer panel's ⌨ button and the touch-overlay action).
+            glassButton("keyboard") {
+                MetalBackedView.toggleKeyboard()
+            }
             if m.visible {
                 glassButton(m.editing ? "checkmark" : "pencil") {
                     m.editing.toggle()

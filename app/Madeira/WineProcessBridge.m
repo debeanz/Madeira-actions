@@ -397,47 +397,66 @@ static void madeira_ensure_runtime_profile(NSString *prefix)
         dprintf( STDERR_FILENO, "[profile] created %d missing folder(s) under drive_c/users/%s (runtime profile)\n",
                  created, name );
 
-    /* 2026-09-10: desktop launchers. The explorer /desktop=shell session
-     * shows the profile's Desktop folder as icons, so a handful of .bat
-     * files there give one-tap access to Wine's own tools — none of
-     * which were reachable before without the Run dialog:
-     *   File Explorer  -> explorer.exe C:\   (Wine's explorer is also the
-     *                     shell file browser when given a path)
-     *   Notepad        -> notepad.exe        (edit boot.config & co in place)
-     *   Task Manager   -> taskmgr.exe        (kill a stuck game)
-     *   Wine Config    -> winecfg.exe
-     * .bat rather than .lnk: a shortcut is a binary IShellLink blob, a
-     * batch file is text that cmd.exe (bundled) runs via ShellExecute.
-     * Rewritten every launch so edits to this table ship without a
-     * prefix reset; users' own desktop files are never touched. */
+    /* 2026-09-10: launchers for Wine's own tools, none of which were
+     * reachable before without the Run dialog:
+     *   File Explorer -> explorer.exe   (with no /desktop switch Wine's
+     *                    explorer opens its shell file-browser window)
+     *   Notepad       -> notepad.exe    (edit boot.config & co in place)
+     *   Task Manager  -> taskmgr.exe    (kill a stuck game)
+     *   Wine Config   -> winecfg.exe
+     *
+     * They are SYMLINKS to the system32 binaries, named as the user should
+     * see them. The first cut used .bat files; every launch then left a
+     * conhost console window that could not be closed. A .lnk would need a
+     * hand-built IShellLink blob. A symlink is listed by the shell like any
+     * .exe and runs the target directly with no console. Relative targets,
+     * because the container path changes across reinstalls.
+     *
+     * Two homes: the Desktop folder (for when the desktop window's own
+     * painting reaches the compositor — today it does not, so desktop icons
+     * are invisible) and Start Menu → Programs → Madeira Tools, which the
+     * start menu (a separate, rendered window) lists now. Recreated every
+     * launch; users' own files in those folders are never touched. */
     {
-        static const struct { const char *file; const char *cmd; } launchers[] = {
-            { "File Explorer.bat", "explorer.exe C:\\" },
-            { "Notepad.bat",       "notepad.exe" },
-            { "Task Manager.bat",  "taskmgr.exe" },
-            { "Wine Config.bat",   "winecfg.exe" },
+        static const struct { const char *file; const char *exe; } launchers[] = {
+            { "File Explorer.exe", "explorer.exe" },
+            { "Notepad.exe",       "notepad.exe" },
+            { "Task Manager.exe",  "taskmgr.exe" },
+            { "Wine Config.exe",   "winecfg.exe" },
         };
-        /* Two homes: the Desktop folder (for when the desktop window's own
-         * painting reaches the compositor — today it does not, so desktop
-         * icons are invisible) and Start Menu → Programs → Madeira Tools,
-         * which the start menu (a separate, rendered window) lists now. */
+        static const char *stale_bats[] = {
+            "File Explorer.bat", "Notepad.bat", "Task Manager.bat", "Wine Config.bat",
+        };
         NSString *startMenu = [user stringByAppendingPathComponent:
             @"AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Madeira Tools"];
         [fm createDirectoryAtPath:startMenu withIntermediateDirectories:YES attributes:nil error:nil];
         NSArray *homes = @[ [user stringByAppendingPathComponent:@"Desktop"], startMenu ];
-        int written = 0;
+        int linked = 0;
         for (NSString *home in homes)
-        for (size_t i = 0; i < sizeof(launchers) / sizeof(launchers[0]); i++)
         {
-            NSString *body = [NSString stringWithFormat:
-                @"@echo off\r\nstart \"\" %s\r\n", launchers[i].cmd];
-            NSString *p = [home stringByAppendingPathComponent:[NSString stringWithUTF8String:launchers[i].file]];
-            NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
-            if (old && [old isEqualToString:body]) continue;
-            if ([body writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) written++;
+            /* depth below drive_c → "../" per level back to drive_c/windows/system32 */
+            NSArray *comps = [home pathComponents];
+            NSUInteger dc = [comps indexOfObject:@"drive_c"];
+            if (dc == NSNotFound) continue;
+            NSMutableString *up = [NSMutableString string];
+            for (NSUInteger k = dc + 1; k < comps.count; k++) [up appendString:@"../"];
+
+            for (size_t i = 0; i < sizeof(stale_bats) / sizeof(stale_bats[0]); i++)
+                [fm removeItemAtPath:[home stringByAppendingPathComponent:
+                    [NSString stringWithUTF8String:stale_bats[i]]] error:nil];
+
+            for (size_t i = 0; i < sizeof(launchers) / sizeof(launchers[0]); i++)
+            {
+                NSString *p = [home stringByAppendingPathComponent:[NSString stringWithUTF8String:launchers[i].file]];
+                NSString *target = [NSString stringWithFormat:@"%@windows/system32/%s", up, launchers[i].exe];
+                NSString *cur = [fm destinationOfSymbolicLinkAtPath:p error:nil];
+                if (cur && [cur isEqualToString:target]) continue;
+                [fm removeItemAtPath:p error:nil];
+                if ([fm createSymbolicLinkAtPath:p withDestinationPath:target error:nil]) linked++;
+            }
         }
-        if (written)
-            dprintf( STDERR_FILENO, "[profile] wrote %d launcher(s) for users/%s (Desktop + Start Menu)\n", written, name );
+        if (linked)
+            dprintf( STDERR_FILENO, "[profile] linked %d launcher(s) for users/%s (Desktop + Start Menu)\n", linked, name );
     }
 }
 
