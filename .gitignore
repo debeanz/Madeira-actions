@@ -139,3 +139,6 @@ wine/build-macos/
 wine/build-arm64ec
 build/dxmt-ios/shader-headers/
 research/dxmt/build-pe/
+
+# Wine Mono runtime is fetched by CI into the app bundle folder, never committed
+app/Madeira/mono/wine-mono-*

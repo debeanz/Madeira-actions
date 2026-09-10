@@ -952,6 +952,14 @@ struct ContentView: View {
         "960x540", "1280x720", "1600x900", "1920x1080", "2048x1084", "2796x1290",
         "1024x768", "1280x960",
     ]
+    /// Version of the Wine Mono runtime CI placed in the bundle's mono/
+    /// folder (mscoree finds it via WINEDATADIR = bundle), or nil.
+    static var bundledMonoVersion: String? {
+        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("mono"),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return nil }
+        return names.first { $0.hasPrefix("wine-mono-") }.map { String($0.dropFirst("wine-mono-".count)) }
+    }
+
     /// "0.1.<run> (<run>, <commit>)" as stamped by CI (Stamp version step);
     /// "0.1.0 (1)" for a local Xcode build.
     static var appVersionText: String {
@@ -1167,7 +1175,10 @@ struct ContentView: View {
                         Text("Runtime components").font(.headline)
                         dependencyRow("Visual C++ runtime", detail: "Provided by the prefix", available: true)
                         Divider()
-                        dependencyRow("Wine Mono", detail: "Install workflow not available yet", available: false)
+                        dependencyRow("Wine Mono",
+                                      detail: Self.bundledMonoVersion.map { "Bundled runtime \($0) (.NET Framework games)" }
+                                              ?? "Not in this build — .NET games cannot start",
+                                      available: Self.bundledMonoVersion != nil)
                     }
                     .padding(18)
                     .background(Color(uiColor: .secondarySystemGroupedBackground),

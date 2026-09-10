@@ -23,6 +23,7 @@
 #include <pwd.h>
 
 static void madeira_ensure_runtime_profile(NSString *prefix);
+static void madeira_link_wine_mono(NSString *prefix);
 
 /* 2026-09-10: 32-bit (WoW64) feasibility. A 32-bit Windows process needs
  * its whole address space below 4GB. On iOS the app's __PAGEZERO segment
@@ -396,6 +397,46 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
         madeira_ensure_runtime_profile( prefix );
+        madeira_link_wine_mono( prefix );
+    }
+}
+
+/* 2026-09-10: point C:\windows\mono\mono-2.0 at the Wine Mono runtime CI
+ * bundles under <app>/mono/wine-mono-<ver>/. That directory is mscoree's
+ * FIRST lookup (get_mono_path_local); its WINEDATADIR route would have
+ * found <bundle>/mono on its own, but it refuses data dirs that start with
+ * \??\unix — which is how the bundle appears here. Without this, every
+ * .NET Framework executable died with "Wine Mono is not installed"
+ * (OneShot: World Machine Edition; Celeste would too). Recreated every
+ * launch because the bundle path changes across reinstalls, exactly like
+ * the system32 links above. Harmless when no runtime is bundled. */
+static void madeira_link_wine_mono(NSString *prefix)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *monoRoot = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"mono"];
+    NSArray *entries = [fm contentsOfDirectoryAtPath:monoRoot error:nil];
+    NSString *runtime = nil;
+    for (NSString *e in entries)
+        if ([e hasPrefix:@"wine-mono-"]) { runtime = [monoRoot stringByAppendingPathComponent:e]; break; }
+
+    NSString *monoDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/mono"];
+    NSString *link = [monoDir stringByAppendingPathComponent:@"mono-2.0"];
+    if (!runtime)
+    {
+        /* No runtime in this build: leave a real directory alone, drop a stale link. */
+        if ([fm destinationOfSymbolicLinkAtPath:link error:nil]) [fm removeItemAtPath:link error:nil];
+        dprintf( STDERR_FILENO, "[wine-mono] no runtime bundled under %s\n", monoRoot.UTF8String );
+        return;
+    }
+    [fm createDirectoryAtPath:monoDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *cur = [fm destinationOfSymbolicLinkAtPath:link error:nil];
+    if (!cur || ![cur isEqualToString:runtime])
+    {
+        [fm removeItemAtPath:link error:nil];
+        if ([fm createSymbolicLinkAtPath:link withDestinationPath:runtime error:nil])
+            dprintf( STDERR_FILENO, "[wine-mono] C:\\windows\\mono\\mono-2.0 -> %s\n", runtime.UTF8String );
+        else
+            dprintf( STDERR_FILENO, "[wine-mono] FAILED to link mono-2.0 -> %s\n", runtime.UTF8String );
     }
 }
 

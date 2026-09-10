@@ -670,6 +670,35 @@ jobs:
           set -euxo pipefail
           bash build/xinput/build.sh
 
+      # Wine Mono: the .NET Framework runtime Wine's mscoree needs for managed
+      # executables (OneShot: World Machine Edition, FNA/XNA/MonoGame games).
+      # Version must match WINE_MONO_VERSION in the fork's mscoree. Bundled as
+      # app/Madeira/mono/wine-mono-<ver>; WineProcessBridge symlinks
+      # C:\windows\mono\mono-2.0 at it each launch (mscoree's first lookup —
+      # the WINEDATADIR route rejects the bundle's \??\unix path).
+      - name: Cache Wine Mono
+        id: winemono
+        uses: actions/cache@v4
+        with:
+          path: app/Madeira/mono/wine-mono-11.0.0
+          key: wine-mono-11.0.0-tarxz-${{ env.CACHE_V }}
+
+      - name: Wine Mono
+        if: steps.winemono.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          VER=11.0.0
+          curl -fL --retry 3 -o /tmp/wine-mono.tar.xz \
+            "https://dl.winehq.org/wine/wine-mono/${VER}/wine-mono-${VER}-x86.tar.xz"
+          mkdir -p app/Madeira/mono /tmp/wine-mono-x
+          tar -xJf /tmp/wine-mono.tar.xz -C /tmp/wine-mono-x
+          # The tarball's top-level directory is wine-mono-<ver>; normalise anyway.
+          TOP="$(ls /tmp/wine-mono-x | head -1)"
+          rm -rf "app/Madeira/mono/wine-mono-${VER}"
+          mv "/tmp/wine-mono-x/${TOP}" "app/Madeira/mono/wine-mono-${VER}"
+          test -f "app/Madeira/mono/wine-mono-${VER}/bin/libmono-2.0-x86_64.dll"
+          du -sh "app/Madeira/mono/wine-mono-${VER}"
+
       # Stub DirectComposition so native plugins that import dcomp.dll can
       # load (Rhythm Doctor's multiwindow_unity). See build/dcomp/dcomp.c.
       - name: Build dcomp stub (ARM64EC)
