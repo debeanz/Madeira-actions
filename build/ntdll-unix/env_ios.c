@@ -2289,6 +2289,21 @@ void unix_init_startup_info(void)
     params->hStdInput       = wine_server_ptr_handle( info->hstdin );
     params->hStdOutput      = wine_server_ptr_handle( info->hstdout );
     params->hStdError       = wine_server_ptr_handle( info->hstderr );
+#ifdef WINE_IOS
+    /* 2026-09-10: a process spawned by the explorer shell (GUI parent, no
+     * console) is born with NULL standard handles — exactly as on Windows,
+     * where a GUI app's stderr simply vanishes. Here that hides the one
+     * line that matters most: Fields of Mistria's Rust engine panicked
+     * (the trace shows it reading RUST_BACKTRACE, then exit(1)) and the
+     * message went to a handle that does not exist. Give NULL stdout and
+     * stderr a handle on the app's fd 2, which is dup'ed onto
+     * madeira-log.txt, so panics, asserts and printf-style fatal errors
+     * land in the log. stdin stays NULL. */
+    if (!params->hStdOutput)
+        wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
+    if (!params->hStdError)
+        wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );
+#endif
     {   /* ml662: name the standard handles this pseudo-process is born with. */
         extern void ios_dump_std_handles_ex( const char *when, void *peb, HANDLE hin, HANDLE hout,
                                              HANDLE herr, HANDLE console );
