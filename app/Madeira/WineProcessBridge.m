@@ -417,19 +417,27 @@ static void madeira_ensure_runtime_profile(NSString *prefix)
             { "Task Manager.bat",  "taskmgr.exe" },
             { "Wine Config.bat",   "winecfg.exe" },
         };
-        NSString *desktop = [user stringByAppendingPathComponent:@"Desktop"];
+        /* Two homes: the Desktop folder (for when the desktop window's own
+         * painting reaches the compositor — today it does not, so desktop
+         * icons are invisible) and Start Menu → Programs → Madeira Tools,
+         * which the start menu (a separate, rendered window) lists now. */
+        NSString *startMenu = [user stringByAppendingPathComponent:
+            @"AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Madeira Tools"];
+        [fm createDirectoryAtPath:startMenu withIntermediateDirectories:YES attributes:nil error:nil];
+        NSArray *homes = @[ [user stringByAppendingPathComponent:@"Desktop"], startMenu ];
         int written = 0;
+        for (NSString *home in homes)
         for (size_t i = 0; i < sizeof(launchers) / sizeof(launchers[0]); i++)
         {
             NSString *body = [NSString stringWithFormat:
                 @"@echo off\r\nstart \"\" %s\r\n", launchers[i].cmd];
-            NSString *p = [desktop stringByAppendingPathComponent:[NSString stringWithUTF8String:launchers[i].file]];
+            NSString *p = [home stringByAppendingPathComponent:[NSString stringWithUTF8String:launchers[i].file]];
             NSString *old = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
             if (old && [old isEqualToString:body]) continue;
             if ([body writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) written++;
         }
         if (written)
-            dprintf( STDERR_FILENO, "[profile] wrote %d desktop launcher(s) to users/%s/Desktop\n", written, name );
+            dprintf( STDERR_FILENO, "[profile] wrote %d launcher(s) for users/%s (Desktop + Start Menu)\n", written, name );
     }
 }
 
