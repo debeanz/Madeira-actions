@@ -868,6 +868,8 @@ struct ContentView: View {
     /// FEX_TSOENABLED=0: skip x86 memory-ordering emulation. Big CPU saving,
     /// not safe for every title. Applied by runWineFullSequence.
     @AppStorage("madeira.fexNoTSO") private var fexNoTSO = false
+    /// MADEIRA_DEBUG_VERBOSE=1: full WINEDEBUG trace (WineProcessBridge.m).
+    @AppStorage("madeira.wineVerbose") private var wineVerbose = false
     /// Screen size of the Wine Virtual Desktop launcher, as "WxH". This is
     /// the display games see: the win32u shim lists every standard mode up
     /// to this size, so it also bounds what a game's own resolution menu
@@ -1364,6 +1366,10 @@ struct ContentView: View {
                             }
                             Section("Diagnostics") {
                                 Toggle("Detailed runtime diagnostics", isOn: $input.diagnostics)
+                                Toggle("Verbose Wine trace (slow)", isOn: $wineVerbose)
+                                Text("Logs every file open, module load, exception dispatch and process event to madeira-log.txt. Use it to capture a crash, then turn it off. Applies on the next launch.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                         .navigationTitle("FEX Engine")
@@ -2402,6 +2408,12 @@ struct ContentView: View {
             logStore.log("FEX: TSO emulation OFF (experimental, Settings → FEX Engine)")
         } else {
             unsetenv("FEX_TSOENABLED")
+        }
+        if wineVerbose {
+            setenv("MADEIRA_DEBUG_VERBOSE", "1", 1)
+            logStore.log("Wine: verbose trace ON (Settings → FEX Engine → Engine diagnostics)")
+        } else {
+            unsetenv("MADEIRA_DEBUG_VERBOSE")
         }
 
         // Start a main thread heartbeat to diagnose hang

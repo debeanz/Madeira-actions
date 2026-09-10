@@ -401,7 +401,10 @@ static void *wine_process_thread(void *arg) {
 #else
             const char *verbose = getenv("MADEIRA_DEBUG_VERBOSE");
             if (verbose && *verbose && *verbose != '0') {
-                setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
+                /* trace+seh added 2026-09-10: names the FIRST exception of a
+                 * crash (code + address) before any handler recursion buries
+                 * it. Verbose mode only; it is far too chatty for daily use. */
+                setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file,trace+seh", 1);
                 LOG("WINEDEBUG = verbose (MADEIRA_DEBUG_VERBOSE set)");
             } else {
                 /* err+all keeps real failure messages, but subtract err+virtual
