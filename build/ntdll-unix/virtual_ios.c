@@ -3883,7 +3883,20 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             uint32_t i0, i1, i2;
             unsigned reg;
 
-            if (data_map && (data_map[i / 4] || data_map[(i + 4) / 4] || data_map[(i + 8) / 4]))
+            /* 2026-09-10: data_map is a BITMAP (one bit per instruction,
+             * text_size/32+1 bytes — see ios_x18_build_data_map and the
+             * main pass below). This pass indexed it as one BYTE per
+             * instruction, reading up to 8x past the allocation: for
+             * winhttp.dll's 0x1ed69-byte .text that is ~28KB beyond a
+             * 0xf6c-byte buffer. When the heap happened to end at a page
+             * boundary the read faulted while virtual_mutex was held, and
+             * the Mach fault handler (ios_virtual_handle_fault_for_thread
+             * takes the same mutex) deadlocked the process — Blasphemous
+             * hung at its WINHTTP load with the main thread parked here.
+             * Heap-layout dependent, hence intermittent. */
+            if (data_map && ((data_map[(i / 4) >> 3] & (1u << ((i / 4) & 7))) ||
+                             (data_map[((i + 4) / 4) >> 3] & (1u << (((i + 4) / 4) & 7))) ||
+                             (data_map[((i + 8) / 4) >> 3] & (1u << (((i + 8) / 4) & 7)))))
                 continue;
 
             i0 = *(uint32_t *)(text_rw + i);
