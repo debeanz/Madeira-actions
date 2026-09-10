@@ -429,7 +429,7 @@ struct GamepadSettingsView: View {
             Section("Controller") {
                 HStack {
                     Image(systemName: pad.controllerName == nil ? "gamecontroller" : "gamecontroller.fill")
-                        .foregroundStyle(pad.controllerName == nil ? .secondary : .green)
+                        .foregroundStyle(pad.controllerName == nil ? Color.secondary : Color.green)
                     Text(pad.controllerName ?? "No controller connected")
                         .foregroundStyle(pad.controllerName == nil ? .secondary : .primary)
                 }
