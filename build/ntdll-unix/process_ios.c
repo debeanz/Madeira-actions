@@ -1345,6 +1345,19 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (ios_is_arm64ec_cur() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
             machine = ios_cur_image_info()->Machine;
     }
+    /* 2026-09-10: no WoW64 on this port. Refuse 32-bit images HERE, at
+     * CreateProcess time, so the spawner gets STATUS_INVALID_IMAGE_FORMAT →
+     * ERROR_BAD_EXE_FORMAT ("not a valid Win32 application"). The child-side
+     * check in load_main_exe stays as the backstop, but by then a process
+     * exists, and its immediate death surfaced in explorer as a baffling
+     * "invalid handle". */
+    if (!is_machine_64bit( machine ))
+    {
+        dprintf(2, "[spawn] REJECT %s: 32-bit image (machine 0x%x) — this port runs 64-bit x86 programs only\n",
+                debugstr_us(&path), machine);
+        status = STATUS_INVALID_IMAGE_FORMAT;
+        goto done;
+    }
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;
     env_size = get_env_size( params, &winedebug );
