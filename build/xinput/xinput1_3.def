@@ -1,0 +1,14 @@
+; Ordinals mirror Microsoft's xinput1_3.dll (Wine's xinput1_3.spec).
+EXPORTS
+    DllMain @1
+    XInputGetState @2
+    XInputSetState @3
+    XInputGetCapabilities @4
+    XInputEnable @5
+    XInputGetDSoundAudioDeviceGuids @6
+    XInputGetBatteryInformation @7
+    XInputGetKeystroke @8
+    XInputGetStateEx @100 NONAME
+    XInputWaitForGuideButton @101 NONAME
+    XInputCancelGuideButtonWait @102 NONAME
+    XInputPowerOffController @103 NONAME

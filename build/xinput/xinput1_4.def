@@ -1,0 +1,19 @@
+; Ordinals mirror Microsoft's xinput1_4.dll (Wine's xinput1_4.spec).
+; Programs import XInput by ordinal (SDL, Steam layers); 2 must be
+; XInputGetState or the loader binds them to "unimplemented function".
+EXPORTS
+    DllMain @1
+    XInputGetState @2
+    XInputSetState @3
+    XInputGetCapabilities @4
+    XInputEnable @5
+    XInputGetDSoundAudioDeviceGuids @6
+    XInputGetBatteryInformation @7
+    XInputGetKeystroke @8
+    XInputGetAudioDeviceIds @10
+    XInputGetStateEx @100 NONAME
+    XInputWaitForGuideButton @101 NONAME
+    XInputCancelGuideButtonWait @102 NONAME
+    XInputPowerOffController @103 NONAME
+    XInputGetBaseBusInformation @104 NONAME
+    XInputGetCapabilitiesEx @108 NONAME

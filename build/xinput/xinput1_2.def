@@ -1,0 +1,7 @@
+; Ordinals follow Wine's xinput1_2.spec (sequential in this order).
+EXPORTS
+    XInputEnable @1
+    XInputGetCapabilities @2
+    XInputGetDSoundAudioDeviceGuids @3
+    XInputSetState @4
+    XInputGetState @5

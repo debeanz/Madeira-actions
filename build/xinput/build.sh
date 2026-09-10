@@ -22,9 +22,12 @@ fi
 mkdir -p "$OUT"
 for name in xinput1_4 xinput1_3 xinput1_2 xinput1_1 xinput9_1_0; do
     echo "=== $name.dll ==="
+    # One .def per DLL name: each Microsoft XInput DLL has its own fixed
+    # ordinal layout and programs import by ordinal (OneShot's Steam layer
+    # imported xinput1_4 ordinal 2 and hit "unimplemented function").
     "$CC" -shared -O2 -Wall -Wno-unused-parameter -s \
         -I"$DIR" \
-        -o "$OUT/$name.dll" "$DIR/xinput.c" "$DIR/xinput.def"
+        -o "$OUT/$name.dll" "$DIR/xinput.c" "$DIR/$name.def"
     # Show what we produced: machine type, imports and the export table.
     "$TC/llvm-readobj" --file-headers "$OUT/$name.dll" | grep -E "Machine|Characteristics" | head -3
     "$TC/llvm-readobj" --coff-imports "$OUT/$name.dll" | grep -E "^\s*Name:" | sort -u
