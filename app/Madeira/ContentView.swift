@@ -868,7 +868,8 @@ struct ContentView: View {
     /// can offer.
     @AppStorage("madeira.desktopResolution") private var desktopResolution = "960x540"
     private static let desktopResolutions = [
-        "960x540", "1280x720", "1600x900", "1920x1080", "1024x768", "1280x960",
+        "960x540", "1280x720", "1600x900", "1920x1080", "2048x1084", "2796x1290",
+        "1024x768", "1280x960",
     ]
     private var desktopSize: (w: Int, h: Int) {
         let parts = desktopResolution.split(separator: "x").compactMap { Int($0) }
