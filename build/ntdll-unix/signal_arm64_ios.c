@@ -2862,6 +2862,124 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                         }
                     }
+                    /* STXR / STLXR (general register, single) into an alias page — ml786.
+                     *
+                     * Encoding: size 001000 o2=0 L=0 o1=0 Rs o0 11111 Rn Rt
+                     *   mask 0x3fe07c00 == 0x08007c00 (o0 free: STXR and STLXR; o1=0
+                     *   excludes the pair forms; size 00..11 = B/H/W/X).
+                     *
+                     * OneShot: World Machine Edition (Wine Mono) hit this in ntdll's
+                     * RtlEnterCriticalSection: Mono keeps a CRITICAL_SECTION inside its
+                     * own RWX code-manager chunk, which Madeira aliases into the JIT
+                     * pool. The InterlockedIncrement on LockCount is
+                     *     885ffd09  ldaxr w9, [x8]
+                     *     1100052a  add   w10, w9, #1
+                     *     880bfd0a  stlxr w11, w10, [x8]      <- faults (RX view)
+                     *     35ffffab  cbnz  w11, <ldaxr>
+                     * The LDAXR reads fine through the RX view, so ONLY the store
+                     * exclusive arrives here, and the ml431 per-thread monitor (which
+                     * is fed by an emulated LDAXR on the UNALIGNED path) is empty.
+                     *
+                     * A plain store would break the atomicity the loop exists for.
+                     * Instead: find the matching LDAXR/LDXR (same size, same Rn, at
+                     * most 8 instructions back), take the value it left in its Rt as
+                     * the expected value, and do a genuine compare-and-swap on the RW
+                     * alias — the two views share physical memory, so the CAS is
+                     * atomic against every other thread's LSE/exclusive access. A
+                     * failed CAS reports status=1, the loop re-executes its LDAXR
+                     * natively and comes back with a fresh expected value: exactly the
+                     * architectural retry. Only if no matching load can be found (or
+                     * an intermediate instruction rewrote the loaded register or the
+                     * base) do we fall back to a plain release store with status=0,
+                     * and say so in the log. */
+                    else if ((insn & 0x3fe07c00u) == 0x08007c00u)
+                    {
+                        const uint32_t Size = (insn >> 30) & 0x3;
+                        const uint32_t Rs = (insn >> 16) & 0x1f;
+                        const uint32_t Rn = (insn >> 5) & 0x1f;
+                        const uint32_t Rt = insn & 0x1f;
+                        const uint64_t szmask = (Size == 3) ? ~0ULL : ((1ULL << (8u << Size)) - 1);
+                        const uint64_t stval = ((Rt == 31) ? 0 : state.__x[Rt]) & szmask;
+                        const uint32_t ldaxr = 0x085ffc00u | (Size << 30);   /* o0=1 */
+                        const uint32_t ldxr  = 0x085f7c00u | (Size << 30);   /* o0=0 */
+                        int load_rt = -1, clobbered = 0, k;
+                        uint64_t status = 0, expected = 0;
+                        int did_cas = 0, swapped = 0;
+                        /* Never read across the start of the page holding pc: the page
+                         * below may be unmapped and this runs on the exception server. */
+                        const uint64_t scan_lo = (uint64_t)fault_pc & ~0x3fffULL;
+
+                        for (k = 1; k <= 8 && (uint64_t)fault_pc - 4 * k >= scan_lo; k++)
+                        {
+                            uint32_t p = *(uint32_t *)(uintptr_t)(fault_pc - 4 * k);
+                            if ((p & 0xffe0fc00u) == ldaxr || (p & 0xffe0fc00u) == ldxr)
+                            {
+                                if (((p >> 5) & 0x1f) == Rn && (p & 0x1f) != 31) load_rt = p & 0x1f;
+                                break;   /* the nearest exclusive load decides, match or not */
+                            }
+                            /* Anything in between whose Rd/Rt field names the loaded
+                             * register or the base makes the register value untrustworthy.
+                             * (Conservative: stores/branches also have a Rt field.) */
+                            if ((p & 0x1f) == Rn) clobbered = 1;
+                        }
+                        if (load_rt >= 0 && !clobbered)
+                        {
+                            for (k = 1; k <= 8 && (uint64_t)fault_pc - 4 * k >= scan_lo; k++)
+                            {
+                                uint32_t p = *(uint32_t *)(uintptr_t)(fault_pc - 4 * k);
+                                if ((p & 0xffe0fc00u) == ldaxr || (p & 0xffe0fc00u) == ldxr) break;
+                                if ((p & 0x1f) == (uint32_t)load_rt) { clobbered = 1; break; }
+                            }
+                        }
+
+                        if (load_rt >= 0 && !clobbered)
+                        {
+                            expected = state.__x[load_rt] & szmask;
+                            did_cas = 1;
+                            switch (Size)
+                            {
+                            case 0: { uint8_t  e = (uint8_t)expected;
+                                      swapped = __atomic_compare_exchange_n((uint8_t *)rw_addr, &e, (uint8_t)stval,
+                                                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); break; }
+                            case 1: { uint16_t e = (uint16_t)expected;
+                                      swapped = __atomic_compare_exchange_n((uint16_t *)rw_addr, &e, (uint16_t)stval,
+                                                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); break; }
+                            case 2: { uint32_t e = (uint32_t)expected;
+                                      swapped = __atomic_compare_exchange_n((uint32_t *)rw_addr, &e, (uint32_t)stval,
+                                                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); break; }
+                            default:{ uint64_t e = expected;
+                                      swapped = __atomic_compare_exchange_n((uint64_t *)rw_addr, &e, stval,
+                                                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); break; }
+                            }
+                            status = swapped ? 0 : 1;
+                        }
+                        else
+                        {
+                            switch (Size)
+                            {
+                            case 0:  __atomic_store_n((uint8_t *)rw_addr,  (uint8_t)stval,  __ATOMIC_RELEASE); break;
+                            case 1:  __atomic_store_n((uint16_t *)rw_addr, (uint16_t)stval, __ATOMIC_RELEASE); break;
+                            case 2:  __atomic_store_n((uint32_t *)rw_addr, (uint32_t)stval, __ATOMIC_RELEASE); break;
+                            default: __atomic_store_n((uint64_t *)rw_addr, stval,           __ATOMIC_RELEASE); break;
+                            }
+                            status = 0;
+                        }
+                        if (Rs != 31) state.__x[Rs] = status;
+                        emulated = 1;
+                        {
+                            static int stxr_n;
+                            if (stxr_n < 8 || (!did_cas && stxr_n < 64))
+                                dprintf(STDERR_FILENO,
+                                    "[stxr-emul] ml786 #%d insn=0x%08x pc=0x%llx addr=0x%llx size=%u "
+                                    "Rn=x%u Rt=x%u Rs=x%u load_rt=%d %s expected=0x%llx new=0x%llx status=%llu\n",
+                                    ++stxr_n, insn, (unsigned long long)fault_pc,
+                                    (unsigned long long)fault_addr, 1u << Size, Rn, Rt, Rs, load_rt,
+                                    did_cas ? "CAS" : (clobbered ? "PLAIN-STORE (loaded reg clobbered)"
+                                                                 : "PLAIN-STORE (no LDAXR found)"),
+                                    (unsigned long long)expected, (unsigned long long)stval,
+                                    (unsigned long long)status);
+                        }
+                    }
                     /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
                     else if ((insn & 0xffe00c00) == 0xf8200800)
                     {
@@ -3053,6 +3171,37 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                             memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
                             emulated = 1;
+                        }
+                    }
+                    /* SIMD/FP STUR (immediate, UNSCALED) for the D/S/H/B widths — ml786.
+                     *   size 111 1 00 00 0 imm9 00 Rn Rt, size = 11 D (0xfc000000),
+                     *   10 S (0xbc000000), 01 H (0x7c000000), 00 B (0x3c000000);
+                     *   mask 0xffe00c00 pins bits[11:10]==00 (unscaled, NO writeback).
+                     * Same gap as the Q form above, one size down: the pre/post-index
+                     * D and S branches require (insn & 0xc00) != 0, so unscaled S/D
+                     * stores fell through to [store-undecoded]. OneShot (Wine Mono)
+                     * hit 0xbc029260 = `stur s0, [x19, #41]` — FEX's translation of a
+                     * guest 4-byte store into Mono's aliased JIT heap (x86 RSI-4, an
+                     * odd address, i.e. Mono patching an imm32 inside generated
+                     * code). fault_addr is already the effective address. */
+                    else if ((insn & 0x3fe00c00) == 0x3c000000)
+                    {
+                        int rt = insn & 0x1f;
+                        int size = (insn >> 30) & 3;   /* 0=B 1=H 2=S 3=D */
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 1 << size);
+                            emulated = 1;
+                            {
+                                static int stur_n;
+                                if (stur_n < 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[stur-emul] ml786 #%d insn=0x%08x pc=0x%llx addr=0x%llx "
+                                        "%d-byte %c%d\n",
+                                        ++stur_n, insn, (unsigned long long)fault_pc,
+                                        (unsigned long long)fault_addr, 1 << size,
+                                        "bhsd"[size], rt);
+                            }
                         }
                     }
                     /* GPR STR (immediate, unsigned offset, 64-bit X-reg):
