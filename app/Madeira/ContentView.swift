@@ -952,6 +952,16 @@ struct ContentView: View {
         "960x540", "1280x720", "1600x900", "1920x1080", "2048x1084", "2796x1290",
         "1024x768", "1280x960",
     ]
+    /// "0.1.<run> (<run>, <commit>)" as stamped by CI (Stamp version step);
+    /// "0.1.0 (1)" for a local Xcode build.
+    static var appVersionText: String {
+        let info = Bundle.main.infoDictionary
+        let v = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = info?["CFBundleVersion"] as? String ?? "?"
+        if let c = info?["MadeiraBuildCommit"] as? String, !c.isEmpty { return "\(v) (\(b), \(c))" }
+        return "\(v) (\(b))"
+    }
+
     private var desktopSize: (w: Int, h: Int) {
         let parts = desktopResolution.split(separator: "x").compactMap { Int($0) }
         guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (960, 540) }
@@ -1010,6 +1020,8 @@ struct ContentView: View {
         }
         .onAppear {
             jit_install_trap_handler()
+            // First line of every session log: which build produced it.
+            logStore.log("Madeira \(Self.appVersionText)")
             entitlements = EntitlementStatus.check()
             logEntitlementStatus()
             GamepadBridge.shared.start()
@@ -1487,7 +1499,7 @@ struct ContentView: View {
                 }
 
                 Section("About") {
-                    LabeledContent("Madeira", value: "0.1.0")
+                    LabeledContent("Madeira", value: Self.appVersionText)
                     LabeledContent("Device", value: deviceInfo)
                 }
             }

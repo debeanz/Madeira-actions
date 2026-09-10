@@ -641,6 +641,19 @@ jobs:
           PY
           grep -n "glassEffect" "$F" && { echo "FATAL: calls remain"; exit 1; } || true
 
+      # Every build gets its own version: marketing version 0.1.<run number>,
+      # build number <run number>, plus the commit, so IPAs, the About row
+      # and madeira-log.txt can all be matched to a commit.
+      - name: Stamp version
+        run: |
+          set -euxo pipefail
+          P=app/Madeira/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 0.1.${GITHUB_RUN_NUMBER}" "$P"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" "$P"
+          /usr/libexec/PlistBuddy -c "Add :MadeiraBuildCommit string ${GITHUB_SHA:0:7}" "$P" \
+            || /usr/libexec/PlistBuddy -c "Set :MadeiraBuildCommit ${GITHUB_SHA:0:7}" "$P"
+          /usr/libexec/PlistBuddy -c "Print" "$P" | grep -E "Version|Commit"
+
       # Replacement XInput DLLs (ARM64EC). Overwrites the checked-in Wine
       # built-ins in the working tree before xcodebuild bundles the folder.
       - name: Build XInput DLLs (ARM64EC)
@@ -709,17 +722,18 @@ jobs:
           lipo -info out/Madeira.app/Madeira
           rm -rf artifacts && mkdir -p artifacts/Payload
           cp -R out/Madeira.app artifacts/Payload/Madeira.app
-          cd artifacts && zip -qry Madeira.ipa Payload
-          unzip -l Madeira.ipa | grep -q "Payload/Madeira.app/Madeira"
-          ls -lh Madeira.ipa
+          IPA="Madeira-0.1.${GITHUB_RUN_NUMBER}.ipa"
+          cd artifacts && zip -qry "$IPA" Payload
+          unzip -l "$IPA" | grep -q "Payload/Madeira.app/Madeira"
+          ls -lh "$IPA"
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Madeira
+          name: Madeira-0.1.${{ github.run_number }}
           path: |
-            artifacts/Madeira.ipa
+            artifacts/*.ipa
             /tmp/fex.log
             wine/build-macos/config.log
             research/dxmt/build-pe/meson-logs/**

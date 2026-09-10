@@ -521,7 +521,10 @@ static void *wine_process_thread(void *arg) {
                 /* trace+seh added 2026-09-10: names the FIRST exception of a
                  * crash (code + address) before any handler recursion buries
                  * it. Verbose mode only; it is far too chatty for daily use. */
-                setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file,trace+seh", 1);
+                /* trace+dialog: MessageBox text. A game's fatal-error box is
+                 * often the ONLY statement of why it quit, and here it can go
+                 * unseen (Fields of Mistria exit(1)'d with no window on screen). */
+                setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file,trace+seh,trace+dialog", 1);
                 LOG("WINEDEBUG = verbose (MADEIRA_DEBUG_VERBOSE set)");
             } else {
                 /* err+all keeps real failure messages, but subtract err+virtual
