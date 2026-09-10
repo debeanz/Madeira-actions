@@ -2104,6 +2104,20 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         char *loader;
 
         if (main_image_info.ImageCharacteristics & IMAGE_FILE_DLL) status = STATUS_INVALID_IMAGE_FORMAT;
+        /* 2026-09-10: no WoW64 on this port — FEX runs 64-bit x86 only and
+         * there is no 32-bit ntdll/address-space setup. A 32-bit main image
+         * that gets this far (Celeste.exe: Machine=0x14c, chars=0x102 passed
+         * map_image_into_view's checks, unlike Undertale's) went on to
+         * build_wow64_parameters, whose 4GB-window VA scan cannot succeed
+         * here and asserted — killing the launch thread without the server
+         * ever learning the process died, so the explorer that spawned it
+         * hung. Fail it like any other bad image instead. */
+        if (!is_machine_64bit( main_image_info.Machine ))
+        {
+            MESSAGE( "wine: %s is a 32-bit (machine 0x%x) image; this port runs 64-bit x86 programs only\n",
+                     debugstr_us(&nt_name), main_image_info.Machine );
+            status = STATUS_INVALID_IMAGE_FORMAT;
+        }
         /* if we have to use a different loader, fall back to start.exe */
         if ((loader = get_alternate_wineloader( main_image_info.Machine )))
         {
