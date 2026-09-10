@@ -642,6 +642,9 @@ jobs:
       - name: Build Madeira.app
         run: |
           set -uxo pipefail
+          # The runner launches bash with -e; switch it off or the failing
+          # pipeline aborts the step before the diagnostics below run.
+          set +e
           rm -rf out
           # Compiler errors are re-emitted as GitHub annotations so they show
           # on the run summary (readable without signing in, unlike the log).
