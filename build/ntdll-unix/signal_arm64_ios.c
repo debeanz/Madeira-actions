@@ -2900,8 +2900,15 @@ static void *ios_mach_exception_thread( void *arg )
                         const uint32_t Rt = insn & 0x1f;
                         const uint64_t szmask = (Size == 3) ? ~0ULL : ((1ULL << (8u << Size)) - 1);
                         const uint64_t stval = ((Rt == 31) ? 0 : state.__x[Rt]) & szmask;
+                        /* LDAXR/LDXR: size 001000 0 1 0 11111 o0 11111 Rn Rt. The Rs
+                         * field is fixed at 11111, so the match mask must KEEP bits
+                         * 20:16 (0xfffffc00). ml786 shipped 0xffe0fc00, which cleared
+                         * them and never matched, so every STLXR took the plain-store
+                         * fallback ("loaded reg clobbered", from the add x8,x0,#8 that
+                         * sits before the loop). ml787 fixes the mask. */
                         const uint32_t ldaxr = 0x085ffc00u | (Size << 30);   /* o0=1 */
                         const uint32_t ldxr  = 0x085f7c00u | (Size << 30);   /* o0=0 */
+                        const uint32_t ldx_mask = 0xfffffc00u;
                         int load_rt = -1, clobbered = 0, k;
                         uint64_t status = 0, expected = 0;
                         int did_cas = 0, swapped = 0;
@@ -2912,7 +2919,7 @@ static void *ios_mach_exception_thread( void *arg )
                         for (k = 1; k <= 8 && (uint64_t)fault_pc - 4 * k >= scan_lo; k++)
                         {
                             uint32_t p = *(uint32_t *)(uintptr_t)(fault_pc - 4 * k);
-                            if ((p & 0xffe0fc00u) == ldaxr || (p & 0xffe0fc00u) == ldxr)
+                            if ((p & ldx_mask) == ldaxr || (p & ldx_mask) == ldxr)
                             {
                                 if (((p >> 5) & 0x1f) == Rn && (p & 0x1f) != 31) load_rt = p & 0x1f;
                                 break;   /* the nearest exclusive load decides, match or not */
@@ -2927,7 +2934,7 @@ static void *ios_mach_exception_thread( void *arg )
                             for (k = 1; k <= 8 && (uint64_t)fault_pc - 4 * k >= scan_lo; k++)
                             {
                                 uint32_t p = *(uint32_t *)(uintptr_t)(fault_pc - 4 * k);
-                                if ((p & 0xffe0fc00u) == ldaxr || (p & 0xffe0fc00u) == ldxr) break;
+                                if ((p & ldx_mask) == ldaxr || (p & ldx_mask) == ldxr) break;
                                 if ((p & 0x1f) == (uint32_t)load_rt) { clobbered = 1; break; }
                             }
                         }
@@ -2970,7 +2977,7 @@ static void *ios_mach_exception_thread( void *arg )
                             static int stxr_n;
                             if (stxr_n < 8 || (!did_cas && stxr_n < 64))
                                 dprintf(STDERR_FILENO,
-                                    "[stxr-emul] ml786 #%d insn=0x%08x pc=0x%llx addr=0x%llx size=%u "
+                                    "[stxr-emul] ml787 #%d insn=0x%08x pc=0x%llx addr=0x%llx size=%u "
                                     "Rn=x%u Rt=x%u Rs=x%u load_rt=%d %s expected=0x%llx new=0x%llx status=%llu\n",
                                     ++stxr_n, insn, (unsigned long long)fault_pc,
                                     (unsigned long long)fault_addr, 1u << Size, Rn, Rt, Rs, load_rt,
@@ -3176,7 +3183,8 @@ static void *ios_mach_exception_thread( void *arg )
                     /* SIMD/FP STUR (immediate, UNSCALED) for the D/S/H/B widths — ml786.
                      *   size 111 1 00 00 0 imm9 00 Rn Rt, size = 11 D (0xfc000000),
                      *   10 S (0xbc000000), 01 H (0x7c000000), 00 B (0x3c000000);
-                     *   mask 0xffe00c00 pins bits[11:10]==00 (unscaled, NO writeback).
+                     *   mask 0x3fe00c00 leaves size free and pins bits[11:10]==00
+                     *   (unscaled, NO writeback).
                      * Same gap as the Q form above, one size down: the pre/post-index
                      * D and S branches require (insn & 0xc00) != 0, so unscaled S/D
                      * stores fell through to [store-undecoded]. OneShot (Wine Mono)
