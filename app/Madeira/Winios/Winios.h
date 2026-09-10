@@ -49,6 +49,12 @@ void winios_post_key(int vk, int down);
  * dispatch inside. */
 void winios_set_compositor_frame(double x, double y, double w, double h);
 
+/* Show/hide the desktop compositor view. It is a window-level UIView
+ * above the whole SwiftUI tree (like MetalHostView), so the app must
+ * hide it explicitly when the Activity tab is not on screen. Remembered
+ * if called before the compositor exists; main-thread dispatch inside. */
+void winios_set_compositor_hidden(int hidden);
+
 /* S2 trackpad pointer. (x, y) are ABSOLUTE wine-desktop pixels (the
  * Swift trackpad engine owns the cursor position); flags are raw
  * MOUSEEVENTF_* combos; data carries the wheel delta for

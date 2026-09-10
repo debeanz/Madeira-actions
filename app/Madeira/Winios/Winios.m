@@ -653,6 +653,18 @@ void winios_set_compositor_frame(double x, double y, double w, double h) {
     });
 }
 
+/* Hidden state requested by the app (tab switches). Applied on creation
+ * too, so a desktop started while another tab is showing stays out of
+ * sight until Activity is selected. */
+static BOOL g_comp_hidden;
+
+void winios_set_compositor_hidden(int hidden) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_comp_hidden = hidden != 0;
+        if (g_compositor_view) g_compositor_view.hidden = g_comp_hidden;
+    });
+}
+
 /* main thread only */
 static void winios_ensure_compositor(void) {
     if (g_compositor_view) return;
@@ -678,6 +690,7 @@ static void winios_ensure_compositor(void) {
     g_desk_bg = [CALayer layer];
     g_desk_bg.backgroundColor = [UIColor colorWithRed:0.0 green:0.502 blue:0.502 alpha:1.0].CGColor;
     [g_compositor_view.layer addSublayer:g_desk_bg];
+    g_compositor_view.hidden = g_comp_hidden;
     [win addSubview:g_compositor_view];
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");

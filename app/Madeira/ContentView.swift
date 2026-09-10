@@ -851,7 +851,6 @@ struct ContentView: View {
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
     @ObservedObject private var touchControls = TouchControlsModel.shared
-    @ObservedObject private var perf = PerfMonitor.shared
     @ObservedObject private var gamepad = GamepadBridge.shared
     @State private var pointerPanel = false
     @State private var selectedTab: MadeiraTab = .library
@@ -933,9 +932,14 @@ struct ContentView: View {
             logEntitlementStatus()
             GamepadBridge.shared.start()
             MetalHostView.shared.isHidden = selectedTab != .activity
+            winios_set_compositor_hidden(selectedTab != .activity ? 1 : 0)
         }
         .onChange(of: selectedTab) { _, tab in
+            // Both surfaces are window-level views above the whole SwiftUI
+            // tree: the games' Metal host AND the desktop compositor. The
+            // compositor used to stay visible on every tab.
             MetalHostView.shared.isHidden = tab != .activity
+            winios_set_compositor_hidden(tab != .activity ? 1 : 0)
         }
         .onReceive(NotificationCenter.default.publisher(
             for: Notification.Name("MadeiraExitFullScreen"))) { _ in
@@ -1225,6 +1229,7 @@ struct ContentView: View {
         .perfMonitored()
         .onAppear {
             MetalHostView.shared.isHidden = false
+            winios_set_compositor_hidden(0)
             touchControls.fullScreen = true
             if touchControls.visible { touchControls.ensureDefaultLayout() }
             TouchControlsHost.attach()
@@ -1357,7 +1362,7 @@ struct ContentView: View {
                     Toggle(isOn: $perfOverlayEnabled) {
                         Label("Show FPS, memory and thermal readout", systemImage: "gauge.with.dots.needle.67percent")
                     }
-                    Text("Shown beside the game surface and in full screen. Memory and thermal warnings are still logged and shown as a banner when the readout is off.")
+                    Text("Shown beside the game surface and in full screen. Memory and thermal changes are always written to the session log, whether or not the readout is on.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1415,14 +1420,6 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal)
-
-            // Warning banner sits ABOVE the surface, never over it: the
-            // Metal host is a window-level view that covers anything drawn
-            // on top of the game area.
-            PerfWarningBanner()
-                .padding(.horizontal)
-                .animation(.easeInOut(duration: 0.25), value: perf.warning)
-                .animation(.easeInOut(duration: 0.25), value: perf.warningDismissed)
 
             MadeiraMetalView()
                 .frame(maxWidth: .infinity)
@@ -3261,7 +3258,6 @@ enum TouchControlsHost {
 
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
-    @ObservedObject private var perf = PerfMonitor.shared
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     @State private var pinchBase: Double?
 
@@ -3275,23 +3271,16 @@ struct TouchControlsOverlay: View {
                         }
                     }
                     // Performance HUD: this window is the only thing that
-                    // draws above the window-level Metal host, so full
-                    // screen readouts and warnings have to live here. Kept
-                    // inside the top 100pt band that ControlsWindow.hitTest
-                    // reserves for the toolbar, so the pacing pill and the
-                    // banner's dismiss button stay tappable.
-                    HStack(alignment: .top, spacing: 10) {
-                        if perfOverlayEnabled {
-                            FPSOverlay()
-                        }
-                        PerfWarningBanner()
-                            .frame(maxWidth: 340)
+                    // draws above the window-level Metal host, so the full
+                    // screen readout has to live here. Kept inside the top
+                    // 100pt band that ControlsWindow.hitTest reserves for
+                    // the toolbar, so the pacing pill stays tappable.
+                    if perfOverlayEnabled {
+                        FPSOverlay()
+                            .padding(.top, geo.safeAreaInsets.top + 10)
+                            .padding(.leading, geo.safeAreaInsets.leading + 12)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
-                    .padding(.top, geo.safeAreaInsets.top + 10)
-                    .padding(.leading, geo.safeAreaInsets.leading + 12)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .animation(.easeInOut(duration: 0.25), value: perf.warning)
-                    .animation(.easeInOut(duration: 0.25), value: perf.warningDismissed)
                     topBar
                         .padding(.top, geo.safeAreaInsets.top + 10)
                         .padding(.trailing, geo.safeAreaInsets.trailing + 12)

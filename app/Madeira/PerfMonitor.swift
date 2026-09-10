@@ -24,10 +24,6 @@ final class PerfMonitor: ObservableObject {
     @Published private(set) var memMB: Int = 0
     @Published private(set) var thermal: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
     @Published private(set) var lowPower: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
-    /// Highest-priority active warning, or nil. Banner text derives from it.
-    @Published private(set) var warning: Warning? = nil
-    /// True once the user swipes the banner away; cleared on the next tier change.
-    @Published var warningDismissed = false
 
     /// iOS jetsams this app at EXACTLY 4096MB of phys_footprint with the
     /// increased-memory-limit entitlement (ml605 died at 4080MB with no
@@ -231,7 +227,6 @@ final class PerfMonitor: ObservableObject {
                 LogStore.shared.log("Memory back to normal: \(memMB)MB used", level: .success)
             }
             lastMemoryTier = tier
-            warningDismissed = false
         }
 
         if thermal != lastThermal {
@@ -243,35 +238,6 @@ final class PerfMonitor: ObservableObject {
                 LogStore.shared.log("Thermal state back to nominal", level: .success)
             }
             lastThermal = thermal
-            warningDismissed = false
-        }
-
-        // Pick the single worst condition for the banner. Memory wins ties
-        // because it ends the session; heat only slows it.
-        let memW: Warning? = tier == .ok ? nil : .memory(tier)
-        let thermW: Warning? = thermal == .nominal ? nil : .thermal(thermal)
-        let next: Warning?
-        switch (memW, thermW) {
-        case (nil, nil): next = nil
-        case (let m?, nil): next = m
-        case (nil, let t?): next = t
-        case (let m?, let t?):
-            next = severity(m) >= severity(t) ? m : t
-        }
-        if next != warning { warning = next }
-    }
-
-    private func severity(_ w: Warning) -> Int {
-        switch w {
-        case .memory(let t): return t.rawValue
-        case .thermal(let s):
-            switch s {
-            case .nominal:  return 0
-            case .fair:     return 1
-            case .serious:  return 2
-            case .critical: return 3
-            @unknown default: return 0
-            }
         }
     }
 
@@ -318,47 +284,6 @@ final class PerfMonitor: ObservableObject {
         let dc = latest.c &- oldest.c
         guard dt > 0.0001 else { return 0 }
         return Double(dc) / dt
-    }
-}
-
-/// Dismissable banner for the active PerfMonitor warning. Sized for the
-/// portrait Activity screen and the full-screen HUD; it collapses to nothing
-/// when there is no warning or the user has swiped it away.
-struct PerfWarningBanner: View {
-    @ObservedObject private var perf = PerfMonitor.shared
-
-    var body: some View {
-        if let w = perf.warning, !perf.warningDismissed {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: w.symbol)
-                    .font(.title3)
-                    .foregroundStyle(w.color)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(w.title)
-                        .font(.subheadline.bold())
-                        .foregroundStyle(.white)
-                    Text(w.detail)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.85))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-                Button {
-                    perf.warningDismissed = true
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.caption.bold())
-                        .foregroundStyle(.white.opacity(0.7))
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(12)
-            .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(w.color.opacity(0.8), lineWidth: 1))
-            .transition(.move(edge: .top).combined(with: .opacity))
-        }
     }
 }
 
