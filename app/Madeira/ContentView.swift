@@ -89,10 +89,64 @@ final class MetalBackedView: UIView {
     // Run) directly instead of relying on the browse list.
     static weak var keyboardTarget: MetalBackedView?
     override var canBecomeFirstResponder: Bool { true }
+
+    /// Whether the software keyboard is actually on screen, tracked from
+    /// UIKit's notifications. `isFirstResponder` alone is not enough: the
+    /// view can still be first responder with the keyboard gone (window
+    /// changes, scene transitions), and then a "toggle" resigned an
+    /// invisible keyboard — the button seemed dead every other press.
+    private static var keyboardShown = false
+    private static var keyboardObserved = false
+    private static func observeKeyboard() {
+        guard !keyboardObserved else { return }
+        keyboardObserved = true
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: UIResponder.keyboardDidShowNotification, object: nil, queue: .main) { _ in
+            keyboardShown = true
+        }
+        nc.addObserver(forName: UIResponder.keyboardDidHideNotification, object: nil, queue: .main) { _ in
+            keyboardShown = false
+        }
+    }
+
+    /// The surface view that is live on screen right now: the registered
+    /// target if it is still in a window, else any attached instance.
+    private static func liveTarget() -> MetalBackedView? {
+        if let v = keyboardTarget, v.window != nil { return v }
+        for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+            for w in scene.windows {
+                if let v = find(in: w) { return v }
+            }
+        }
+        return nil
+    }
+
+    private static func find(in view: UIView) -> MetalBackedView? {
+        if let v = view as? MetalBackedView, !v.isHidden { return v }
+        for s in view.subviews { if let v = find(in: s) { return v } }
+        return nil
+    }
+
     static func toggleKeyboard() {
-        guard let v = keyboardTarget else { return }
+        observeKeyboard()
+        guard let v = liveTarget() else {
+            LogStore.shared.log("Keyboard: no live game surface to attach to", level: .error)
+            return
+        }
+        if keyboardShown {
+            v.resignFirstResponder()
+            return
+        }
+        // Not visible: (re)raise it. The button lives in the touch-controls
+        // window, so make sure the surface's own window is key first —
+        // iOS only shows the keyboard for the key window's responder.
+        v.window?.makeKey()
         if v.isFirstResponder { v.resignFirstResponder() }
-        else { v.becomeFirstResponder() }
+        let ok = v.becomeFirstResponder()
+        if !ok {
+            LogStore.shared.log("Keyboard: becomeFirstResponder refused (window=\(v.window == nil ? "nil" : "ok"))",
+                                level: .error)
+        }
     }
 
     override init(frame: CGRect) {

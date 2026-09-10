@@ -584,7 +584,18 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
+/* hwnd → owning pseudo-process (its PEB, the identity process_exit_wrapper
+ * uses). Windows die with their process server-side, but the driver never
+ * gets pDestroyWindow for them, so without this a quit game left its last
+ * (black) frame as a layer on top of the taskbar. */
+static NSMutableDictionary<NSNumber *, NSValue *> *g_layer_owner;
+extern void *ios_jit_current_peb(void);                                 /* ntdll-unix, wine thread */
 static void winios_place_metal_layer(NSNumber *key);
+static void winios_note_layer_owner(NSNumber *key, void *owner) {
+    if (!owner) return;
+    if (!g_layer_owner) g_layer_owner = [NSMutableDictionary new];
+    if (!g_layer_owner[key]) g_layer_owner[key] = [NSValue valueWithPointer:owner];
+}
 
 /* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
  * Crop the layer contents to the window's actual size or everything
@@ -731,24 +742,45 @@ static CALayer *winios_layer_for(HWND hwnd, bool create) {
     return l;
 }
 
+/* main thread only */
+static void winios_remove_layer_now(NSNumber *key) {
+    if (!g_layers) return;
+    CALayer *l = g_layers[key];
+    if (l) {
+        [l removeFromSuperlayer];
+        [g_layers removeObjectForKey:key];
+        [g_px_rects removeObjectForKey:key];
+    }
+    CAMetalLayer *ml = g_metal_layers[key];
+    if (ml) {
+        [ml removeFromSuperlayer];
+        [g_metal_layers removeObjectForKey:key];
+        [g_client_rects removeObjectForKey:key];
+        fprintf(stderr, "[winios] metal layer removed for hwnd=0x%lx\n", (unsigned long)key.unsignedLongValue);
+        fflush(stderr);
+    }
+    [g_layer_owner removeObjectForKey:key];
+}
+
 static void winios_remove_layer(HWND hwnd) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!g_layers) return;
-        NSNumber *key = @((uintptr_t)hwnd);
-        CALayer *l = g_layers[key];
-        if (l) {
-            [l removeFromSuperlayer];
-            [g_layers removeObjectForKey:key];
-            [g_px_rects removeObjectForKey:key];
-        }
-        CAMetalLayer *ml = g_metal_layers[key];
-        if (ml) {
-            [ml removeFromSuperlayer];
-            [g_metal_layers removeObjectForKey:key];
-            [g_client_rects removeObjectForKey:key];
-            fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
-            fflush(stderr);
-        }
+        winios_remove_layer_now(@((uintptr_t)hwnd));
+    });
+}
+
+/* Called from process_exit_wrapper (ntdll-unix) on the dying pseudo-
+ * process's own thread. Drops every layer that process owned. */
+void winios_process_exited(void *peb) {
+    if (!peb) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_layer_owner) return;
+        NSMutableArray<NSNumber *> *dead = [NSMutableArray new];
+        for (NSNumber *key in g_layer_owner)
+            if (g_layer_owner[key].pointerValue == peb) [dead addObject:key];
+        for (NSNumber *key in dead) winios_remove_layer_now(key);
+        fprintf(stderr, "[winios] process peb=%p exited: removed %lu orphaned layer(s), %lu remain\n",
+                peb, (unsigned long)dead.count, (unsigned long)g_layers.count);
+        fflush(stderr);
     });
 }
 
@@ -784,11 +816,13 @@ static void winios_place_metal_layer(NSNumber *key) {
  * the shim CFRetains it for DXMT's lifetime handling. */
 CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
     __block CAMetalLayer *result = nil;
+    void *owner = ios_jit_current_peb();   /* caller's (wine) thread */
     void (^make)(void) = ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         if (!g_metal_layers) g_metal_layers = [NSMutableDictionary new];
         NSNumber *key = @((uintptr_t)hwnd);
+        winios_note_layer_owner(key, owner);
         CAMetalLayer *ml = g_metal_layers[key];
         if (!ml) {
             CALayer *win = winios_layer_for(hwnd, true);
@@ -818,11 +852,13 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
  * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, desktop pixels. */
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
+    void *owner = ios_jit_current_peb();   /* wine thread: the window's process */
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         CALayer *l = winios_layer_for(hwnd, true);
         NSNumber *key = @((uintptr_t)hwnd);
+        winios_note_layer_owner(key, owner);
         g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
         if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
         g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];

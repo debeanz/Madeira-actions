@@ -55,6 +55,13 @@ void winios_set_compositor_frame(double x, double y, double w, double h);
  * if called before the compositor exists; main-thread dispatch inside. */
 void winios_set_compositor_hidden(int hidden);
 
+/* Drop every compositor layer owned by a pseudo-process that has just
+ * exited (ntdll-unix process_exit_wrapper calls this with the dead PEB).
+ * The driver never sees pDestroyWindow for windows the server tears down
+ * with their process, so a quit game otherwise leaves its last frame as
+ * a layer over the desktop. */
+void winios_process_exited(void *peb);
+
 /* S2 trackpad pointer. (x, y) are ABSOLUTE wine-desktop pixels (the
  * Swift trackpad engine owns the cursor position); flags are raw
  * MOUSEEVENTF_* combos; data carries the wheel delta for

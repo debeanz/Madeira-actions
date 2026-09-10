@@ -2250,6 +2250,15 @@ void process_exit_wrapper( int status )
          * the session (else-branch) lives as long as the app. Reuse is
          * grace-delayed inside the allocator for laggard exit threads. */
         ios_jit_reclaim_process( dead_peb );
+        /* 2026-09-10: drop the compositor layers this process's windows
+         * owned (Winios.m). The server destroys the windows with the
+         * process but the display driver never gets pDestroyWindow for
+         * them, so a quit game left its last frame over the taskbar. Weak:
+         * the simulator/test runtimes may not link the compositor. */
+        {
+            extern void winios_process_exited( void *peb ) __attribute__((weak));
+            if (winios_process_exited) winios_process_exited( dead_peb );
+        }
     }
     else close( fd_socket );
 #else
