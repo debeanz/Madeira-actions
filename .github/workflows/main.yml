@@ -706,6 +706,14 @@ jobs:
           set -euxo pipefail
           bash build/dcomp/build.sh
 
+      # Session agent: native AArch64 helper the desktop runs instead of
+      # services.exe directly; it starts services.exe and then launches games
+      # the Games tab asks for. See build/agent/madeira-agent.c.
+      - name: Build session agent (AArch64)
+        run: |
+          set -euxo pipefail
+          bash build/agent/build.sh
+
       - name: Build Madeira.app
         env:
           PAGEZERO_EXPERIMENT: ${{ inputs.pagezero_experiment }}

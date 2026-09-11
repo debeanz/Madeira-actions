@@ -56,6 +56,10 @@
 		A1000203 /* SimulatorStubs.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000203 /* SimulatorStubs.m */; };
 		A1000204 /* PerfMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000204 /* PerfMonitor.swift */; };
 		A1000205 /* Gamepad.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000205 /* Gamepad.swift */; };
+		A1000206 /* PEResources.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000206 /* PEResources.swift */; };
+		A1000207 /* GameLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000207 /* GameLibrary.swift */; };
+		A1000208 /* SessionLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000208 /* SessionLauncher.swift */; };
+		A1000209 /* LauncherView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000209 /* LauncherView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -119,6 +123,10 @@
 		A2000203 /* SimulatorStubs.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SimulatorStubs.m; sourceTree = "<group>"; };
 		A2000204 /* PerfMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerfMonitor.swift; sourceTree = "<group>"; };
 		A2000205 /* Gamepad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Gamepad.swift; sourceTree = "<group>"; };
+		A2000206 /* PEResources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PEResources.swift; sourceTree = "<group>"; };
+		A2000207 /* GameLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameLibrary.swift; sourceTree = "<group>"; };
+		A2000208 /* SessionLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionLauncher.swift; sourceTree = "<group>"; };
+		A2000209 /* LauncherView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LauncherView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -174,6 +182,10 @@
 				A2000202 /* FPSOverlay.swift */,
 				A2000204 /* PerfMonitor.swift */,
 				A2000205 /* Gamepad.swift */,
+				A2000206 /* PEResources.swift */,
+				A2000207 /* GameLibrary.swift */,
+				A2000208 /* SessionLauncher.swift */,
+				A2000209 /* LauncherView.swift */,
 				A2000203 /* SimulatorStubs.m */,
 				A2000004 /* JITAllocator.c */,
 				A2000005 /* JITAllocator.h */,
@@ -328,6 +340,10 @@
 				A1000202 /* FPSOverlay.swift in Sources */,
 				A1000204 /* PerfMonitor.swift in Sources */,
 				A1000205 /* Gamepad.swift in Sources */,
+				A1000206 /* PEResources.swift in Sources */,
+				A1000207 /* GameLibrary.swift in Sources */,
+				A1000208 /* SessionLauncher.swift in Sources */,
+				A1000209 /* LauncherView.swift in Sources */,
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
 				A1000006 /* FEXBridge.mm in Sources */,

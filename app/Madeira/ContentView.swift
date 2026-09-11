@@ -926,7 +926,7 @@ struct ContentView: View {
     @ObservedObject private var touchControls = TouchControlsModel.shared
     @ObservedObject private var gamepad = GamepadBridge.shared
     @State private var pointerPanel = false
-    @State private var selectedTab: MadeiraTab = .library
+    @State private var selectedTab: MadeiraTab = .games
     @State private var developerToolsExpanded = false
     @State private var desktopFullScreen = false
     /// ml790: Start -> "Exit desktop" has closed every program. The desktop
@@ -994,7 +994,7 @@ struct ContentView: View {
     }
 
     private enum MadeiraTab: Hashable {
-        case library, containers, activity, settings
+        case games, library, containers, activity, settings
     }
 
     var body: some View {
@@ -1009,6 +1009,9 @@ struct ContentView: View {
                 landscapeBody
             } else {
                 TabView(selection: $selectedTab) {
+                    launcherScreen
+                        .tabItem { Label("Games", systemImage: "gamecontroller.fill") }
+                        .tag(MadeiraTab.games)
                     libraryScreen
                         .tabItem { Label("Library", systemImage: "square.grid.2x2.fill") }
                         .tag(MadeiraTab.library)
@@ -1042,15 +1045,22 @@ struct ContentView: View {
             GamepadBridge.shared.start()
             FrameCap.apply(FrameCap.saved, persist: false)
             applySurfaceVisibility(tab: selectedTab)
+            // ml791: controller drives the Games grid while that tab shows.
+            GamepadBridge.shared.onNavigate = { LauncherNavigator.shared.handle($0) }
+            syncGamepadUIMode()
         }
         .onChange(of: selectedTab) { _, tab in
             // Both surfaces are window-level views above the whole SwiftUI
             // tree: the games' Metal host AND the desktop compositor. The
             // compositor used to stay visible on every tab.
             applySurfaceVisibility(tab: tab)
+            syncGamepadUIMode()
         }
         .onChange(of: desktopShutDown) { _, _ in
             applySurfaceVisibility(tab: selectedTab)
+        }
+        .onChange(of: desktopFullScreen) { _, _ in
+            syncGamepadUIMode()
         }
         .onReceive(NotificationCenter.default.publisher(
             for: Notification.Name("MadeiraExitFullScreen"))) { _ in
@@ -1071,6 +1081,57 @@ struct ContentView: View {
     /// button must offer Start Desktop again.
     private var desktopIsRunning: Bool {
         wineserver_is_running() != 0 && !desktopShutDown
+    }
+
+    /// ml791: the pad navigates the Games grid only while that tab is on
+    /// screen and the desktop is not full screen over it.
+    private func syncGamepadUIMode() {
+        GamepadBridge.shared.uiMode = (selectedTab == .games && !desktopFullScreen)
+    }
+
+    /// ml791: the Games tab. A console-style grid of the game folders on
+    /// C:, playable by tap or controller (LauncherView).
+    private var launcherScreen: some View {
+        LauncherView(onPlay: playGame)
+    }
+
+    /// ml791: start a game from the Games tab inside the desktop session.
+    ///
+    /// The runtime is one-shot per app launch, so games are never started as
+    /// the root process here; they are children of the desktop, exactly as
+    /// a File Explorer double-click would make them. The desktop's helper
+    /// (madeira-agent.exe, started in place of services.exe) does the
+    /// CreateProcess; SessionLauncher talks to it through C:\madeira. If the
+    /// desktop is not running yet it is started first and the request waits
+    /// for the agent; if it was shut down with Exit desktop it is shown
+    /// again. The desktop goes full screen once the game has started.
+    private func playGame(_ game: LauncherGame) {
+        guard let exe = game.exe else {
+            logStore.log("\(game.title): only 32-bit executables found — not supported on this port", level: .error)
+            return
+        }
+        logStore.log("Games: launching \(game.title) → \(GameLibrary.windowsPath(exe))")
+        if wineserver_is_running() == 0 {
+            SessionLauncher.shared.clearReady()
+            launchVirtualDesktop()
+        } else if desktopShutDown {
+            resumeDesktop()
+        } else {
+            selectedTab = .activity
+        }
+        SessionLauncher.shared.launch(exe: game.exeWindowsPath, dir: game.dirWindowsPath) { outcome in
+            switch outcome {
+            case .started(let pid):
+                logStore.log("\(game.title) started (pid \(pid))", level: .success)
+                desktopFullScreen = true
+            case .failed(let code):
+                logStore.log("\(game.title) failed to start: Windows error \(code)", level: .error)
+            case .agentNotReady:
+                logStore.log("\(game.title): the desktop did not become ready in time — try again from the Games tab", level: .error)
+            case .noAnswer:
+                logStore.log("\(game.title): no answer from the desktop agent (C:\\madeira\\agent.log has details)", level: .error)
+            }
+        }
     }
 
     /// Runtime status sheet: "Off" after Exit desktop — the runtime is still
@@ -1914,8 +1975,11 @@ struct ContentView: View {
         let (deskW, deskH) = desktopSize
         logStore.log("Virtual desktop: \(deskW)x\(deskH)")
         setenv("MADEIRA_EXE", "explorer.exe", 1)
+        // ml791: explorer runs ONE command after creating the desktop. It
+        // is now the session agent, which starts services.exe itself and
+        // then launches whatever the Games tab asks for (build/agent).
         setenv("MADEIRA_ARGS",
-               "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
+               "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\madeira-agent.exe C:\\windows\\system32\\services.exe", 1)
         setenv("MADEIRA_DESKTOP", "1", 1)
         setenv("MADEIRA_SCREEN_W", String(deskW), 1)
         setenv("MADEIRA_SCREEN_H", String(deskH), 1)

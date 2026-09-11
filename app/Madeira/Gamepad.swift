@@ -179,6 +179,22 @@ final class GamepadBridge: ObservableObject {
     /// key-up the key it actually pressed, not the one it now maps to.
     @Published var mapping: GamepadMapping = .generic { didSet { save(); releaseAll(using: oldValue) } }
 
+    /// ml791: while the Games tab is showing, the pad drives the tile grid
+    /// (LauncherNavigator) instead of the game: D-pad / left stick move the
+    /// highlight, A plays. The XInput table keeps reporting a connected but
+    /// idle pad so a game left running in the desktop sees no input.
+    @Published var uiMode: Bool = false {
+        didSet {
+            guard uiMode != oldValue else { return }
+            releaseAll(using: mapping)
+            navStickDir = nil
+            if uiMode && native && enabled { publishNeutral() }
+        }
+    }
+    var onNavigate: ((GamepadNavAction) -> Void)?
+    private var navStickDir: GamepadNavAction? = nil
+    private var navStickNext: CFTimeInterval = 0
+
     // Mouse event flags, same values MetalBackedView uses.
     private let F_MOVE: UInt32 = 0x0001, F_LDOWN: UInt32 = 0x0002, F_LUP: UInt32 = 0x0004
     private let F_RDOWN: UInt32 = 0x0008, F_RUP: UInt32 = 0x0010
@@ -399,7 +415,31 @@ final class GamepadBridge: ObservableObject {
 
     // MARK: Buttons
 
+    private static func navAction(for el: GamepadElement) -> GamepadNavAction? {
+        switch el {
+        case .dpadUp: return .up
+        case .dpadDown: return .down
+        case .dpadLeft: return .left
+        case .dpadRight: return .right
+        case .a: return .select
+        case .b: return .back
+        default: return nil
+        }
+    }
+
+    /// Connected, nothing pressed: what a game sees while the pad is busy
+    /// with the Games tab.
+    private func publishNeutral() {
+        var s = madeira_xinput_state()
+        s.connected = 1
+        madeira_xinput_set_state(0, &s)
+    }
+
     private func setHeld(_ el: GamepadElement, _ down: Bool) {
+        if uiMode {
+            if down, enabled, let a = Self.navAction(for: el) { onNavigate?(a) }
+            return
+        }
         guard enabled, !native else { return }
         if down {
             guard !held.contains(el) else { return }
@@ -442,6 +482,11 @@ final class GamepadBridge: ObservableObject {
 
     @objc private func tick(_ sender: CADisplayLink) {
         guard enabled, let pad = controller?.extendedGamepad else { return }
+        if uiMode {
+            navStick(pad.leftThumbstick, now: sender.timestamp)
+            if native { publishNeutral() }
+            return
+        }
         if native {
             publishNative(pad)
             var low: UInt16 = 0, high: UInt16 = 0
@@ -450,6 +495,27 @@ final class GamepadBridge: ObservableObject {
         }
         evaluate(pad.leftThumbstick, mode: mapping.leftStick, dir: &leftDir)
         evaluate(pad.rightThumbstick, mode: mapping.rightStick, dir: &rightDir)
+    }
+
+    /// Left stick as a D-pad for the Games tab: one step when pushed past
+    /// 0.6, then auto-repeat (0.4 s initial delay, 0.13 s thereafter) while
+    /// held, like a keyboard key.
+    private func navStick(_ stick: GCControllerDirectionPad, now: CFTimeInterval) {
+        let x = stick.xAxis.value, y = stick.yAxis.value
+        var dir: GamepadNavAction? = nil
+        if abs(x) >= 0.6 || abs(y) >= 0.6 {
+            dir = abs(x) > abs(y) ? (x > 0 ? .right : .left) : (y > 0 ? .up : .down)
+        }
+        if dir != navStickDir {
+            navStickDir = dir
+            if let dir {
+                onNavigate?(dir)
+                navStickNext = now + 0.4
+            }
+        } else if let dir, now >= navStickNext {
+            onNavigate?(dir)
+            navStickNext = now + 0.13
+        }
     }
 
     private func evaluate(_ stick: GCControllerDirectionPad, mode: StickMode, dir: inout Int) {
