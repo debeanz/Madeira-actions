@@ -35,6 +35,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <wchar.h>
@@ -211,6 +212,25 @@ static void handle_request( void )
     /* Delete first so a failure cannot be retried forever. */
     DeleteFileW( REQUEST_PATH );
     get_field( text, "id", id, sizeof(id) );
+    /* ml798: "kill=<pid>" — force close a program we started. */
+    if (get_field( text, "kill", args, sizeof(args) ))
+    {
+        DWORD kpid = strtoul( args, NULL, 10 );
+        BOOL ok = FALSE;
+        int i;
+        for (i = 0; i < g_child_n; i++)
+            if (g_child_pid[i] == kpid) { ok = TerminateProcess( g_child_handle[i], 1 ); break; }
+        if (i == g_child_n)
+        {
+            HANDLE h = OpenProcess( PROCESS_TERMINATE, FALSE, kpid );
+            if (h) { ok = TerminateProcess( h, 1 ); CloseHandle( h ); }
+        }
+        agent_log( "kill id=%s pid=%lu -> %s (%lu)", id, (unsigned long)kpid, ok ? "ok" : "err", (unsigned long)GetLastError() );
+        snprintf( result, sizeof(result), ok ? "id=%s\r\nok kill\r\n" : "id=%s\r\nerr code=%lu\r\n", id, (unsigned long)GetLastError() );
+        write_text_file( RESULT_PATH, result );
+        HeapFree( GetProcessHeap(), 0, text );
+        return;
+    }
     if (!get_field( text, "exe", exe, sizeof(exe) ))
     {
         agent_log( "request without exe= ignored" );

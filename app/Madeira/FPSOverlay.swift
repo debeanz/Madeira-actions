@@ -80,34 +80,28 @@ struct FPSOverlay: View {
                 .cornerRadius(6)
                 .onTapGesture { collapsed = true }
             } else {
-                HStack(spacing: 8) {
-                    // Live phys_footprint — the SAME number jetsam kills on.
-                    // ml605 died at 4080MB against a 4096MB limit with no
-                    // warning of any kind in the log, so having it on screen
-                    // turns "it vanished" into "we watched it climb".
-                    Text("\(perf.memMB)MB")
-                        .foregroundColor(perf.memColor)
-                        .frame(width: 56, alignment: .trailing)
-                    divider
-                    thermalBadge
-                    divider
-                    Text("Present:")
-                        .foregroundColor(.secondary)
-                    Text("\(perf.presentCount)")
-                        .foregroundColor(.primary)
-                    divider
+                // ml798: "FPS: 42.7  MEM: 1088MB" — coloured labels, white
+                // values, one dark rounded panel. Present count dropped.
+                HStack(spacing: 10) {
                     Text("FPS:")
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Color(red: 1.0, green: 0.38, blue: 0.45))
                     Text(String(format: "%.1f", perf.fps))
-                        .foregroundColor(fpsColor)
-                        .frame(width: 40, alignment: .trailing)
+                        .foregroundColor(.white)
+                        .frame(width: 42, alignment: .trailing)
+                    Text("MEM:")
+                        .foregroundColor(Color(red: 0.45, green: 0.9, blue: 0.5))
+                    Text("\(perf.memMB)MB")
+                        .foregroundColor(.white)
+                    thermalBadge
                     pacingPill
                 }
-                .font(.system(.caption, design: .monospaced))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.92))
-                .cornerRadius(6)
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.55))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 1))
                 .onTapGesture { collapsed = true }
             }
         }

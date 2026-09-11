@@ -283,6 +283,8 @@ struct LauncherView: View {
     let onPlay: (LauncherGame) -> Void
     let onOpenDesktop: () -> Void
     let onQuitApp: () -> Void
+    /// ml798: "Force close" in the running game's options.
+    var onForceClose: () -> Void = {}
 
     @ObservedObject private var library = GameLibrary.shared
     @ObservedObject private var covers = SteamCovers.shared
@@ -378,8 +380,11 @@ struct LauncherView: View {
             .onChange(of: width > height) { _, wide in focus.columns = wide ? 100_000 : columns }
         }
         .environment(\.colorScheme, .dark)
+        .onChange(of: session) { _, _ in
+            focus.sync(games: orderedGames)
+        }
         .onAppear {
-            focus.sync(games: library.games)
+            focus.sync(games: orderedGames)
             focus.active = !overlayPresented
             refreshSpin = library.scanning
             library.rescanIfStale()
@@ -387,8 +392,8 @@ struct LauncherView: View {
         .onDisappear {
             focus.active = false
         }
-        .onChange(of: library.games) { _, games in
-            focus.sync(games: games)
+        .onChange(of: library.games) { _, _ in
+            focus.sync(games: orderedGames)
         }
         .onChange(of: focus.openedID) { _, id in
             if let id, let g = library.game(withID: id) { covers.ensureCover(for: g) }
@@ -405,6 +410,7 @@ struct LauncherView: View {
         .sheet(item: $optionsGame) { game in
             OptionsSheet(game: game,
                          session: session,
+                         onForceClose: onForceClose,
                          onPlay: { g in play(g) },
                          onRename: { g in
                              afterDismiss {
@@ -466,8 +472,8 @@ struct LauncherView: View {
             onQuitApp()
             return
         }
-        // Resume: the game is running, ContentView just re-enters full screen.
-        if case .playing = session, let g = library.game(withID: id) {
+        // Resume: THIS game is running, ContentView just re-enters full screen.
+        if case .playing(let t) = session, let g = library.game(withID: id), g.title == t {
             onPlay(g)
             return
         }
@@ -535,8 +541,23 @@ struct LauncherView: View {
     /// ml794/ml795: landscape = one horizontal row of covers (GameHub style,
     /// highlighted cover drawn larger); portrait = the vertical grid.
     /// Left/right browse either; A opens the card.
+    /// ml798: the game being played comes first so it is easy to find.
+    private var orderedGames: [LauncherGame] {
+        var g: [LauncherGame] = library.games
+        if case .playing(let t) = session, let i = g.firstIndex(where: { $0.title == t }), i > 0 {
+            let playing = g.remove(at: i)
+            g.insert(playing, at: 0)
+        }
+        return g
+    }
+
+    private func isPlaying(_ game: LauncherGame) -> Bool {
+        if case .playing(let t) = session { return t == game.title }
+        return false
+    }
+
     private func grid(columns: Int, horizontal: Bool) -> some View {
-        let games: [LauncherGame] = library.games
+        let games: [LauncherGame] = orderedGames
         return ScrollViewReader { proxy in
             Group {
                 if horizontal {
@@ -564,6 +585,16 @@ struct LauncherView: View {
                         only32Bit: game.only32Bit,
                         focused: highlighted)
             .equatable()
+            .overlay(alignment: .topTrailing) {
+                if isPlaying(game) {
+                    Text("PLAYING")
+                        .font(.system(size: 10, weight: .heavy))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(LauncherPalette.play, in: Capsule())
+                        .padding(6)
+                }
+            }
             .onTapGesture { tapTile(game) }
             .onLongPressGesture(minimumDuration: 0.5) { longPressTile(game) }
             .onAppear { SteamCovers.shared.ensureCover(for: game) }
@@ -659,7 +690,7 @@ struct LauncherView: View {
         let coverH: CGFloat = coverW / LauncherPalette.coverAspect
         let playState: CardPlayState
         var isRunningThisGame = false
-        if case .playing = session { isRunningThisGame = true }
+        if case .playing(let t) = session, t == game.title { isRunningThisGame = true }
         if isEnded {
             playState = .reopen
         } else if isRunningThisGame {
@@ -1117,6 +1148,7 @@ private final class SheetRowsModel: ObservableObject {
 private struct OptionsSheet: View {
     let game: LauncherGame
     let session: LauncherSession
+    var onForceClose: () -> Void = {}
     let onPlay: (LauncherGame) -> Void
     let onRename: (LauncherGame) -> Void
     let onChangeCover: (LauncherGame) -> Void
@@ -1205,6 +1237,14 @@ private struct OptionsSheet: View {
                                  destructive: false, checked: false,
                                  action: {
                                      covers.clearCover(for: g)
+                                     dismiss()
+                                 }))
+        }
+        if case .playing(let t) = session, t == g.title {
+            out.append(OptionRow(id: "forceclose", title: "Force close", systemImage: "xmark.octagon",
+                                 destructive: true, checked: false,
+                                 action: {
+                                     onForceClose()
                                      dismiss()
                                  }))
         }

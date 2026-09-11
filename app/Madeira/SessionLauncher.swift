@@ -51,6 +51,35 @@ final class SessionLauncher {
     /// main with the exit code.
     private var exitURL: URL { agentDir.appendingPathComponent("exit.txt") }
 
+    /// ml798: ask the agent to TerminateProcess a game it started.
+    func kill(pid: Int, completion: @escaping (Bool) -> Void) {
+        queue.async {
+            let fm = FileManager.default
+            let id = UUID().uuidString
+            try? fm.removeItem(at: self.resultURL)
+            let tmp = self.agentDir.appendingPathComponent("launch.tmp")
+            do {
+                try "id=\(id)\r\nkill=\(pid)\r\n".write(to: tmp, atomically: false, encoding: .utf8)
+                try? fm.removeItem(at: self.requestURL)
+                try fm.moveItem(at: tmp, to: self.requestURL)
+            } catch {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            let t0 = Date()
+            while Date().timeIntervalSince(t0) < 10 {
+                if let s = try? String(contentsOf: self.resultURL, encoding: .utf8), s.contains("id=\(id)") {
+                    try? fm.removeItem(at: self.resultURL)
+                    let ok = s.contains("ok")
+                    DispatchQueue.main.async { completion(ok) }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            DispatchQueue.main.async { completion(false) }
+        }
+    }
+
     func waitForExit(pid: Int, completion: @escaping (Int) -> Void) {
         DispatchQueue.global(qos: .utility).async {
             let needle = "pid=\(pid) "

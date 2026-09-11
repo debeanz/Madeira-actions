@@ -952,6 +952,7 @@ struct ContentView: View {
     @State private var launchingGame: LauncherGame? = nil
     @State private var firstFrameSeen = false
     @State private var launchBarPhase = false
+    @State private var playingPid: Int = 0
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
     @State private var showRelaunchAlert = false
@@ -1122,7 +1123,19 @@ struct ContentView: View {
     /// ml791: the Games tab. A console-style grid of the game folders on
     /// C:, playable by tap or controller (LauncherView).
     private var launcherScreen: some View {
-        LauncherView(session: launcherSession, onPlay: playGameHosted, onOpenDesktop: openDesktopFromGames, onQuitApp: quitApp)
+        var v = LauncherView(session: launcherSession, onPlay: playGameHosted, onOpenDesktop: openDesktopFromGames, onQuitApp: quitApp)
+        v.onForceClose = forceCloseGame
+        return v
+    }
+
+    /// ml798: kill the game the Games tab launched (agent TerminateProcess);
+    /// the agent's exit report then returns the card to Play.
+    private func forceCloseGame() {
+        guard case .playing(let title) = launcherSession, playingPid > 0 else { return }
+        logStore.log("Force closing \(title) (pid \(playingPid))")
+        SessionLauncher.shared.kill(pid: playingPid) { ok in
+            logStore.log(ok ? "\(title) force closed" : "\(title): force close failed", level: ok ? .info : .error)
+        }
     }
 
     /// ml797: Play from the Games tab runs the game INSIDE a hidden desktop
@@ -1161,6 +1174,7 @@ struct ContentView: View {
                 case .started(let pid):
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)
                     GameLibrary.shared.markPlayed(game)
+                    playingPid = pid
                     launcherSession = .playing(game.title)
                     watchHostedGame(pid: pid, title: game.title)
                     return
@@ -4018,7 +4032,9 @@ struct TouchControlsOverlay: View {
             }
         }
         // ml796: Big Picture style toolbar — one dark panel instead of
-        // floating glass circles.
+        // floating glass circles. ml798: mirrored so the X sits at the far
+        // right (no directional icons in here, so nothing else flips).
+        .environment(\.layoutDirection, .rightToLeft)
         .padding(6)
         .background(RoundedRectangle(cornerRadius: 24, style: .continuous)
                         .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.88)))
