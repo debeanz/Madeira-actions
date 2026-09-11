@@ -180,6 +180,9 @@ final class GamesFocus: ObservableObject {
     }
 
     private func closeNow() {
+        // ml800: land on the tile of the game whose card was open — its
+        // position may have changed (the playing game moves to the front).
+        if let id = openedID, let i = gameIDs.firstIndex(of: id), i != gridIndex { gridIndex = i }
         if openedID != nil { openedID = nil }
         let next: FocusArea = gameCount > 0 ? .grid : .topBar
         if area != next { area = next }
@@ -188,6 +191,9 @@ final class GamesFocus: ObservableObject {
     /// Called from onChange(of: library.games) and onAppear.
     func sync(games: [LauncherGame]) {
         withAnimation(GamesFocus.anim) {
+            // ml800: keep the highlight on the same GAME across a reorder.
+            let prevID: String? = (self.gridIndex >= 0 && self.gridIndex < self.gameIDs.count)
+                ? self.gameIDs[self.gridIndex] : nil
             self.gameIDs = games.map { $0.id }
             self.gameCount = self.gameIDs.count
             if self.gameCount == 0 {
@@ -195,7 +201,8 @@ final class GamesFocus: ObservableObject {
                 if self.openedID != nil { self.openedID = nil }
                 if self.area != .topBar { self.area = .topBar }
             } else {
-                let i = max(0, min(self.gridIndex, self.gameCount - 1))
+                var i = max(0, min(self.gridIndex, self.gameCount - 1))
+                if let p = prevID, let found = self.gameIDs.firstIndex(of: p) { i = found }
                 if i != self.gridIndex { self.gridIndex = i }
                 if let opened = self.openedID, !self.gameIDs.contains(opened) {
                     self.closeNow()
@@ -399,8 +406,12 @@ struct LauncherView: View {
             geometryContent(geo.size)
         }
         .environment(\.colorScheme, .dark)
-        .onChange(of: session) { _, _ in
+        .onChange(of: session) { _, s in
             focus.sync(games: orderedGames)
+            // ml800: a game that just started is the one to have selected.
+            if case .playing(let t) = s, let g = orderedGames.first(where: { $0.title == t }) {
+                focus.focusTile(id: g.id)
+            }
         }
         .onAppear {
             focus.sync(games: orderedGames)

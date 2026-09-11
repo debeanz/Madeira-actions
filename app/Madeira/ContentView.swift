@@ -1096,12 +1096,17 @@ struct ContentView: View {
             case .launching, .playing, .enablingJIT: selectedTab = .games
             default: break
             }
+            // The tab may not change (already on Games): re-apply anyway so
+            // the window-level surfaces never linger over the UI.
+            applySurfaceVisibility(tab: selectedTab)
         }
     }
 
     /// The games' Metal host and the desktop compositor are visible only on
     /// the Desktop tab, and not while the desktop is shut down (ml790).
     private func applySurfaceVisibility(tab: MadeiraTab) {
+        // Full screen manages the surfaces itself (fullScreenDesktop).
+        if desktopFullScreen { return }
         let hidden = tab != .desktop || desktopShutDown || showLaunchOverlay
         MetalHostView.shared.isHidden = hidden
         winios_set_compositor_hidden(hidden ? 1 : 0)
@@ -1203,8 +1208,10 @@ struct ContentView: View {
                 selectedTab = .games
             }
         }
+        // ml800: the desktop stays OFF on the Desktop tab unless the user
+        // turns it on there. A game session started here keeps
+        // desktopShutDown set; full screen shows the game regardless.
         if wineserver_is_running() != 0 {
-            if desktopShutDown { resumeDesktop() }
             selectedTab = .desktop
             desktopFullScreen = true
             startInSession()
@@ -1217,6 +1224,7 @@ struct ContentView: View {
                 // Let the loading screen paint before the JIT pool freeze.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                     launchVirtualDesktop()
+                    desktopShutDown = true
                     startInSession()
                 }
             }
