@@ -1073,6 +1073,14 @@ struct ContentView: View {
         wineserver_is_running() != 0 && !desktopShutDown
     }
 
+    /// Runtime status sheet: "Off" after Exit desktop — the runtime is still
+    /// resident (it cannot be restarted in-process), but the desktop is not.
+    private var desktopStatusText: String {
+        if desktopIsRunning { return "Running" }
+        if desktopShutDown { return "Off (runtime idle)" }
+        return "Ready"
+    }
+
     private var libraryScreen: some View {
         NavigationStack {
             ScrollView {
@@ -1303,7 +1311,7 @@ struct ContentView: View {
         NavigationStack {
             List {
                 Section("Session") {
-                    LabeledContent("Desktop", value: wineserver_is_running() != 0 ? "Running" : "Ready")
+                    LabeledContent("Desktop", value: desktopStatusText)
                     LabeledContent("Architecture", value: "ARM64EC")
                     LabeledContent("Graphics", value: "DXMT · Metal")
                 }
@@ -1563,10 +1571,11 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Windows Desktop")
                         .font(.headline)
-                    Label(wineserver_is_running() != 0 ? "Session running" : "Ready to launch",
+                    Label(desktopIsRunning ? "Session running"
+                          : desktopShutDown ? "Desktop off (runtime idle)" : "Ready to launch",
                           systemImage: "circle.fill")
                         .font(.caption)
-                        .foregroundStyle(wineserver_is_running() != 0 ? .green : .secondary)
+                        .foregroundStyle(desktopIsRunning ? .green : .secondary)
                 }
                 Spacer()
                 Button {
