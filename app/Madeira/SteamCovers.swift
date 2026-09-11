@@ -174,6 +174,7 @@ final class SteamCovers: ObservableObject {
         // 2. An appid already stored on the game.
         if let appid = game.steamAppID, appid > 0 {
             if let image = coverImage(appid: appid) {
+                applySteamName(appid: appid, to: game)
                 publish(id: id, generation: gen, image: image)
             } else {
                 LogStore.shared.log("Cover: \(title) -> Steam \(appid) has no header image", level: .error)
@@ -186,6 +187,7 @@ final class SteamCovers: ObservableObject {
         if let appid = steamAppIDFile(for: game) {
             if let image = coverImage(appid: appid) {
                 LogStore.shared.log("Cover: \(title) -> Steam \(appid) (steam_appid.txt)", level: .success)
+                applySteamName(appid: appid, to: game)
                 publish(id: id, generation: gen, image: image)
             } else {
                 LogStore.shared.log("Cover: \(title) -> Steam \(appid) (steam_appid.txt) has no header image", level: .error)
@@ -214,8 +216,27 @@ final class SteamCovers: ObservableObject {
         LogStore.shared.log("Cover: \(title) -> Steam \(found.id) (\(found.name))", level: .success)
         DispatchQueue.main.async {
             GameLibrary.shared.setSteamAppID(found.id, for: game)
+            GameLibrary.shared.setSteamTitle(found.name, for: game)
         }
         publish(id: id, generation: gen, image: image)
+    }
+
+    /// ml796: name the game the way Steam does. Search results carry the
+    /// name; appid-only resolutions (stored id, steam_appid.txt) ask the
+    /// store once (appdetails, filters=basic) and remember it.
+    private func applySteamName(appid: Int, to game: LauncherGame) {
+        if GameLibrary.shared.hasSteamTitle(for: game.id) { return }
+        guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(appid)&filters=basic") else { return }
+        let (data, resp) = fetch(url)
+        guard let data, let resp, resp.statusCode == 200,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entry = root[String(appid)] as? [String: Any],
+              let payload = entry["data"] as? [String: Any],
+              let name = payload["name"] as? String, !name.isEmpty else { return }
+        LogStore.shared.log("Cover: \(game.title) is \"\(name)\" on Steam")
+        DispatchQueue.main.async {
+            GameLibrary.shared.setSteamTitle(name, for: game)
+        }
     }
 
     private func publish(id: String, generation gen: Int, image: UIImage) {

@@ -148,6 +148,28 @@ final class GameLibrary: ObservableObject {
         LogStore.shared.log("Games: \(game.title) will run \(GameLibrary.windowsPath(exe))")
     }
 
+    /// ml796: Steam's own name for a game (from the cover match), used as the
+    /// title unless the user renamed it. Persisted so it survives rescans.
+    private let steamTitleKey = "madeira.launcher.steamTitles"
+    private var steamTitles: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: steamTitleKey) as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: steamTitleKey) }
+    }
+
+    func hasSteamTitle(for id: String) -> Bool { steamTitles[id] != nil }
+
+    func setSteamTitle(_ title: String, for game: LauncherGame) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        var s = steamTitles
+        s[game.id] = t
+        steamTitles = s
+        guard titleOverrides[game.id] == nil else { return }
+        if let i = games.firstIndex(where: { $0.id == game.id }), games[i].title != t {
+            games[i].title = t
+        }
+    }
+
     func rename(_ game: LauncherGame, to title: String) {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
@@ -383,7 +405,7 @@ final class GameLibrary: ObservableObject {
             if let o = exeOverrides[id], candidates.contains(where: { $0.path == o }) {
                 exe = URL(fileURLWithPath: o)
             }
-            let title = titleOverrides[id] ?? GameLibrary.prettyTitle(folder.lastPathComponent)
+            let title = titleOverrides[id] ?? steamTitles[id] ?? GameLibrary.prettyTitle(folder.lastPathComponent)
             out.append(LauncherGame(id: id, title: title, folder: folder, exe: exe,
                                     candidates: candidates, only32Bit: candidates.isEmpty && only32,
                                     isManual: false, steamAppID: steamIDs[id],

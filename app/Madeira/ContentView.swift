@@ -948,6 +948,9 @@ struct ContentView: View {
     /// ml792: what the Games tab is doing with the one-shot runtime. Drives
     /// the launcher's status pill and gates a second launch (see playGame).
     @State private var launcherSession: LauncherSession = .idle
+    /// ml796: the game behind the loading screen, and whether it has drawn.
+    @State private var launchingGame: LauncherGame? = nil
+    @State private var firstFrameSeen = false
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
     @State private var showRelaunchAlert = false
@@ -1085,6 +1088,12 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(
             for: Notification.Name("MadeiraExitFullScreen"))) { _ in
             desktopFullScreen = false
+            // ml796: leaving full screen during a game launched from the
+            // Games tab lands back on that tab, not on the Desktop tab.
+            switch launcherSession {
+            case .launching, .playing, .enablingJIT: selectedTab = .games
+            default: break
+            }
         }
     }
 
@@ -1223,10 +1232,16 @@ struct ContentView: View {
             let (screenW, screenH) = desktopSize
             setenv("MADEIRA_SCREEN_W", String(screenW), 1)
             setenv("MADEIRA_SCREEN_H", String(screenH), 1)
-            logStore.log("Games: screen \(screenW)x\(screenH) (Settings → Virtual Desktop resolution)")
+            logStore.log("Games: screen \(screenW)x\(screenH) (Settings → Screen resolution)")
+            launchingGame = game
+            firstFrameSeen = false
             desktopFullScreen = true
-            runWineFullSequence()
-            watchDirectGame(game.title)
+            // Let the loading screen actually reach the display before the
+            // JIT pool allocation freezes the process.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                runWineFullSequence()
+                watchDirectGame(game.title)
+            }
         }
     }
 
@@ -1250,6 +1265,15 @@ struct ContentView: View {
             }
             DispatchQueue.main.async {
                 self.launcherSession = .playing(title)
+            }
+            // ml796: keep the loading screen up until the game has presented
+            // a couple of frames (or it died first).
+            let presents0 = madeira_get_present_count()
+            while wine_process_is_running() != 0 && madeira_get_present_count() < presents0 + 2 {
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            DispatchQueue.main.async {
+                self.firstFrameSeen = true
             }
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.5)
@@ -1509,11 +1533,63 @@ struct ContentView: View {
         }
     }
 
+    /// ml796: what the screen shows from Play until the game's first frame.
+    /// The JIT pool allocation suspends the whole process for a few seconds,
+    /// so this must be on screen BEFORE runWineFullSequence starts.
+    private var launchOverlay: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.06, green: 0.07, blue: 0.11), Color(red: 0.02, green: 0.02, blue: 0.04)],
+                           startPoint: .top, endPoint: .bottom)
+            VStack(spacing: 18) {
+                if let g = launchingGame, let cover = SteamCovers.shared.covers[g.id] {
+                    Image(uiImage: cover)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 320, height: 150)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .shadow(color: .black.opacity(0.6), radius: 20)
+                }
+                Text(launchingGame?.title ?? "")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                ProgressView()
+                    .tint(.white)
+                    .scaleEffect(1.3)
+                Text({
+                    switch launcherSession {
+                    case .enablingJIT: return "Enabling JIT…"
+                    case .launching: return "Starting…"
+                    default: return "Loading…"
+                    }
+                }())
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+            .padding(32)
+        }
+    }
+
+    private var showLaunchOverlay: Bool {
+        guard launchingGame != nil, !firstFrameSeen else { return false }
+        switch launcherSession {
+        case .enablingJIT, .launching, .playing: return true
+        default: return false
+        }
+    }
+
     private var fullScreenDesktop: some View {
         ZStack {
             Color.black
             MadeiraMetalView()
+            if showLaunchOverlay {
+                launchOverlay
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
         }
+        .animation(.easeInOut(duration: 0.4), value: showLaunchOverlay)
         .ignoresSafeArea()
         .statusBarHidden(true)
         .perfMonitored()
@@ -3806,6 +3882,13 @@ struct TouchControlsOverlay: View {
                 }
             }
         }
+        // ml796: Big Picture style toolbar — one dark panel instead of
+        // floating glass circles.
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.88)))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
         .animation(.easeInOut(duration: 0.22), value: m.editing)
     }
 
@@ -3830,10 +3913,11 @@ struct TouchControlsOverlay: View {
         } label: {
             // Stroke only — never a .fill variant.
             Image(systemName: system)
-                .font(.system(size: 18, weight: .regular))
-                .foregroundStyle(.white.opacity(dim ? 0.35 : 1.0))
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(dim ? Color.white.opacity(0.35) : Color(red: 0.10, green: 0.62, blue: 1.0))
                 .frame(width: 44, height: 44)
-                .background(GlassShape(circle: true))
+                .background(Circle().fill(Color(red: 0.12, green: 0.15, blue: 0.20)))
+                .overlay(Circle().stroke(Color.white.opacity(0.08), lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
