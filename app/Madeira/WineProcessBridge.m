@@ -340,6 +340,11 @@ extern void wine_log_set_file(const char *path);
 
 static pthread_t g_wine_thread;
 static volatile int g_wine_running = 0;
+/* ml788: exit code of the root Wine process once it has ended (-1 while it
+ * runs or never ran). The desktop session's "Exit desktop" ends here: explorer
+ * leaves its message loop and ExitProcess(0)s; the app reads this to decide
+ * whether that was a clean shutdown or a crash of the desktop process. */
+static volatile int g_wine_exit_code = -1;
 static char *g_prefix_path = NULL;
 
 /***********************************************************************
@@ -1146,8 +1151,10 @@ static void *wine_process_thread(void *arg) {
         if (setjmp(wine_ios_exit_jmpbuf) == 0) {
             __wine_main(argc, argv);
             dprintf(STDERR_FILENO, "[WineProc] __wine_main returned normally\n");
+            g_wine_exit_code = 0;
         } else {
             dprintf(STDERR_FILENO, "[WineProc] Wine exited with code %d (caught by longjmp)\n", wine_ios_exit_code);
+            g_wine_exit_code = wine_ios_exit_code;
         }
 
         g_wine_running = 0;
@@ -1226,6 +1233,10 @@ int wine_process_start(const char *prefix_path) {
     pthread_detach(g_wine_thread);
     LOG("Wine process thread created");
     return 0;
+}
+
+int wine_process_exit_code(void) {
+    return g_wine_exit_code;
 }
 
 int wine_process_is_running(void) {

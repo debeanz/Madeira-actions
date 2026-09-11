@@ -1888,6 +1888,48 @@ struct ContentView: View {
         runWineFullSequence()
     }
 
+    /// ml788: the desktop's root process (explorer.exe /desktop) has ended.
+    ///
+    /// This is where Start -> "Exit desktop" arrives: explorer asks for
+    /// confirmation, ExitWindows() runs `wineboot --end-session --shutdown`,
+    /// wineboot sends WM_QUERYENDSESSION/WM_ENDSESSION to every program and
+    /// TerminateProcess()es the ones still alive, the server closes the
+    /// desktop one second after its last user is gone (WM_CLOSE to the
+    /// desktop window), explorer's message loop ends and __wine_main returns.
+    /// Before this hook the app just sat on a black desktop: the wineserver
+    /// thread had been stopped and nothing could be started again.
+    ///
+    /// A second desktop cannot be started inside this Mach process — the
+    /// wineserver thread, FEX, ntdll's static state and the JIT pool are all
+    /// one-shot — so the honest equivalent of "shut down" is to end the app;
+    /// relaunching Madeira gives a fresh desktop. The log line lands in
+    /// madeira-log.txt before the process goes away.
+    private func desktopSessionEnded(exitCode: Int) {
+        let clean = exitCode == 0
+        logStore.log(clean
+            ? "Desktop session ended (Exit desktop) — closing Madeira; relaunch it to start a new desktop"
+            : "Desktop process died with exit code \(exitCode) — closing Madeira; relaunch it to start a new desktop",
+            level: clean ? .success : .error)
+        DispatchQueue.main.async {
+            winios_set_compositor_hidden(1)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            // Put the app in the background first so the exit reads as
+            // leaving the app rather than a crash, then end the process.
+            // _exit skips atexit handlers: Wine's leftover system threads
+            // (services.exe, rpcss) are still running and would only trip
+            // static destructors.
+            let app = UIApplication.shared
+            let suspend = Selector(("suspend"))
+            if app.responds(to: suspend) {
+                app.perform(suspend)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                _exit(0)
+            }
+        }
+    }
+
     private func launchThumper() {
         prepareLibraryLaunch("Thumper")
         setenv("MADEIRA_EXE", "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
@@ -2919,6 +2961,21 @@ struct ContentView: View {
             Thread.sleep(forTimeInterval: 2.0)
             winios_phase("wine-start")
             self.startWineProcess()
+
+            // ml788: watch the desktop's root process for its whole life, not
+            // just during the detach wait below (which gives up after its cap
+            // while the desktop keeps running). Start -> "Exit desktop" ends
+            // with explorer.exe leaving __wine_main; that is the only signal
+            // the app gets, and it has to act on it (see desktopSessionEnded).
+            let desktopSession = getenv("MADEIRA_DESKTOP").map { $0.pointee == 49 } ?? false
+            if desktopSession && wine_process_is_running() != 0 {
+                DispatchQueue.global(qos: .utility).async {
+                    while wine_process_is_running() != 0 {
+                        Thread.sleep(forTimeInterval: 0.5)
+                    }
+                    self.desktopSessionEnded(exitCode: Int(wine_process_exit_code()))
+                }
+            }
 
             // Step 4: Wait for Wine to finish instead of fixed timer
             // Poll wine_process_is_running() — it clears when __wine_main returns

@@ -77,6 +77,7 @@ void wineserver_stop(void) {}
 void wineserver_inject_client_fd(int fd) { (void)fd; }
 int wine_process_start(const char *prefix_path) { (void)prefix_path; return -1; }
 int wine_process_is_running(void) { return 0; }
+int wine_process_exit_code(void) { return -1; }
 int madeira_write_continue_flag(void) { return -1; }
 
 void wine_log_set_file(const char *path) { (void)path; }

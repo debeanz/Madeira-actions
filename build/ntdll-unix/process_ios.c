@@ -2257,6 +2257,20 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
         self = reply->self;
     }
     SERVER_END_REQ;
+#ifdef WINE_IOS
+    /* ml788: a kill aimed at ANOTHER pseudo-process (wineboot --end-session
+     * terminating each program during Start -> Exit desktop, Task Manager's
+     * End Task, Steam killing its helpers). Foreign kills rely on the server
+     * closing the victim's request/wait fds — SIGQUIT via __pthread_kill does
+     * not deliver on iOS — so name every one, capped, to trace a shutdown. */
+    if (!self && handle && handle != (HANDLE)~(ULONG_PTR)0)
+    {
+        static int foreign_kill_n;
+        if (foreign_kill_n < 32)
+            ERR("[kill] ml788 #%d NtTerminateProcess(handle=%p, exit_code=%d) on another process -> status=0x%x\n",
+                ++foreign_kill_n, handle, (int)exit_code, ret);
+    }
+#endif
     if (self)
     {
 #ifdef WINE_IOS
