@@ -363,6 +363,23 @@ struct LauncherView: View {
         }
     }
 
+    private func columnCount(_ width: CGFloat) -> Int {
+        let n: Int = Int((width - 24.0) / 200.0)
+        return n < 2 ? 2 : n
+    }
+
+    /// Landscape row: a huge focus step so up always reaches the top bar and
+    /// down does nothing; portrait grid: the real column count.
+    private func geometryContent(_ size: CGSize) -> some View {
+        let wide: Bool = size.width > size.height
+        let columns: Int = columnCount(size.width)
+        let step: Int = wide ? 100_000 : columns
+        return screen(width: size.width, height: size.height, columns: columns, wide: wide)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onAppear { focus.columns = step }
+            .onChange(of: step) { _, s in focus.columns = s }
+    }
+
     private func mainColumn(columns: Int, wide: Bool) -> some View {
         VStack(spacing: 0) {
             topBar
@@ -377,17 +394,7 @@ struct LauncherView: View {
 
     var body: some View {
         GeometryReader { geo in
-            let width: CGFloat = geo.size.width
-            let height: CGFloat = geo.size.height
-            let columns: Int = max(2, Int((width - 24) / 200))
-            let wide: Bool = width > height
-            screen(width: width, height: height, columns: columns, wide: wide)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                // Landscape row: a huge step so up always reaches the top bar
-                // and down does nothing; portrait grid: the real column count.
-                .onAppear { focus.columns = wide ? 100_000 : columns }
-                .onChange(of: columns) { _, c in focus.columns = wide ? 100_000 : c }
-                .onChange(of: wide) { _, w in focus.columns = w ? 100_000 : columns }
+            geometryContent(geo.size)
         }
         .environment(\.colorScheme, .dark)
         .onChange(of: session) { _, _ in
