@@ -929,6 +929,11 @@ struct ContentView: View {
     @State private var selectedTab: MadeiraTab = .library
     @State private var developerToolsExpanded = false
     @State private var desktopFullScreen = false
+    /// ml790: Start -> "Exit desktop" has closed every program. The desktop
+    /// (explorer, services) stays alive underneath — the runtime cannot be
+    /// restarted in-process — but it is hidden and the Activity tab offers
+    /// Start Desktop again, which simply shows it (see resumeDesktop).
+    @State private var desktopShutDown = false
     @State private var showActivityLogs = false
     @State private var showRuntimeStatus = false
     @State private var prefixSizeText = "Calculating…"
@@ -1036,20 +1041,36 @@ struct ContentView: View {
             logEntitlementStatus()
             GamepadBridge.shared.start()
             FrameCap.apply(FrameCap.saved, persist: false)
-            MetalHostView.shared.isHidden = selectedTab != .activity
-            winios_set_compositor_hidden(selectedTab != .activity ? 1 : 0)
+            applySurfaceVisibility(tab: selectedTab)
         }
         .onChange(of: selectedTab) { _, tab in
             // Both surfaces are window-level views above the whole SwiftUI
             // tree: the games' Metal host AND the desktop compositor. The
             // compositor used to stay visible on every tab.
-            MetalHostView.shared.isHidden = tab != .activity
-            winios_set_compositor_hidden(tab != .activity ? 1 : 0)
+            applySurfaceVisibility(tab: tab)
+        }
+        .onChange(of: desktopShutDown) { _, _ in
+            applySurfaceVisibility(tab: selectedTab)
         }
         .onReceive(NotificationCenter.default.publisher(
             for: Notification.Name("MadeiraExitFullScreen"))) { _ in
             desktopFullScreen = false
         }
+    }
+
+    /// The games' Metal host and the desktop compositor are visible only on
+    /// the Activity tab, and not while the desktop is shut down (ml790).
+    private func applySurfaceVisibility(tab: MadeiraTab) {
+        let hidden = tab != .activity || desktopShutDown
+        MetalHostView.shared.isHidden = hidden
+        winios_set_compositor_hidden(hidden ? 1 : 0)
+    }
+
+    /// "Running" on the Start Desktop button: the runtime is up and the
+    /// desktop is showing. After Exit desktop the runtime is still up but the
+    /// button must offer Start Desktop again.
+    private var desktopIsRunning: Bool {
+        wineserver_is_running() != 0 && !desktopShutDown
     }
 
     private var libraryScreen: some View {
@@ -1612,15 +1633,19 @@ struct ContentView: View {
             // Same launch as Library → Developer tools → Wine Virtual Desktop,
             // reachable from the tab where the desktop is actually shown.
             Button {
-                launchVirtualDesktop()
+                if desktopShutDown {
+                    resumeDesktop()
+                } else {
+                    launchVirtualDesktop()
+                }
             } label: {
-                Label(wineserver_is_running() != 0 ? "Running" : "Start Desktop",
-                      systemImage: wineserver_is_running() != 0 ? "desktopcomputer.and.arrow.down" : "play.fill")
+                Label(desktopIsRunning ? "Running" : "Start Desktop",
+                      systemImage: desktopIsRunning ? "desktopcomputer.and.arrow.down" : "play.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .tint(.mint)
-            .disabled(wineserver_is_running() != 0)
+            .disabled(desktopIsRunning)
 
             // The touch-controller toggle lives in the full-screen toolbar
             // and Settings → Input; it was redundant here.
@@ -1888,45 +1913,43 @@ struct ContentView: View {
         runWineFullSequence()
     }
 
-    /// ml788: the desktop's root process (explorer.exe /desktop) has ended.
-    ///
-    /// This is where Start -> "Exit desktop" arrives: explorer asks for
-    /// confirmation, ExitWindows() runs `wineboot --end-session --shutdown`,
-    /// wineboot sends WM_QUERYENDSESSION/WM_ENDSESSION to every program and
-    /// TerminateProcess()es the ones still alive, the server closes the
-    /// desktop one second after its last user is gone (WM_CLOSE to the
-    /// desktop window), explorer's message loop ends and __wine_main returns.
-    /// Before this hook the app just sat on a black desktop: the wineserver
-    /// thread had been stopped and nothing could be started again.
-    ///
-    /// A second desktop cannot be started inside this Mach process — the
-    /// wineserver thread, FEX, ntdll's static state and the JIT pool are all
-    /// one-shot — so the honest equivalent of "shut down" is to end the app;
-    /// relaunching Madeira gives a fresh desktop. The log line lands in
-    /// madeira-log.txt before the process goes away.
-    private func desktopSessionEnded(exitCode: Int) {
-        let clean = exitCode == 0
-        logStore.log(clean
-            ? "Desktop session ended (Exit desktop) — closing Madeira; relaunch it to start a new desktop"
-            : "Desktop process died with exit code \(exitCode) — closing Madeira; relaunch it to start a new desktop",
-            level: clean ? .success : .error)
+    /// ml790: Start -> "Exit desktop" finished. explorer asked for
+    /// confirmation, ExitWindows() ran `wineboot --end-session --shutdown`,
+    /// wineboot sent WM_QUERYENDSESSION/WM_ENDSESSION to every program and
+    /// TerminateProcess()ed the ones still alive, and exited 0 (stage 2).
+    /// On this port that is the end of the chain: the fork's server keeps
+    /// the desktop open (auto-close suppressed), so explorer and the service
+    /// processes stay alive underneath. The user wants the desktop gone, not
+    /// the app (ml788/ml789 ended the app here), so: leave full screen, hide
+    /// the compositor, and let Start Desktop show the now-empty desktop
+    /// again. Nothing is torn down — the runtime cannot be re-initialised in
+    /// this process, and the live session is exactly what makes "start" fast.
+    private func desktopShutDownNow() {
+        logStore.log("Exit desktop: all programs closed — desktop shut down. Start Desktop shows it again.", level: .success)
         DispatchQueue.main.async {
-            winios_set_compositor_hidden(1)
+            self.desktopFullScreen = false
+            self.desktopShutDown = true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            // Put the app in the background first so the exit reads as
-            // leaving the app rather than a crash, then end the process.
-            // _exit skips atexit handlers: Wine's leftover system threads
-            // (services.exe, rpcss) are still running and would only trip
-            // static destructors.
-            let app = UIApplication.shared
-            let suspend = Selector(("suspend"))
-            if app.responds(to: suspend) {
-                app.perform(suspend)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                _exit(0)
-            }
+    }
+
+    /// Start Desktop after an Exit desktop: the session is still there, so
+    /// showing it again is all it takes.
+    private func resumeDesktop() {
+        logStore.log("Desktop resumed")
+        desktopShutDown = false
+        selectedTab = .activity
+    }
+
+    /// The desktop's root process (explorer.exe /desktop) itself ended, which
+    /// Exit desktop never does on this port: explorer crashed or was killed.
+    /// wine_process_thread has stopped the wineserver with it and the runtime
+    /// cannot be restarted in this process, so hide the dead surface and say
+    /// what to do instead of sitting on a black desktop.
+    private func desktopProcessDied(exitCode: Int) {
+        logStore.log("Desktop process ended (exit code \(exitCode)) — the Wine runtime is stopped; relaunch Madeira to start a new desktop", level: .error)
+        DispatchQueue.main.async {
+            self.desktopFullScreen = false
+            self.desktopShutDown = true
         }
     }
 
@@ -2975,20 +2998,20 @@ struct ContentView: View {
                         // ml789: Start -> Exit desktop. ntdll reports the
                         // `wineboot --end-session` child's spawn and exit;
                         // when it exited with 0 every program is closed and
-                        // the session ends here, without waiting for the
+                        // the desktop is shut down here (hidden, Start
+                        // Desktop re-shows it), without waiting for the
                         // server to close the desktop (it never does on
                         // this port — 0.1.34 log).
                         let stage = winios_session_shutdown_stage()
                         if stage == 2 {
-                            self.desktopSessionEnded(exitCode: 0)
-                            return
-                        }
-                        if stage == 3 {
-                            logStore.log("Exit desktop cancelled: a program refused to close (wineboot exit non-zero)", level: .error)
                             winios_session_shutdown_note(0, 0)
+                            self.desktopShutDownNow()
+                        } else if stage == 3 {
+                            winios_session_shutdown_note(0, 0)
+                            logStore.log("Exit desktop cancelled: a program refused to close (wineboot exit non-zero)", level: .error)
                         }
                     }
-                    self.desktopSessionEnded(exitCode: Int(wine_process_exit_code()))
+                    self.desktopProcessDied(exitCode: Int(wine_process_exit_code()))
                 }
             }
 

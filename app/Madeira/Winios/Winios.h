@@ -66,9 +66,9 @@ void winios_process_exited(void *peb);
  * calls. stage 1 = `wineboot --end-session` was spawned by ExitWindowsEx,
  * 2 = that wineboot exited with code 0 (every program is closed), 3 = it
  * exited non-zero (a program refused WM_QUERYENDSESSION, shutdown cancelled).
- * The app polls the stage and ends the session itself on 2, because the
- * server's own desktop close never fires on this port. Passing stage 0
- * resets. */
+ * The app polls the stage and on 2 shuts the desktop down itself (hides it;
+ * Start Desktop shows it again), because the server's own desktop close
+ * never fires on this port. Passing stage 0 resets. */
 void winios_session_shutdown_note(int stage, int code);
 int  winios_session_shutdown_stage(void);
 
