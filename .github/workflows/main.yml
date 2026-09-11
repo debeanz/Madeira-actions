@@ -714,6 +714,13 @@ jobs:
           set -euxo pipefail
           bash build/agent/build.sh
 
+      # Stub wintypes.dll (WinRT helpers) so Unity IL2CPP games whose
+      # GameAssembly.dll imports api-ms-win-core-winrt-robuffer can load.
+      - name: Build wintypes stub (ARM64EC)
+        run: |
+          set -euxo pipefail
+          bash build/wintypes/build.sh
+
       - name: Build Madeira.app
         env:
           PAGEZERO_EXPERIMENT: ${{ inputs.pagezero_experiment }}

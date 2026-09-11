@@ -1,0 +1,7 @@
+EXPORTS
+    RoGetBufferMarshaler
+    RoResolveNamespace
+    RoGetMetaDataFile
+    RoParseTypeName
+    RoIsApiContractPresent
+    RoIsApiContractMajorVersionPresent

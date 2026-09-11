@@ -145,4 +145,5 @@ app/Madeira/mono/wine-mono-*
 
 # Built by CI into the bundle folders (build/dcomp, build/agent)
 app/Madeira/arm64ec-windows/dcomp.dll
+app/Madeira/arm64ec-windows/wintypes.dll
 app/Madeira/aarch64-windows/madeira-agent.exe

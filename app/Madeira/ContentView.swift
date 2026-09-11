@@ -1237,11 +1237,25 @@ struct ContentView: View {
         DispatchQueue.global(qos: .utility).async {
             let presents0 = madeira_get_present_count()
             var waited = 0.0
-            while madeira_get_present_count() < presents0 + 2 && waited < 120 {
+            while madeira_get_present_count() < presents0 + 2 && waited < 60 {
                 Thread.sleep(forTimeInterval: 0.25)
                 waited += 0.25
             }
-            DispatchQueue.main.async { self.firstFrameSeen = true }
+            let drew = madeira_get_present_count() >= presents0 + 2
+            DispatchQueue.main.async {
+                self.firstFrameSeen = true
+                // ml801: a game that never drew within 60 s died at startup
+                // (0.1.52: an IL2CPP title failing to load GameAssembly.dll)
+                // and the exit report may never come; do not leave the
+                // loading screen up forever.
+                if !drew, case .playing(let t) = self.launcherSession, t == title {
+                    logStore.log("\(title) never drew a frame within 60 s — treating it as failed; check madeira-log.txt for a missing DLL or a crash", level: .error)
+                    self.launcherSession = .idle
+                    self.launchingGame = nil
+                    self.desktopFullScreen = false
+                    self.selectedTab = .games
+                }
+            }
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
             logStore.log("\(title) ended (exit code \(code))")
