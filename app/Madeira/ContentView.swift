@@ -2972,6 +2972,21 @@ struct ContentView: View {
                 DispatchQueue.global(qos: .utility).async {
                     while wine_process_is_running() != 0 {
                         Thread.sleep(forTimeInterval: 0.5)
+                        // ml789: Start -> Exit desktop. ntdll reports the
+                        // `wineboot --end-session` child's spawn and exit;
+                        // when it exited with 0 every program is closed and
+                        // the session ends here, without waiting for the
+                        // server to close the desktop (it never does on
+                        // this port — 0.1.34 log).
+                        let stage = winios_session_shutdown_stage()
+                        if stage == 2 {
+                            self.desktopSessionEnded(exitCode: 0)
+                            return
+                        }
+                        if stage == 3 {
+                            logStore.log("Exit desktop cancelled: a program refused to close (wineboot exit non-zero)", level: .error)
+                            winios_session_shutdown_note(0, 0)
+                        }
                     }
                     self.desktopSessionEnded(exitCode: Int(wine_process_exit_code()))
                 }

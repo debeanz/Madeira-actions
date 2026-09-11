@@ -2217,6 +2217,45 @@ static int init_thread_pipe(void)
 }
 
 
+#ifdef WINE_IOS
+/* ml789: case-insensitive substring test of an ASCII needle on a
+ * UNICODE_STRING, used to recognise the `wineboot.exe --end-session` child by
+ * its command line both when it is spawned (process_ios.c) and when it exits
+ * (below). The needle is plain char on purpose: this unix side is built
+ * without -fshort-wchar, so an L"" literal would be 4-byte wchar_t. */
+int ios_unicode_contains( const UNICODE_STRING *us, const char *needle )
+{
+    ULONG len = us->Length / sizeof(WCHAR), nlen = 0, i, j;
+    if (!us->Buffer) return 0;
+    while (needle[nlen]) nlen++;
+    if (!nlen || nlen > len) return 0;
+    for (i = 0; i + nlen <= len; i++)
+    {
+        for (j = 0; j < nlen; j++)
+        {
+            unsigned int a = us->Buffer[i + j], b = (unsigned char)needle[j];
+            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+            if (a != b) break;
+        }
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
+/* Is the pseudo-process that is exiting right now the session-shutdown
+ * wineboot? Its own PEB's parameters carry the command line. */
+static int ios_exiting_is_shutdown_wineboot( void )
+{
+    TEB *teb = NtCurrentTeb();
+    RTL_USER_PROCESS_PARAMETERS *params;
+    if (!teb || !teb->Peb || !(params = teb->Peb->ProcessParameters)) return 0;
+    return ios_unicode_contains( &params->CommandLine, "wineboot.exe" )
+        && (ios_unicode_contains( &params->CommandLine, "--end-session" )
+            || ios_unicode_contains( &params->CommandLine, "--kill" ));
+}
+#endif
+
 /***********************************************************************
  *           process_exit_wrapper
  *
@@ -2258,6 +2297,18 @@ void process_exit_wrapper( int status )
         {
             extern void winios_process_exited( void *peb ) __attribute__((weak));
             if (winios_process_exited) winios_process_exited( dead_peb );
+        }
+        /* ml789: the `wineboot --end-session` child is done. Code 0 means every
+         * program accepted WM_QUERYENDSESSION and was closed or terminated;
+         * non-zero means one refused and the shutdown is cancelled. The app
+         * ends the session on 0 (Winios.m / ContentView). */
+        {
+            extern void winios_session_shutdown_note( int stage, int code ) __attribute__((weak));
+            if (winios_session_shutdown_note && ios_exiting_is_shutdown_wineboot())
+            {
+                wine_log_write("[Wine ntdll/server] [shutdown] ml789 wineboot --end-session exited with %d", status);
+                winios_session_shutdown_note( status == 0 ? 2 : 3, status );
+            }
         }
     }
     else close( fd_socket );

@@ -880,6 +880,26 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     ERR("NtCreateUserProcess: image=%s cmdline=%s\n",
         debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ));
 
+    /* ml789: Start -> "Exit desktop". user32's ExitWindowsEx runs
+     * `wineboot.exe --end-session [--force] --shutdown` (`--kill` for
+     * EWX_FORCE). Tell the app, which ends the session once that wineboot
+     * has finished closing every program (process_exit_wrapper reports the
+     * exit). The 0.1.34 log showed wineboot doing its job five times while
+     * the server never closed the desktop, so the app cannot wait for
+     * explorer to leave on its own. */
+    {
+        extern int ios_unicode_contains( const UNICODE_STRING *us, const char *needle );
+        extern void winios_session_shutdown_note( int stage, int code ) __attribute__((weak));
+        if (winios_session_shutdown_note
+            && ios_unicode_contains( &params->CommandLine, "wineboot.exe" )
+            && (ios_unicode_contains( &params->CommandLine, "--end-session" )
+                || ios_unicode_contains( &params->CommandLine, "--kill" )))
+        {
+            ERR("[shutdown] ml789 session shutdown requested: %s\n", debugstr_us( &params->CommandLine ));
+            winios_session_shutdown_note( 1, 0 );
+        }
+    }
+
     /* TEMP HACK (Steam S3 2026-07-10, task #29): refuse to spawn Steam's
      * minidump reporter. The reporter child hits the deep guest-exception-
      * DISPATCH wall ("exception frame is not in stack limits") and — worse —

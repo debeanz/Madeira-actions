@@ -62,6 +62,16 @@ void winios_set_compositor_hidden(int hidden);
  * a layer over the desktop. */
 void winios_process_exited(void *peb);
 
+/* ml789: Start -> "Exit desktop" progress, reported by ntdll-unix through weak
+ * calls. stage 1 = `wineboot --end-session` was spawned by ExitWindowsEx,
+ * 2 = that wineboot exited with code 0 (every program is closed), 3 = it
+ * exited non-zero (a program refused WM_QUERYENDSESSION, shutdown cancelled).
+ * The app polls the stage and ends the session itself on 2, because the
+ * server's own desktop close never fires on this port. Passing stage 0
+ * resets. */
+void winios_session_shutdown_note(int stage, int code);
+int  winios_session_shutdown_stage(void);
+
 /* S2 trackpad pointer. (x, y) are ABSOLUTE wine-desktop pixels (the
  * Swift trackpad engine owns the cursor position); flags are raw
  * MOUSEEVENTF_* combos; data carries the wheel delta for

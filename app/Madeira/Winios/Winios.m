@@ -784,6 +784,24 @@ void winios_process_exited(void *peb) {
     });
 }
 
+/* ml789: Start -> "Exit desktop" progress (see Winios.h). Written by
+ * ntdll-unix on the wineboot child's thread, read by ContentView's desktop
+ * watcher every 0.5 s. A plain volatile int is enough for that handshake. */
+static volatile int g_session_shutdown_stage = 0;
+
+void winios_session_shutdown_note(int stage, int code) {
+    g_session_shutdown_stage = stage;
+    fprintf(stderr, "[winios] [shutdown] ml789 stage=%d (%s) code=%d\n", stage,
+            stage == 1 ? "wineboot --end-session spawned" :
+            stage == 2 ? "all programs closed, ending session" :
+            stage == 3 ? "cancelled: a program refused to close" : "reset", code);
+    fflush(stderr);
+}
+
+int winios_session_shutdown_stage(void) {
+    return g_session_shutdown_stage;
+}
+
 /* ============================================================ *
  * S2-7: DXMT presentation into desktop windows
  * ============================================================
