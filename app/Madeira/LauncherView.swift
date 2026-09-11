@@ -392,7 +392,9 @@ struct LauncherView: View {
         }
     }
 
-    var body: some View {
+    /// The screen plus its state observers; the sheets are layered on in
+    /// body so neither expression is too big for the type-checker.
+    private var core: some View {
         GeometryReader { geo in
             geometryContent(geo.size)
         }
@@ -424,6 +426,10 @@ struct LauncherView: View {
         .onChange(of: library.scanning) { _, scanning in
             refreshSpin = scanning
         }
+    }
+
+    var body: some View {
+        core
         .sheet(item: $optionsGame) { game in
             OptionsSheet(game: game,
                          session: session,
