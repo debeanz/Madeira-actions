@@ -134,13 +134,8 @@ final class GamesFocus: ObservableObject {
             switch action {
             case .left:  moveTile(to: gridIndex - 1)
             case .right: moveTile(to: gridIndex + 1)
-            case .up:
-                if gridIndex < rowStep {
-                    area = .topBar
-                } else {
-                    moveTile(to: gridIndex - rowStep)
-                }
-            case .down:  moveTile(to: gridIndex + rowStep)
+            case .up:    area = .topBar          // ml794: single horizontal row
+            case .down:  break
             case .select:
                 if let id = highlightedID { openNow(id) }
             default: break
@@ -519,32 +514,50 @@ struct LauncherView: View {
 
     // MARK: Grid
 
+    /// ml794: one horizontal row of covers (GameHub style). The highlighted
+    /// cover is drawn larger, the rest smaller; left/right browse, A opens
+    /// the card. `columns` is ignored (kept so callers do not change).
     private func grid(columns: Int) -> some View {
-        let items: [GridItem] = Array(repeating: GridItem(.flexible(), spacing: 12), count: columns)
         let games: [LauncherGame] = library.games
+        let bigW: CGFloat = 300, bigH: CGFloat = 140
+        let smallW: CGFloat = 196, smallH: CGFloat = 92
         return ScrollViewReader { proxy in
-            ScrollView(.vertical) {
-                LazyVGrid(columns: items, alignment: .leading, spacing: 12) {
-                    ForEach(Array(games.enumerated()), id: \.element.id) { i, game in
-                        let highlighted: Bool = focus.area != .topBar && focus.gridIndex == i
-                        GameTile(id: game.id,
-                                 title: game.title,
-                                 cover: covers.covers[game.id],
-                                 icon: library.icons[game.id],
-                                 loading: covers.state[game.id] == .loading,
-                                 only32Bit: game.only32Bit,
-                                 focused: highlighted)
-                            .equatable()
-                            .onTapGesture { tapTile(game) }
-                            .onLongPressGesture(minimumDuration: 0.5) { longPressTile(game) }
-                            .onAppear { SteamCovers.shared.ensureCover(for: game) }
-                            .id(game.id)
+            VStack(alignment: .leading, spacing: 10) {
+                Spacer(minLength: 0)
+                Text("YOUR GAMES")
+                    .font(.system(size: 13, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(LauncherPalette.textSecondary)
+                    .padding(.horizontal, 20)
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .center, spacing: 14) {
+                        ForEach(Array(games.enumerated()), id: \.element.id) { i, game in
+                            let highlighted: Bool = focus.area != .topBar && focus.gridIndex == i
+                            GameTile(id: game.id,
+                                     title: game.title,
+                                     cover: covers.covers[game.id],
+                                     icon: library.icons[game.id],
+                                     loading: covers.state[game.id] == .loading,
+                                     only32Bit: game.only32Bit,
+                                     focused: highlighted)
+                                .equatable()
+                                .frame(width: highlighted ? bigW : smallW,
+                                       height: highlighted ? bigH + 44 : smallH + 40)
+                                .animation(.spring(response: 0.28, dampingFraction: 0.82), value: highlighted)
+                                .onTapGesture { tapTile(game) }
+                                .onLongPressGesture(minimumDuration: 0.5) { longPressTile(game) }
+                                .onAppear { SteamCovers.shared.ensureCover(for: game) }
+                                .id(game.id)
+                        }
                     }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 8)
                 }
-                .padding(12)
-                .padding(.bottom, 12)
+                .scrollIndicators(.hidden)
+                .frame(height: bigH + 60)
+                Spacer(minLength: 0)
             }
-            .scrollIndicators(.hidden)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onChange(of: focus.gridIndex) { _, i in
                 scrollToTile(i, in: games, proxy: proxy)
             }
