@@ -51,7 +51,28 @@
  * Games tab turns "Resume" back into "Play"). */
 static HANDLE g_child_handle[32];
 static DWORD  g_child_pid[32];
+static DWORD  g_child_kill_at[32];   /* ml799: tick when a hard kill is due, 0 = none */
 static int    g_child_n;
+
+/* ml799: a violent TerminateProcess from outside wedges the desktop on
+ * this port (the victim's threads never get the signal and keep their
+ * locks), so "force close" first asks every window of the process to
+ * close — what Alt+F4 does, which Unity and most games honour — and only
+ * terminates after CLOSE_GRACE_MS if the process is still there. */
+#define CLOSE_GRACE_MS 8000
+static int g_close_posted;
+
+static BOOL CALLBACK close_windows_proc( HWND hwnd, LPARAM lp )
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId( hwnd, &pid );
+    if (pid == (DWORD)lp)
+    {
+        PostMessageW( hwnd, WM_CLOSE, 0, 0 );
+        g_close_posted++;
+    }
+    return TRUE;
+}
 
 static void append_text_file( const WCHAR *path, const char *text )
 {
@@ -75,10 +96,18 @@ static void reap_children( void )
             CloseHandle( g_child_handle[i] );
             snprintf( line, sizeof(line), "pid=%lu code=%ld\r\n", (unsigned long)g_child_pid[i], (long)(int)code );
             append_text_file( EXIT_PATH, line );
+            agent_log( "%s", line );
             g_child_n--;
             g_child_handle[i] = g_child_handle[g_child_n];
             g_child_pid[i] = g_child_pid[g_child_n];
+            g_child_kill_at[i] = g_child_kill_at[g_child_n];
             continue;
+        }
+        if (g_child_kill_at[i] && (LONG)(GetTickCount() - g_child_kill_at[i]) >= 0)
+        {
+            agent_log( "pid=%lu ignored WM_CLOSE for %d ms -> TerminateProcess", (unsigned long)g_child_pid[i], CLOSE_GRACE_MS );
+            TerminateProcess( g_child_handle[i], 1 );
+            g_child_kill_at[i] = 0;
         }
         i++;
     }
@@ -193,6 +222,7 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
         {
             g_child_handle[g_child_n] = pi.hProcess;
             g_child_pid[g_child_n] = pi.dwProcessId;
+            g_child_kill_at[g_child_n] = 0;
             g_child_n++;
         }
         else CloseHandle( pi.hProcess );
@@ -218,14 +248,29 @@ static void handle_request( void )
         DWORD kpid = strtoul( args, NULL, 10 );
         BOOL ok = FALSE;
         int i;
+        g_close_posted = 0;
+        EnumWindows( close_windows_proc, (LPARAM)kpid );
         for (i = 0; i < g_child_n; i++)
-            if (g_child_pid[i] == kpid) { ok = TerminateProcess( g_child_handle[i], 1 ); break; }
+            if (g_child_pid[i] == kpid)
+            {
+                /* Polite close first; the reap loop terminates after the grace. */
+                g_child_kill_at[i] = GetTickCount() + CLOSE_GRACE_MS;
+                if (!g_child_kill_at[i]) g_child_kill_at[i] = 1;
+                ok = TRUE;
+                break;
+            }
         if (i == g_child_n)
         {
-            HANDLE h = OpenProcess( PROCESS_TERMINATE, FALSE, kpid );
-            if (h) { ok = TerminateProcess( h, 1 ); CloseHandle( h ); }
+            /* Not ours: close its windows now, terminate if none took it. */
+            if (g_close_posted) ok = TRUE;
+            else
+            {
+                HANDLE h = OpenProcess( PROCESS_TERMINATE, FALSE, kpid );
+                if (h) { ok = TerminateProcess( h, 1 ); CloseHandle( h ); }
+            }
         }
-        agent_log( "kill id=%s pid=%lu -> %s (%lu)", id, (unsigned long)kpid, ok ? "ok" : "err", (unsigned long)GetLastError() );
+        agent_log( "kill id=%s pid=%lu -> %s (WM_CLOSE to %d window(s), hard kill in %d ms if ignored)",
+                   id, (unsigned long)kpid, ok ? "ok" : "err", g_close_posted, CLOSE_GRACE_MS );
         snprintf( result, sizeof(result), ok ? "id=%s\r\nok kill\r\n" : "id=%s\r\nerr code=%lu\r\n", id, (unsigned long)GetLastError() );
         write_text_file( RESULT_PATH, result );
         HeapFree( GetProcessHeap(), 0, text );

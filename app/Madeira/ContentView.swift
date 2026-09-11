@@ -1133,8 +1133,20 @@ struct ContentView: View {
     private func forceCloseGame() {
         guard case .playing(let title) = launcherSession, playingPid > 0 else { return }
         logStore.log("Force closing \(title) (pid \(playingPid))")
-        SessionLauncher.shared.kill(pid: playingPid) { ok in
-            logStore.log(ok ? "\(title) force closed" : "\(title): force close failed", level: ok ? .info : .error)
+        let pid = playingPid
+        SessionLauncher.shared.kill(pid: pid) { ok in
+            logStore.log(ok ? "\(title): close requested" : "\(title): force close failed", level: ok ? .info : .error)
+        }
+        // ml799: if no exit report ever arrives (a process that will not die
+        // wedges this port), do not stay stuck in "playing" forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+            if case .playing = launcherSession, playingPid == pid {
+                logStore.log("\(title) did not report its exit after force close — treating it as ended", level: .error)
+                launcherSession = .idle
+                launchingGame = nil
+                desktopFullScreen = false
+                selectedTab = .games
+            }
         }
     }
 
