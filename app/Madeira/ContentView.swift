@@ -927,13 +927,18 @@ struct ContentView: View {
     @ObservedObject private var gamepad = GamepadBridge.shared
     @State private var pointerPanel = false
     @State private var selectedTab: MadeiraTab = .games
-    @State private var developerToolsExpanded = false
     @State private var desktopFullScreen = false
     /// ml790: Start -> "Exit desktop" has closed every program. The desktop
     /// (explorer, services) stays alive underneath — the runtime cannot be
-    /// restarted in-process — but it is hidden and the Activity tab offers
+    /// restarted in-process — but it is hidden and the Desktop tab offers
     /// Start Desktop again, which simply shows it (see resumeDesktop).
     @State private var desktopShutDown = false
+    /// ml792: what the Games tab is doing with the one-shot runtime. Drives
+    /// the launcher's status pill and gates a second launch (see playGame).
+    @State private var launcherSession: LauncherSession = .idle
+    /// A game already ran in this process and the runtime cannot be started
+    /// again: offer to quit so the next game gets a fresh launch.
+    @State private var showRelaunchAlert = false
     @State private var showActivityLogs = false
     @State private var showRuntimeStatus = false
     @State private var prefixSizeText = "Calculating…"
@@ -994,7 +999,7 @@ struct ContentView: View {
     }
 
     private enum MadeiraTab: Hashable {
-        case games, library, containers, activity, settings
+        case games, containers, desktop, settings
     }
 
     var body: some View {
@@ -1005,34 +1010,37 @@ struct ContentView: View {
             // though DXMT continues presenting underneath it.
             if desktopFullScreen {
                 fullScreenDesktop
-            } else if vSizeClass == .compact && selectedTab == .activity {
+            } else if vSizeClass == .compact && selectedTab == .desktop {
                 landscapeBody
             } else {
                 TabView(selection: $selectedTab) {
                     launcherScreen
                         .tabItem { Label("Games", systemImage: "gamecontroller.fill") }
                         .tag(MadeiraTab.games)
-                    libraryScreen
-                        .tabItem { Label("Library", systemImage: "square.grid.2x2.fill") }
-                        .tag(MadeiraTab.library)
                     containersScreen
                         .tabItem { Label("Containers", systemImage: "shippingbox.fill") }
                         .tag(MadeiraTab.containers)
                     Group {
-                        if selectedTab == .activity {
+                        if selectedTab == .desktop {
                             activityScreen
                         } else {
                             Color.clear
                         }
                     }
-                        .tabItem { Label("Activity", systemImage: "waveform.path.ecg") }
-                        .tag(MadeiraTab.activity)
+                        .tabItem { Label("Desktop", systemImage: "desktopcomputer") }
+                        .tag(MadeiraTab.desktop)
                     settingsScreen
                         .tabItem { Label("Settings", systemImage: "gearshape.fill") }
                         .tag(MadeiraTab.settings)
                 }
                 .tint(.indigo)
             }
+        }
+        .alert("Reopen Madeira to play another game", isPresented: $showRelaunchAlert) {
+            Button("Quit Madeira", role: .destructive) { quitApp() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A game already ran in this session and the Wine runtime can only be started once per launch. Quit and reopen Madeira, then pick the next game.")
         }
         .onAppear {
             jit_install_trap_handler()
@@ -1046,7 +1054,7 @@ struct ContentView: View {
             FrameCap.apply(FrameCap.saved, persist: false)
             applySurfaceVisibility(tab: selectedTab)
             // ml791: controller drives the Games grid while that tab shows.
-            GamepadBridge.shared.onNavigate = { LauncherNavigator.shared.handle($0) }
+            GamepadBridge.shared.onNavigate = { GamesFocus.shared.handle($0) }
             syncGamepadUIMode()
         }
         .onChange(of: selectedTab) { _, tab in
@@ -1069,9 +1077,9 @@ struct ContentView: View {
     }
 
     /// The games' Metal host and the desktop compositor are visible only on
-    /// the Activity tab, and not while the desktop is shut down (ml790).
+    /// the Desktop tab, and not while the desktop is shut down (ml790).
     private func applySurfaceVisibility(tab: MadeiraTab) {
-        let hidden = tab != .activity || desktopShutDown
+        let hidden = tab != .desktop || desktopShutDown
         MetalHostView.shared.isHidden = hidden
         winios_set_compositor_hidden(hidden ? 1 : 0)
     }
@@ -1092,45 +1100,181 @@ struct ContentView: View {
     /// ml791: the Games tab. A console-style grid of the game folders on
     /// C:, playable by tap or controller (LauncherView).
     private var launcherScreen: some View {
-        LauncherView(onPlay: playGame)
+        LauncherView(session: launcherSession,
+                     onPlay: playGame,
+                     onOpenDesktop: openDesktopFromGames,
+                     onQuitApp: quitApp)
     }
 
-    /// ml791: start a game from the Games tab inside the desktop session.
+    /// ml792: make sure the debugger is attached before the runtime starts.
+    /// Calls back on the main thread with true when JIT is usable. StikDebug
+    /// polls forever, so a 90 s deadline turns "nothing happened" into a
+    /// logged failure instead of a launcher stuck on "Enabling JIT".
+    private func ensureJIT(_ completion: @escaping (Bool) -> Void) {
+        if jit_check_debugged() {
+            completion(true)
+            return
+        }
+        launcherSession = .enablingJIT
+        logStore.log("Enabling JIT through StikDebug…")
+        var done = false
+        StikJITHelper.enableJIT { ok in
+            if done { return }
+            done = true
+            completion(ok)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90) {
+            if !done {
+                done = true
+                logStore.log("JIT was not enabled within 90 s — is StikDebug installed and paired?", level: .error)
+                completion(false)
+            }
+        }
+    }
+
+    /// ml792: start a game from the Games tab like an app — as the root
+    /// process of the one-shot runtime, no desktop in between.
     ///
-    /// The runtime is one-shot per app launch, so games are never started as
-    /// the root process here; they are children of the desktop, exactly as
-    /// a File Explorer double-click would make them. The desktop's helper
-    /// (madeira-agent.exe, started in place of services.exe) does the
-    /// CreateProcess; SessionLauncher talks to it through C:\madeira. If the
-    /// desktop is not running yet it is started first and the request waits
-    /// for the agent; if it was shut down with Exit desktop it is shown
-    /// again. The desktop goes full screen once the game has started.
+    /// The runtime can be started once per app launch, so the second game
+    /// needs a fresh Madeira (showRelaunchAlert). The only exception is a
+    /// desktop session already started from the Desktop tab: while it runs,
+    /// games are launched inside it through the session agent
+    /// (SessionLauncher), exactly as a File Explorer double-click would.
     private func playGame(_ game: LauncherGame) {
-        guard let exe = game.exe else {
+        guard game.exe != nil else {
             logStore.log("\(game.title): only 32-bit executables found — not supported on this port", level: .error)
             return
         }
-        logStore.log("Games: launching \(game.title) → \(GameLibrary.windowsPath(exe))")
-        if wineserver_is_running() == 0 {
-            SessionLauncher.shared.clearReady()
-            launchVirtualDesktop()
-        } else if desktopShutDown {
-            resumeDesktop()
-        } else {
-            selectedTab = .activity
+        if case .playing = launcherSession {
+            selectedTab = .desktop
+            desktopFullScreen = true
+            return
         }
-        SessionLauncher.shared.launch(exe: game.exeWindowsPath, dir: game.dirWindowsPath) { outcome in
-            switch outcome {
-            case .started(let pid):
-                logStore.log("\(game.title) started (pid \(pid))", level: .success)
-                desktopFullScreen = true
-            case .failed(let code):
-                logStore.log("\(game.title) failed to start: Windows error \(code)", level: .error)
-            case .agentNotReady:
-                logStore.log("\(game.title): the desktop did not become ready in time — try again from the Games tab", level: .error)
-            case .noAnswer:
-                logStore.log("\(game.title): no answer from the desktop agent (C:\\madeira\\agent.log has details)", level: .error)
+        if case .launching = launcherSession { return }
+        if case .enablingJIT = launcherSession { return }
+        if case .ended = launcherSession {
+            showRelaunchAlert = true
+            return
+        }
+        if wineserver_is_running() != 0 {
+            // A desktop session was started from the Desktop tab: launch
+            // inside it (the only option while it runs).
+            logStore.log("Games: \(game.title) will start inside the running desktop")
+            if desktopShutDown {
+                resumeDesktop()
+            } else {
+                selectedTab = .desktop
             }
+            GameLibrary.shared.markPlayed(game)
+            SessionLauncher.shared.launch(exe: game.exeWindowsPath, dir: game.dirWindowsPath) { outcome in
+                switch outcome {
+                case .started(let pid):
+                    logStore.log("\(game.title) started (pid \(pid))", level: .success)
+                    desktopFullScreen = true
+                case .failed(let code):
+                    logStore.log("\(game.title) failed to start: Windows error \(code)", level: .error)
+                case .agentNotReady:
+                    logStore.log("\(game.title): the desktop did not become ready in time", level: .error)
+                case .noAnswer:
+                    logStore.log("\(game.title): no answer from the desktop agent (C:\\madeira\\agent.log has details)", level: .error)
+                }
+            }
+            return
+        }
+        if wine_process_exit_code() != -1 {
+            // The runtime already ran and ended.
+            showRelaunchAlert = true
+            return
+        }
+        launcherSession = .launching(game.title)
+        ensureJIT { ok in
+            guard ok else {
+                launcherSession = .idle
+                return
+            }
+            // ensureJIT switched the state to .enablingJIT while StikDebug
+            // attached; go back to "Starting <title>…" for the runtime start.
+            launcherSession = .launching(game.title)
+            GameLibrary.shared.markPlayed(game)
+            logStore.log("Games: launching \(game.title) → \(game.exeWindowsPath)")
+            prepareDirectLaunch(game.title)
+            // A Windows path here makes WineProcessBridge chdir to the exe's
+            // folder and pick the arm64ec bundle; nothing else is needed.
+            setenv("MADEIRA_EXE", game.exeWindowsPath, 1)
+            unsetenv("MADEIRA_ARGS")
+            unsetenv("MADEIRA_DESKTOP")
+            unsetenv("MADEIRA_SCREEN_W")
+            unsetenv("MADEIRA_SCREEN_H")
+            desktopFullScreen = true
+            runWineFullSequence()
+            watchDirectGame(game.title)
+        }
+    }
+
+    /// ml792: follow a directly launched game's process for its whole life
+    /// and keep launcherSession in step: .playing once the Wine process is
+    /// up, .ended (with the exit code logged) once it is gone.
+    private func watchDirectGame(_ title: String) {
+        DispatchQueue.global(qos: .utility).async {
+            var waited = 0.0
+            while wine_process_is_running() == 0 && waited < 180.0 {
+                Thread.sleep(forTimeInterval: 0.5)
+                waited += 0.5
+            }
+            if wine_process_is_running() == 0 {
+                DispatchQueue.main.async {
+                    self.launcherSession = .idle
+                    self.desktopFullScreen = false
+                    logStore.log("\(title) did not start within 180 s", level: .error)
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                self.launcherSession = .playing(title)
+            }
+            while wine_process_is_running() != 0 {
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            DispatchQueue.main.async {
+                let code = Int(wine_process_exit_code())
+                logStore.log("\(title) ended (exit code \(code))")
+                self.launcherSession = .ended(title)
+                self.desktopFullScreen = false
+                self.selectedTab = .games
+            }
+        }
+    }
+
+    /// ml792: the Games tab's "Open desktop" action. Shows the desktop if
+    /// one is up (or shut down with Exit desktop), starts one if the runtime
+    /// is still unused, and otherwise offers to quit — the runtime ran
+    /// already and cannot be started again in this process.
+    private func openDesktopFromGames() {
+        if desktopShutDown {
+            resumeDesktop()
+        } else if wineserver_is_running() != 0 {
+            selectedTab = .desktop
+        } else if wine_process_exit_code() != -1 {
+            showRelaunchAlert = true
+        } else {
+            ensureJIT { ok in
+                if ok {
+                    launcherSession = .idle
+                    launchVirtualDesktop()
+                } else {
+                    launcherSession = .idle
+                }
+            }
+        }
+    }
+
+    /// ml792: quit at the user's request (the runtime is one-shot, so a
+    /// second game needs a fresh process). A short delay lets the log line
+    /// and the alert dismissal land first.
+    private func quitApp() {
+        logStore.log("Quitting Madeira at the user's request")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            _exit(0)
         }
     }
 
@@ -1140,82 +1284,6 @@ struct ContentView: View {
         if desktopIsRunning { return "Running" }
         if desktopShutDown { return "Off (runtime idle)" }
         return "Ready"
-    }
-
-    private var libraryScreen: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Your games, one tap away.")
-                            .font(.title2.bold())
-                        Text("No imported games yet. Use the developer launchers below for the current test targets.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text("Steam handoff")
-                                .font(.headline)
-                            Spacer()
-                            Text(steamMinimalLayout ? "MINIMAL" : "DESKTOP")
-                                .font(.caption2.bold())
-                                .foregroundStyle(.indigo)
-                        }
-                        Toggle(isOn: $steamMinimalLayout) {
-                            Label("Game-first layout", systemImage: "rectangle.grid.2x2")
-                        }
-                        Text("Saves the preferred presentation for CEF handoff. The current Steam test launcher remains in Developer tools.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(17)
-                    .background(Color(uiColor: .secondarySystemGroupedBackground),
-                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text("Launch profile")
-                                .font(.headline)
-                            Spacer()
-                            Picker("Launch profile", selection: $compatibilityMode) {
-                                Text("Stability").tag("Stability")
-                                Text("Performance").tag("Performance")
-                            }
-                            .pickerStyle(.menu)
-                        }
-                        Text(compatibilityMode == "Stability"
-                             ? "Uses Madeira's validated defaults. Additional conservative FEX overrides are not enabled yet."
-                             : "Uses the current high-throughput FEX defaults.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(17)
-                    .background(Color(uiColor: .secondarySystemGroupedBackground),
-                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-
-                    VStack(alignment: .leading, spacing: 12) {
-                        DisclosureGroup(isExpanded: $developerToolsExpanded) {
-                            actionButtons
-                                .padding(.top, 10)
-                        } label: {
-                            Label("Developer launchers", systemImage: "hammer.fill")
-                                .font(.headline)
-                        }
-                        Text("Wine launch targets, JIT setup, and low-level runtime tests.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(17)
-                    .background(Color(uiColor: .secondarySystemGroupedBackground),
-                                in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                }
-                .padding()
-            }
-            .background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("Library")
-        }
     }
 
     private var containersScreen: some View {
@@ -1310,7 +1378,7 @@ struct ContentView: View {
     private var activityScreen: some View {
         NavigationStack {
             portraitBody
-                .navigationTitle("Activity")
+                .navigationTitle("Desktop")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     Menu {
@@ -1348,7 +1416,7 @@ struct ContentView: View {
         NavigationStack {
             Group {
                 if logStore.entries.isEmpty {
-                    ContentUnavailableView("No Activity Yet",
+                    ContentUnavailableView("No log yet",
                                            systemImage: "text.alignleft",
                                            description: Text("Runtime messages will appear here."))
                 } else {
@@ -1601,6 +1669,14 @@ struct ContentView: View {
                     }
                 }
 
+                Section("Developer") {
+                    NavigationLink {
+                        developerScreen
+                    } label: {
+                        Label("Developer launchers", systemImage: "hammer.fill")
+                    }
+                }
+
                 Section("About") {
                     LabeledContent("Madeira", value: Self.appVersionText)
                     LabeledContent("Device", value: deviceInfo)
@@ -1700,13 +1776,18 @@ struct ContentView: View {
 
     private var activityControls: some View {
         HStack(spacing: 10) {
-            // Same launch as Library → Developer tools → Wine Virtual Desktop,
-            // reachable from the tab where the desktop is actually shown.
+            // Same launch as Settings → Developer launchers → Wine Virtual
+            // Desktop, reachable from the tab where the desktop is shown.
             Button {
                 if desktopShutDown {
                     resumeDesktop()
                 } else {
-                    launchVirtualDesktop()
+                    ensureJIT { ok in
+                        // The desktop is not a "game": the launcher goes back
+                        // to idle either way.
+                        launcherSession = .idle
+                        if ok { launchVirtualDesktop() }
+                    }
                 }
             } label: {
                 Label(desktopIsRunning ? "Running" : "Start Desktop",
@@ -1931,8 +2012,8 @@ struct ContentView: View {
         }
     }
 
-    private func prepareLibraryLaunch(_ title: String) {
-        selectedTab = .activity
+    private func prepareDirectLaunch(_ title: String) {
+        selectedTab = .desktop
         logStore.log("\(title): \(compatibilityMode) launch profile selected")
         if compatibilityMode == "Performance" {
             // The production path's tested FEX defaults remain the performance
@@ -1971,7 +2052,7 @@ struct ContentView: View {
     /// 960x540). Games launched from this desktop get a mode list capped
     /// at this size.
     private func launchVirtualDesktop() {
-        selectedTab = .activity
+        selectedTab = .desktop
         let (deskW, deskH) = desktopSize
         logStore.log("Virtual desktop: \(deskW)x\(deskH)")
         setenv("MADEIRA_EXE", "explorer.exe", 1)
@@ -2010,7 +2091,7 @@ struct ContentView: View {
     private func resumeDesktop() {
         logStore.log("Desktop resumed")
         desktopShutDown = false
-        selectedTab = .activity
+        selectedTab = .desktop
     }
 
     /// The desktop's root process (explorer.exe /desktop) itself ended, which
@@ -2027,20 +2108,31 @@ struct ContentView: View {
     }
 
     private func launchThumper() {
-        prepareLibraryLaunch("Thumper")
+        prepareDirectLaunch("Thumper")
         setenv("MADEIRA_EXE", "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
         unsetenv("MADEIRA_ARGS")
         unsetenv("MADEIRA_DESKTOP")
         runWineFullSequence()
     }
 
-    private var actionButtons: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
+    /// Settings → Developer: the former Library "Developer launchers" row
+    /// (Wine launch targets, JIT setup, low-level runtime tests) and the
+    /// Steam handoff preference.
+    private var developerScreen: some View {
+        List {
+            Section("Steam handoff") {
+                Toggle(isOn: $steamMinimalLayout) {
+                    Label("Game-first layout", systemImage: "rectangle.grid.2x2")
+                }
+                Text("Saves the preferred presentation for CEF handoff. The current Steam test launcher remains in Developer tools.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Launchers") {
                 Button("Enable JIT") {
                     enableJITViaStikDebug()
                 }
-                .buttonStyle(.borderedProminent)
 
                 Button("Steam Testing") {
                     // Steam S3 first boot: virtual desktop (Steam needs a
@@ -2307,14 +2399,10 @@ struct ContentView: View {
                     // with MADEIRA_SURF_SENTINEL=1 if the question returns.
                     runWineFullSequence()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
 
                 Button("Wine Virtual Desktop") {
                     launchVirtualDesktop()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.mint)
 
                 // ml741: Stray (UE4). Launch the shipping binary DIRECTLY rather
                 // than Stray.exe -- the launcher builds its child's command line
@@ -2340,22 +2428,16 @@ struct ContentView: View {
                     logStore.log("Stray: args = \(args)")
                     runWineFullSequence()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
 
                 Button("Thumper (standalone)") {
                     launchThumper()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.pink)
 
                 Button("x64 DX11 cube") {
                     setenv("MADEIRA_EXE", "cube-x64.exe", 1)
                     unsetenv("MADEIRA_ARGS")
                     runWineFullSequence()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.purple)
 
                 // ml731c: one-second check of the Windows clock contract
                 // (GetTickCount64 / system time / unbiased interrupt time /
@@ -2370,24 +2452,19 @@ struct ContentView: View {
                     unsetenv("MADEIRA_DESKTOP")
                     runWineFullSequence()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.teal)
 
                 Button("arm64 DX11 cube") {
                     runTriangleTest()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.blue)
+            }
 
-                Button("Clear Log") {
+            Section("Log") {
+                Button("Clear Log", role: .destructive) {
                     logStore.clear()
                 }
-                .buttonStyle(.bordered)
-                .tint(.red)
             }
-            .padding(.vertical, 6)
         }
-        .defaultScrollAnchor(.leading)
+        .navigationTitle("Developer")
     }
 
     private func runTriangleTest() {
@@ -2398,7 +2475,7 @@ struct ContentView: View {
 #if MADEIRA_SIMULATOR_REAL_RUNTIME
         // The simulator and cube.exe are both ARM64, so this path needs Wine
         // and DXMT but no FEX translation or executable JIT pool.
-        selectedTab = .activity
+        selectedTab = .desktop
         logStore.log("Simulator ARM64 path: starting Wine without FEX/JIT", level: .success)
         DispatchQueue.global(qos: .userInitiated).async {
             self.startWineserver()

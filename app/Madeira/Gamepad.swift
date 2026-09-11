@@ -180,7 +180,7 @@ final class GamepadBridge: ObservableObject {
     @Published var mapping: GamepadMapping = .generic { didSet { save(); releaseAll(using: oldValue) } }
 
     /// ml791: while the Games tab is showing, the pad drives the tile grid
-    /// (LauncherNavigator) instead of the game: D-pad / left stick move the
+    /// (GamesFocus) instead of the game: D-pad / left stick move the
     /// highlight, A plays. The XInput table keeps reporting a connected but
     /// idle pad so a game left running in the desktop sees no input.
     @Published var uiMode: Bool = false {
@@ -188,12 +188,16 @@ final class GamepadBridge: ObservableObject {
             guard uiMode != oldValue else { return }
             releaseAll(using: mapping)
             navStickDir = nil
+            heldNav = nil
             if uiMode && native && enabled { publishNeutral() }
         }
     }
     var onNavigate: ((GamepadNavAction) -> Void)?
     private var navStickDir: GamepadNavAction? = nil
     private var navStickNext: CFTimeInterval = 0
+    /// D-pad button held in uiMode, for auto-repeat (setHeld / tick).
+    private var heldNav: GamepadElement? = nil
+    private var heldNavNext: CFTimeInterval = 0
 
     // Mouse event flags, same values MetalBackedView uses.
     private let F_MOVE: UInt32 = 0x0001, F_LDOWN: UInt32 = 0x0002, F_LUP: UInt32 = 0x0004
@@ -423,8 +427,14 @@ final class GamepadBridge: ObservableObject {
         case .dpadRight: return .right
         case .a: return .select
         case .b: return .back
+        case .y: return .alt
+        case .menu: return .menu
         default: return nil
         }
+    }
+
+    private static func isDpad(_ el: GamepadElement) -> Bool {
+        el == .dpadUp || el == .dpadDown || el == .dpadLeft || el == .dpadRight
     }
 
     /// Connected, nothing pressed: what a game sees while the pad is busy
@@ -437,7 +447,17 @@ final class GamepadBridge: ObservableObject {
 
     private func setHeld(_ el: GamepadElement, _ down: Bool) {
         if uiMode {
-            if down, enabled, let a = Self.navAction(for: el) { onNavigate?(a) }
+            if down, enabled, let a = Self.navAction(for: el) {
+                onNavigate?(a)
+                // D-pad auto-repeat while held (see tick): 0.35 s initial
+                // delay, then every 90 ms.
+                if Self.isDpad(el) {
+                    heldNav = el
+                    heldNavNext = CACurrentMediaTime() + 0.35
+                }
+            } else if !down, Self.isDpad(el), heldNav == el {
+                heldNav = nil
+            }
             return
         }
         guard enabled, !native else { return }
@@ -484,6 +504,10 @@ final class GamepadBridge: ObservableObject {
         guard enabled, let pad = controller?.extendedGamepad else { return }
         if uiMode {
             navStick(pad.leftThumbstick, now: sender.timestamp)
+            if let el = heldNav, sender.timestamp >= heldNavNext, let a = Self.navAction(for: el) {
+                onNavigate?(a)
+                heldNavNext = sender.timestamp + 0.09
+            }
             if native { publishNeutral() }
             return
         }

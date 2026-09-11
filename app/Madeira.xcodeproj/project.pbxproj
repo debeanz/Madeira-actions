@@ -60,6 +60,8 @@
 		A1000207 /* GameLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000207 /* GameLibrary.swift */; };
 		A1000208 /* SessionLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000208 /* SessionLauncher.swift */; };
 		A1000209 /* LauncherView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000209 /* LauncherView.swift */; };
+		A1000210 /* SteamCovers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000210 /* SteamCovers.swift */; };
+		A1000211 /* FileBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000211 /* FileBrowserView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -127,6 +129,8 @@
 		A2000207 /* GameLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameLibrary.swift; sourceTree = "<group>"; };
 		A2000208 /* SessionLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionLauncher.swift; sourceTree = "<group>"; };
 		A2000209 /* LauncherView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LauncherView.swift; sourceTree = "<group>"; };
+		A2000210 /* SteamCovers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCovers.swift; sourceTree = "<group>"; };
+		A2000211 /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -186,6 +190,8 @@
 				A2000207 /* GameLibrary.swift */,
 				A2000208 /* SessionLauncher.swift */,
 				A2000209 /* LauncherView.swift */,
+				A2000210 /* SteamCovers.swift */,
+				A2000211 /* FileBrowserView.swift */,
 				A2000203 /* SimulatorStubs.m */,
 				A2000004 /* JITAllocator.c */,
 				A2000005 /* JITAllocator.h */,
@@ -344,6 +350,8 @@
 				A1000207 /* GameLibrary.swift in Sources */,
 				A1000208 /* SessionLauncher.swift in Sources */,
 				A1000209 /* LauncherView.swift in Sources */,
+				A1000210 /* SteamCovers.swift in Sources */,
+				A1000211 /* FileBrowserView.swift in Sources */,
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
 				A1000006 /* FEXBridge.mm in Sources */,
