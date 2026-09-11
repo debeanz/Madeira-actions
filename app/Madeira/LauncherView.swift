@@ -337,47 +337,57 @@ struct LauncherView: View {
 
     // MARK: Body
 
+    /// Split out of body so the type-checker sees small expressions
+    /// (0.1.45 failed to build: "unable to type-check this expression in
+    /// reasonable time" on the body).
+    private func screen(width: CGFloat, height: CGFloat, columns: Int, wide: Bool) -> some View {
+        let opened: LauncherGame? = openedGame
+        return ZStack {
+            LinearGradient(colors: [LauncherPalette.bgTop, LauncherPalette.bgBottom],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+            mainColumn(columns: columns, wide: wide)
+            if opened != nil {
+                Color.black.opacity(0.55)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture { focus.close() }
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
+            if let game = opened {
+                card(game, width: width, height: height)
+                    .transition(.scale(scale: 0.92).combined(with: .opacity))
+                    .zIndex(2)
+            }
+        }
+    }
+
+    private func mainColumn(columns: Int, wide: Bool) -> some View {
+        VStack(spacing: 0) {
+            topBar
+            if library.games.isEmpty {
+                emptyState
+            } else {
+                grid(columns: columns, horizontal: wide)
+            }
+            statusLine
+        }
+    }
+
     var body: some View {
         GeometryReader { geo in
             let width: CGFloat = geo.size.width
             let height: CGFloat = geo.size.height
             let columns: Int = max(2, Int((width - 24) / 200))
-            let opened: LauncherGame? = openedGame
-            ZStack {
-                LinearGradient(colors: [LauncherPalette.bgTop, LauncherPalette.bgBottom],
-                               startPoint: .top, endPoint: .bottom)
-                    .ignoresSafeArea()
-
-                VStack(spacing: 0) {
-                    topBar
-                    if library.games.isEmpty {
-                        emptyState
-                    } else {
-                        grid(columns: columns, horizontal: width > height)
-                    }
-                    statusLine
-                }
-
-                if opened != nil {
-                    Color.black.opacity(0.55)
-                        .ignoresSafeArea()
-                        .contentShape(Rectangle())
-                        .onTapGesture { focus.close() }
-                        .transition(.opacity)
-                        .zIndex(1)
-                }
-                if let game = opened {
-                    card(game, width: width, height: height)
-                        .transition(.scale(scale: 0.92).combined(with: .opacity))
-                        .zIndex(2)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // Landscape row: a huge step so up always reaches the top bar and
-            // down does nothing; portrait grid: the real column count.
-            .onAppear { focus.columns = width > height ? 100_000 : columns }
-            .onChange(of: columns) { _, c in focus.columns = width > height ? 100_000 : c }
-            .onChange(of: width > height) { _, wide in focus.columns = wide ? 100_000 : columns }
+            let wide: Bool = width > height
+            screen(width: width, height: height, columns: columns, wide: wide)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Landscape row: a huge step so up always reaches the top bar
+                // and down does nothing; portrait grid: the real column count.
+                .onAppear { focus.columns = wide ? 100_000 : columns }
+                .onChange(of: columns) { _, c in focus.columns = wide ? 100_000 : c }
+                .onChange(of: wide) { _, w in focus.columns = w ? 100_000 : columns }
         }
         .environment(\.colorScheme, .dark)
         .onChange(of: session) { _, _ in
