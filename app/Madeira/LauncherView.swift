@@ -3,12 +3,12 @@ import SwiftUI
 import UIKit
 
 // ============================================================================
-// Games tab (ml791/ml792): a Steam Big Picture style launcher.
+// Games tab (ml791/ml792): a console-style launcher.
 //
-//   TopBar      Add game · Refresh · Desktop
-//   Hero        horizontal cover of the selected game, title, details, PLAY
-//   CapsuleRow  "All games"  — horizontal, snapping, one capsule per game
-//   CapsuleRow  "Recently played" (when any)
+//   TopBar      "Games" · Add game · Refresh · Desktop (icon pills)
+//   Grid        horizontal cover tiles, 2-4 columns depending on the width
+//   Card        opened with A / a tap on a tile: the cover big, the title,
+//               details, PLAY and a "…" button that opens the options sheet
 //   StatusLine  controller hint / what the runtime is doing
 //
 // The controller drives GamesFocus (ContentView forwards every
@@ -30,32 +30,35 @@ enum LauncherSession: Equatable {
 
 // MARK: - Focus model
 
-enum FocusArea { case topBar, heroActions, capsules, recent }
+enum FocusArea { case topBar, grid, card }
 
 enum Activation: Equatable {
-    case addGame, refresh, desktop, play, changeCover, options
-    case capsule(String)
-    case recent(String)
+    case addGame, refresh, desktop
+    case play(String)
+    case more(String)
+    case options(String)
 }
 
-/// Where the controller highlight is and which game is selected. One
+/// Where the controller highlight is and which game's card is open. One
 /// instance for the app; ContentView routes pad input here, LauncherView
 /// observes it.
 final class GamesFocus: ObservableObject {
     static let shared = GamesFocus()
 
-    @Published var area: FocusArea = .capsules
+    @Published var area: FocusArea = .grid
     @Published var topIndex: Int = 0
-    @Published var actionIndex: Int = 0
-    @Published var gameIndex: Int = 0
-    @Published var recentIndex: Int = 0
-    @Published var selectedID: String? = nil
+    @Published var gridIndex: Int = 0
+    /// 0 = Play, 1 = More.
+    @Published var cardIndex: Int = 0
+    /// The game whose card is open; nil while browsing the grid.
+    @Published var openedID: String? = nil
     /// Bumped after lastActivation is set; the view reacts in onChange.
     @Published var activation: Int = 0
     private(set) var lastActivation: Activation? = nil
 
     var gameCount: Int = 0
-    var recentCount: Int = 0
+    /// Tiles per grid row; LauncherView sets it from its width.
+    var columns: Int = 2
     /// LauncherView sets true onAppear, false onDisappear (and while a sheet is up).
     var active: Bool = false
     /// When non-nil every action goes here and nothing else happens
@@ -67,9 +70,14 @@ final class GamesFocus: ObservableObject {
     var overlayOwner: AnyObject? = nil
 
     private var gameIDs: [String] = []
-    private var recentIDs: [String] = []
 
     private static let anim: Animation = .spring(response: 0.28, dampingFraction: 0.82)
+
+    /// The tile under the grid highlight.
+    var highlightedID: String? {
+        guard gridIndex >= 0, gridIndex < gameIDs.count else { return nil }
+        return gameIDs[gridIndex]
+    }
 
     /// Called on the main thread by ContentView via GamepadBridge.onNavigate.
     func handle(_ action: GamepadNavAction) {
@@ -94,154 +102,125 @@ final class GamesFocus: ObservableObject {
             fire(.addGame)
             return
         case .menu:
-            fire(.options)
+            if let id = openedID {
+                fire(.options(id))
+            } else if let id = highlightedID {
+                fire(.options(id))
+            }
             return
         default:
             break
         }
+
+        let rowStep: Int = max(1, columns)
 
         switch area {
         case .topBar:
             switch action {
             case .left:  topIndex = max(0, topIndex - 1)
             case .right: topIndex = min(2, topIndex + 1)
-            case .down:  area = gameCount > 0 ? .heroActions : .capsules
+            case .down:  if gameCount > 0 { area = .grid }
             case .select:
                 switch topIndex {
                 case 0: fire(.addGame)
                 case 1: fire(.refresh)
                 default: fire(.desktop)
                 }
-            case .back:  area = .capsules
+            case .back:  if gameCount > 0 { area = .grid }
             default: break
             }
 
-        case .heroActions:
+        case .grid:
             switch action {
-            case .left:  actionIndex = max(0, actionIndex - 1)
-            case .right: actionIndex = min(2, actionIndex + 1)
-            case .up:    area = .topBar
-            case .down:  area = .capsules
-            case .select:
-                switch actionIndex {
-                case 0: fire(.play)
-                case 1: fire(.changeCover)
-                default: fire(.options)
-                }
-            case .back:  area = .capsules
-            default: break
-            }
-
-        case .capsules:
-            switch action {
-            case .left:
-                moveGame(to: gameIndex - 1)
-            case .right:
-                moveGame(to: gameIndex + 1)
+            case .left:  moveTile(to: gridIndex - 1)
+            case .right: moveTile(to: gridIndex + 1)
             case .up:
-                area = gameCount > 0 ? .heroActions : .topBar
-            case .down:
-                if recentCount > 0 {
-                    area = .recent
-                    enterRecent(at: recentIndex)
+                if gridIndex < rowStep {
+                    area = .topBar
+                } else {
+                    moveTile(to: gridIndex - rowStep)
                 }
+            case .down:  moveTile(to: gridIndex + rowStep)
             case .select:
-                if let id = selectedID { fire(.capsule(id)) }
-            default:
-                break
+                if let id = highlightedID { openNow(id) }
+            default: break
             }
 
-        case .recent:
+        case .card:
             switch action {
-            case .left:
-                enterRecent(at: recentIndex - 1)
-            case .right:
-                enterRecent(at: recentIndex + 1)
-            case .up, .back:
-                area = .capsules
-                restoreGameIndex()
+            case .left:  if cardIndex != 0 { cardIndex = 0 }
+            case .right: if cardIndex != 1 { cardIndex = 1 }
             case .select:
-                if recentIndex >= 0 && recentIndex < recentIDs.count {
-                    fire(.recent(recentIDs[recentIndex]))
+                if let id = openedID {
+                    if cardIndex == 0 { fire(.play(id)) } else { fire(.more(id)) }
                 }
-            default:
-                break
+            case .back:  closeNow()
+            default: break
             }
         }
     }
 
-    private func moveGame(to index: Int) {
+    private func moveTile(to index: Int) {
         guard gameCount > 0 else { return }
         let i = max(0, min(gameCount - 1, index))
-        if i != gameIndex { gameIndex = i }
-        let id = gameIDs[i]
-        if selectedID != id { selectedID = id }
+        if i != gridIndex { gridIndex = i }
     }
 
-    private func enterRecent(at index: Int) {
-        guard recentCount > 0 else { return }
-        let i = max(0, min(recentCount - 1, index))
-        if i != recentIndex { recentIndex = i }
-        let id = recentIDs[i]
-        if selectedID != id { selectedID = id }
-        restoreGameIndex()
+    /// State changes without their own animation block (callers animate).
+    private func openNow(_ id: String) {
+        if let i = gameIDs.firstIndex(of: id), i != gridIndex { gridIndex = i }
+        if openedID != id { openedID = id }
+        if cardIndex != 0 { cardIndex = 0 }
+        if area != .card { area = .card }
     }
 
-    /// gameIndex from selectedID (no-op when the id is not in the list).
-    private func restoreGameIndex() {
-        guard let id = selectedID, let i = gameIDs.firstIndex(of: id) else { return }
-        if i != gameIndex { gameIndex = i }
+    private func closeNow() {
+        if openedID != nil { openedID = nil }
+        let next: FocusArea = gameCount > 0 ? .grid : .topBar
+        if area != next { area = next }
     }
 
     /// Called from onChange(of: library.games) and onAppear.
-    func sync(games: [LauncherGame], recents: [LauncherGame]) {
-        gameIDs = games.map { $0.id }
-        recentIDs = recents.map { $0.id }
-        gameCount = gameIDs.count
-        recentCount = recentIDs.count
-
-        if gameCount == 0 {
-            if gameIndex != 0 { gameIndex = 0 }
-            if selectedID != nil { selectedID = nil }
-            if area != .topBar { area = .topBar }
-            if topIndex != 0 { topIndex = 0 }
-        } else {
-            var i: Int = min(gameIndex, gameCount - 1)
-            if let sel = selectedID, let found = gameIDs.firstIndex(of: sel) { i = found }
-            if i < 0 { i = 0 }
-            if i != gameIndex { gameIndex = i }
-            let id = gameIDs[i]
-            if selectedID != id { selectedID = id }
-        }
-
-        if recentCount == 0 {
-            if recentIndex != 0 { recentIndex = 0 }
-            if area == .recent { area = .capsules }
-        } else {
-            let r = max(0, min(recentIndex, recentCount - 1))
-            if r != recentIndex { recentIndex = r }
+    func sync(games: [LauncherGame]) {
+        withAnimation(GamesFocus.anim) {
+            self.gameIDs = games.map { $0.id }
+            self.gameCount = self.gameIDs.count
+            if self.gameCount == 0 {
+                if self.gridIndex != 0 { self.gridIndex = 0 }
+                if self.openedID != nil { self.openedID = nil }
+                if self.area != .topBar { self.area = .topBar }
+            } else {
+                let i = max(0, min(self.gridIndex, self.gameCount - 1))
+                if i != self.gridIndex { self.gridIndex = i }
+                if let opened = self.openedID, !self.gameIDs.contains(opened) {
+                    self.closeNow()
+                }
+                if self.area == .card && self.openedID == nil { self.area = .grid }
+            }
         }
     }
 
-    /// Touch selected a game in the "All games" row (tap or scroll).
-    func select(id: String) {
+    /// Touch put the highlight on a tile.
+    func focusTile(id: String) {
         guard let i = gameIDs.firstIndex(of: id) else { return }
         withAnimation(GamesFocus.anim) {
-            if i != self.gameIndex { self.gameIndex = i }
-            if self.selectedID != id { self.selectedID = id }
-            if self.area == .recent { self.area = .capsules }
+            if i != self.gridIndex { self.gridIndex = i }
+            if self.area != .grid { self.area = .grid }
         }
     }
 
-    /// Touch selected a game in the "Recently played" row (tap or scroll).
-    func selectRecent(id: String) {
-        guard let r = recentIDs.firstIndex(of: id) else { return }
+    /// Show the card for a game (Play highlighted).
+    func open(id: String) {
+        guard gameIDs.contains(id) else { return }
         withAnimation(GamesFocus.anim) {
-            if r != self.recentIndex { self.recentIndex = r }
-            if self.area == .recent {
-                if self.selectedID != id { self.selectedID = id }
-                self.restoreGameIndex()
-            }
+            self.openNow(id)
+        }
+    }
+
+    /// Back to the grid.
+    func close() {
+        withAnimation(GamesFocus.anim) {
+            self.closeNow()
         }
     }
 }
@@ -261,6 +240,9 @@ private enum LauncherPalette {
 
     static let focusAnim: Animation = .spring(response: 0.28, dampingFraction: 0.82)
 
+    /// Cover tiles and the card cover are this wide for every unit of height.
+    static let coverAspect: CGFloat = 2.14
+
     /// Stable hue for a title (FNV-1a over UTF-8), for placeholder art.
     static func hue(for title: String) -> Double {
         var h: UInt32 = 2166136261
@@ -277,6 +259,17 @@ private enum LauncherPalette {
                               startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }
+
+/// "Games\Hollow Knight" for a folder below drive_c.
+private func relativeFolder(_ url: URL) -> String {
+    let root = GameLibrary.driveC.standardizedFileURL.path + "/"
+    let p = url.standardizedFileURL.path
+    let rel = p.hasPrefix(root) ? String(p.dropFirst(root.count)) : p
+    return rel.replacingOccurrences(of: "/", with: "\\")
+}
+
+/// What the card's primary button does.
+private enum CardPlayState { case play, reopen, disabled }
 
 // MARK: - Launcher
 
@@ -296,8 +289,6 @@ struct LauncherView: View {
     @State private var renameGame: LauncherGame? = nil
     @State private var renameText: String = ""
     @State private var showAddGame: Bool = false
-    @State private var allScrolledID: String? = nil
-    @State private var recentScrolledID: String? = nil
     @State private var refreshSpin: Bool = false
 
     init(session: LauncherSession,
@@ -312,22 +303,25 @@ struct LauncherView: View {
 
     // MARK: Derived state
 
-    private var recents: [LauncherGame] { library.recentlyPlayed }
-
-    private var selectedGame: LauncherGame? {
-        guard let id = focus.selectedID else { return nil }
+    /// The game whose card is open (nil when closed or the game is gone).
+    private var openedGame: LauncherGame? {
+        guard let id = focus.openedID else { return nil }
         return library.game(withID: id)
-    }
-
-    private var recentSelectedID: String? {
-        let r = recents
-        guard focus.recentIndex >= 0, focus.recentIndex < r.count else { return nil }
-        return r[focus.recentIndex].id
     }
 
     private var isEnded: Bool {
         if case .ended = session { return true }
         return false
+    }
+
+    /// The runtime is busy or already running a game: no second launch.
+    private var sessionBusy: Bool {
+        switch session {
+        case .enablingJIT, .launching, .playing:
+            return true
+        case .idle, .ended:
+            return false
+        }
     }
 
     private var overlayPresented: Bool {
@@ -339,64 +333,56 @@ struct LauncherView: View {
     var body: some View {
         GeometryReader { geo in
             let width: CGFloat = geo.size.width
-            let isWide: Bool = geo.size.width > geo.size.height
-            let selected: LauncherGame? = selectedGame
-            let backdropImage: UIImage? = selected.flatMap { covers.backdrops[$0.id] }
+            let height: CGFloat = geo.size.height
+            let columns: Int = max(2, Int((width - 24) / 200))
+            let opened: LauncherGame? = openedGame
             ZStack {
-                LauncherBackdrop(key: selected?.id ?? "", image: backdropImage)
+                LinearGradient(colors: [LauncherPalette.bgTop, LauncherPalette.bgBottom],
+                               startPoint: .top, endPoint: .bottom)
+                    .ignoresSafeArea()
 
                 VStack(spacing: 0) {
                     topBar
-                    ScrollViewReader { proxy in
-                        ScrollView(.vertical) {
-                            VStack(alignment: .leading, spacing: 20) {
-                                hero(width: width, isWide: isWide, game: selected)
-                                    .id("hero")
-                                if !library.games.isEmpty {
-                                    allGamesRow(width: width, isWide: isWide)
-                                        .id("all")
-                                    if !recents.isEmpty {
-                                        recentRow(width: width, isWide: isWide)
-                                            .id("recent")
-                                    }
-                                }
-                            }
-                            .padding(.top, 8)
-                            .padding(.bottom, 24)
-                        }
-                        .scrollIndicators(.hidden)
-                        .onChange(of: focus.area) { _, a in
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                switch a {
-                                case .topBar, .heroActions:
-                                    proxy.scrollTo("hero", anchor: .top)
-                                case .capsules:
-                                    proxy.scrollTo("all", anchor: .center)
-                                case .recent:
-                                    proxy.scrollTo("recent", anchor: .bottom)
-                                }
-                            }
-                        }
+                    if library.games.isEmpty {
+                        emptyState
+                    } else {
+                        grid(columns: columns)
                     }
                     statusLine
                 }
+
+                if opened != nil {
+                    Color.black.opacity(0.55)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture { focus.close() }
+                        .transition(.opacity)
+                        .zIndex(1)
+                }
+                if let game = opened {
+                    card(game, width: width, height: height)
+                        .transition(.scale(scale: 0.92).combined(with: .opacity))
+                        .zIndex(2)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onAppear { focus.columns = columns }
+            .onChange(of: columns) { _, c in focus.columns = c }
         }
         .environment(\.colorScheme, .dark)
         .onAppear {
-            focus.sync(games: library.games, recents: recents)
+            focus.sync(games: library.games)
             focus.active = !overlayPresented
             refreshSpin = library.scanning
             library.rescanIfStale()
-            if let g = selectedGame { covers.ensureCover(for: g) }
         }
         .onDisappear {
             focus.active = false
         }
         .onChange(of: library.games) { _, games in
-            focus.sync(games: games, recents: library.recentlyPlayed)
+            focus.sync(games: games)
         }
-        .onChange(of: focus.selectedID) { _, id in
+        .onChange(of: focus.openedID) { _, id in
             if let id, let g = library.game(withID: id) { covers.ensureCover(for: g) }
         }
         .onChange(of: focus.activation) { _, _ in
@@ -459,19 +445,20 @@ struct LauncherView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
     }
 
+    /// Launch when the game can run and the runtime is free.
     private func play(_ game: LauncherGame) {
-        guard !game.only32Bit else { return }
-        if isEnded { return }
+        guard game.exe != nil, !game.only32Bit else { return }
+        guard !isEnded, !sessionBusy else { return }
         onPlay(game)
     }
 
-    /// The hero's primary button: PLAY, or "Reopen Madeira" once a game ended.
-    private func primaryAction(_ game: LauncherGame) {
+    /// The card's primary button: Play, or "Reopen Madeira" once a game ended.
+    private func primaryAction(id: String) {
         if isEnded {
             onQuitApp()
-        } else {
-            play(game)
+            return
         }
+        if let g = library.game(withID: id) { play(g) }
     }
 
     private func handleActivation() {
@@ -483,41 +470,21 @@ struct LauncherView: View {
             library.rescan()
         case .desktop:
             onOpenDesktop()
-        case .play:
-            if let g = selectedGame { primaryAction(g) }
-        case .changeCover:
-            if let g = selectedGame { coverSearchGame = g }
-        case .options:
-            if let g = selectedGame { optionsGame = g }
-        case .capsule(let id), .recent(let id):
-            if let g = library.game(withID: id) { play(g) }
+        case .play(let id):
+            primaryAction(id: id)
+        case .more(let id), .options(let id):
+            if let g = library.game(withID: id) { optionsGame = g }
         }
     }
 
-    private func tapCapsule(_ game: LauncherGame) {
-        if focus.selectedID == game.id {
-            play(game)
-        } else {
-            withAnimation(LauncherPalette.focusAnim) {
-                focus.area = .capsules
-            }
-            focus.select(id: game.id)
-        }
+    /// One tap opens the card.
+    private func tapTile(_ game: LauncherGame) {
+        focus.focusTile(id: game.id)
+        focus.open(id: game.id)
     }
 
-    private func tapRecent(_ game: LauncherGame) {
-        if focus.area == .recent && recentSelectedID == game.id {
-            play(game)
-        } else {
-            withAnimation(LauncherPalette.focusAnim) {
-                focus.area = .recent
-            }
-            focus.selectRecent(id: game.id)
-        }
-    }
-
-    private func longPress(_ game: LauncherGame) {
-        focus.select(id: game.id)
+    private func longPressTile(_ game: LauncherGame) {
+        focus.focusTile(id: game.id)
         optionsGame = game
     }
 
@@ -525,197 +492,134 @@ struct LauncherView: View {
 
     private var topBar: some View {
         HStack(spacing: 10) {
-            TopPill(title: "Add game", systemImage: "plus.circle",
+            Text("Games")
+                .font(.title2.weight(.bold))
+                .foregroundStyle(.white)
+            Spacer(minLength: 8)
+            TopPill(systemImage: "plus.circle", label: "Add game",
                     focused: focus.area == .topBar && focus.topIndex == 0,
                     spinning: false) {
                 showAddGame = true
             }
-            TopPill(title: "Refresh", systemImage: "arrow.clockwise",
+            TopPill(systemImage: "arrow.clockwise", label: "Refresh",
                     focused: focus.area == .topBar && focus.topIndex == 1,
                     spinning: refreshSpin) {
                 library.rescan()
             }
-            TopPill(title: "Desktop", systemImage: "desktopcomputer",
+            TopPill(systemImage: "desktopcomputer", label: "Desktop",
                     focused: focus.area == .topBar && focus.topIndex == 2,
                     spinning: false) {
                 onOpenDesktop()
             }
-            Spacer(minLength: 0)
         }
         .padding(.horizontal, 16)
         .padding(.top, 10)
-        .padding(.bottom, 6)
+        .padding(.bottom, 4)
     }
 
-    // MARK: Hero
+    // MARK: Grid
 
-    @ViewBuilder
-    private func hero(width: CGFloat, isWide: Bool, game: LauncherGame?) -> some View {
-        if library.games.isEmpty {
-            emptyHero
-        } else if let game {
-            let coverW: CGFloat = max(120, min(width - 32, 480))
-            let coverH: CGFloat = coverW / 2.14
-            let sideBySide: Bool = isWide && width >= 800
-            if sideBySide {
-                HStack(alignment: .top, spacing: 24) {
-                    heroCover(game, width: coverW, height: coverH)
-                    VStack(alignment: .leading, spacing: 12) {
-                        heroTitle(game)
-                        heroDetails(game)
-                        heroActions(game)
+    private func grid(columns: Int) -> some View {
+        let items: [GridItem] = Array(repeating: GridItem(.flexible(), spacing: 12), count: columns)
+        let games: [LauncherGame] = library.games
+        return ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                LazyVGrid(columns: items, alignment: .leading, spacing: 12) {
+                    ForEach(Array(games.enumerated()), id: \.element.id) { i, game in
+                        let highlighted: Bool = focus.area != .topBar && focus.gridIndex == i
+                        GameTile(id: game.id,
+                                 title: game.title,
+                                 cover: covers.covers[game.id],
+                                 icon: library.icons[game.id],
+                                 loading: covers.state[game.id] == .loading,
+                                 only32Bit: game.only32Bit,
+                                 focused: highlighted)
+                            .equatable()
+                            .onTapGesture { tapTile(game) }
+                            .onLongPressGesture(minimumDuration: 0.5) { longPressTile(game) }
+                            .onAppear { SteamCovers.shared.ensureCover(for: game) }
+                            .id(game.id)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.horizontal, 16)
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    heroCover(game, width: coverW, height: coverH)
-                    heroTitle(game)
-                    heroDetails(game)
-                    heroActions(game)
-                }
-                .padding(.horizontal, 16)
+                .padding(12)
+                .padding(.bottom, 12)
             }
-        } else {
-            // Games exist but the selection has not settled yet (one frame).
-            Color.clear.frame(height: 1)
+            .scrollIndicators(.hidden)
+            .onChange(of: focus.gridIndex) { _, i in
+                scrollToTile(i, in: games, proxy: proxy)
+            }
+            .onChange(of: focus.area) { _, a in
+                if a == .grid { scrollToTile(focus.gridIndex, in: games, proxy: proxy) }
+            }
         }
     }
 
-    private func heroCover(_ game: LauncherGame, width: CGFloat, height: CGFloat) -> some View {
-        HeroCover(title: game.title,
-                  cover: covers.covers[game.id],
-                  icon: library.icons[game.id],
-                  loading: covers.state[game.id] == .loading,
-                  width: width, height: height)
-            .equatable()
+    private func scrollToTile(_ index: Int, in games: [LauncherGame], proxy: ScrollViewProxy) {
+        guard index >= 0, index < games.count else { return }
+        withAnimation(.easeInOut(duration: 0.25)) {
+            proxy.scrollTo(games[index].id, anchor: .center)
+        }
     }
 
-    private func heroTitle(_ game: LauncherGame) -> some View {
-        Text(game.title)
-            .font(.system(size: 28, weight: .bold))
-            .foregroundStyle(.white)
-            .lineLimit(2)
-            .minimumScaleFactor(0.7)
-            .frame(maxWidth: .infinity, alignment: .leading)
+    private var emptyState: some View {
+        ScrollView(.vertical) {
+            VStack(spacing: 14) {
+                Image(systemName: "gamecontroller")
+                    .font(.system(size: 54))
+                    .foregroundStyle(.white.opacity(0.35))
+                    .padding(.top, 40)
+                Text(library.scanning ? "Looking for games…" : "No games found")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.white)
+                Text("Put each game in its own folder on the C: drive — for example C:\\Games\\Hollow Knight — using the Files app (Madeira › wine › drive_c), or tap Add game and pick the game's .exe")
+                    .font(.subheadline)
+                    .foregroundStyle(LauncherPalette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+                if library.hiddenCount > 0 {
+                    Button("Show \(library.hiddenCount) hidden game(s)") { library.unhideAll() }
+                        .buttonStyle(.bordered)
+                        .tint(.white)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.bottom, 20)
+        }
+        .scrollIndicators(.hidden)
     }
 
-    private func heroDetails(_ game: LauncherGame) -> some View {
-        var line: Text = Text(LauncherView.relativeFolder(game.folder))
-        if let exe = game.exe {
-            line = line + Text("  ·  ") + Text(exe.lastPathComponent).font(.system(.caption, design: .monospaced))
-        }
-        if let played = game.lastPlayed {
-            let rel = RelativeDateTimeFormatter().localizedString(for: played, relativeTo: Date())
-            line = line + Text("  ·  Last played \(rel)")
-        }
-        if game.only32Bit {
-            line = line + Text("  ·  ") + Text("32-bit — not supported").foregroundStyle(LauncherPalette.danger)
-        }
-        return line
-            .font(.caption)
-            .foregroundStyle(LauncherPalette.textSecondary)
-            .lineLimit(2)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
+    // MARK: Card
 
-    private func heroActions(_ game: LauncherGame) -> some View {
-        let focusedRow: Bool = focus.area == .heroActions
-        let playTitle: String
-        let playIcon: String
-        let playKind: HeroButton.Kind
+    private func card(_ game: LauncherGame, width: CGFloat, height: CGFloat) -> some View {
+        // Keep the whole card on screen in landscape: the cover may not take
+        // more than the height left after title, details and buttons.
+        let maxCoverW: CGFloat = max(160, (height - 190) * LauncherPalette.coverAspect)
+        let panelW: CGFloat = max(200, min(width - 32, 560, maxCoverW + 32))
+        let coverW: CGFloat = panelW - 32
+        let coverH: CGFloat = coverW / LauncherPalette.coverAspect
+        let playState: CardPlayState
         if isEnded {
-            playTitle = "Reopen Madeira"
-            playIcon = "arrow.counterclockwise"
-            playKind = .reopen
-        } else if game.only32Bit {
-            playTitle = "32-bit"
-            playIcon = "play.fill"
-            playKind = .play
+            playState = .reopen
+        } else if game.only32Bit || game.exe == nil || sessionBusy {
+            playState = .disabled
         } else {
-            playTitle = "PLAY"
-            playIcon = "play.fill"
-            playKind = .play
+            playState = .play
         }
-        return HStack(spacing: 12) {
-            HeroButton(title: playTitle, systemImage: playIcon, kind: playKind,
-                       focused: focusedRow && focus.actionIndex == 0,
-                       disabled: game.only32Bit && !isEnded,
-                       minWidth: 150) {
-                primaryAction(game)
-            }
-            HeroButton(title: "Cover", systemImage: "photo", kind: .secondary,
-                       focused: focusedRow && focus.actionIndex == 1,
-                       disabled: false, minWidth: 0) {
-                coverSearchGame = game
-            }
-            HeroButton(title: "Options", systemImage: "ellipsis", kind: .secondary,
-                       focused: focusedRow && focus.actionIndex == 2,
-                       disabled: false, minWidth: 0) {
-                optionsGame = game
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.top, 4)
-    }
-
-    private var emptyHero: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "gamecontroller")
-                .font(.system(size: 54))
-                .foregroundStyle(.white.opacity(0.35))
-                .padding(.top, 40)
-            Text(library.scanning ? "Looking for games…" : "No games found")
-                .font(.title2.weight(.bold))
-                .foregroundStyle(.white)
-            Text("Put each game in its own folder on the C: drive — for example C:\\Games\\Hollow Knight — using the Files app (Madeira › wine › drive_c), or tap Add game and pick the game's .exe")
-                .font(.subheadline)
-                .foregroundStyle(LauncherPalette.textSecondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-            if library.hiddenCount > 0 {
-                Button("Show \(library.hiddenCount) hidden game(s)") { library.unhideAll() }
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.bottom, 20)
-    }
-
-    // MARK: Rows
-
-    private func allGamesRow(width: CGFloat, isWide: Bool) -> some View {
-        CapsuleRow(title: "All games",
-                   games: library.games,
-                   rowWidth: width,
-                   isWide: isWide,
-                   selectedID: focus.selectedID,
-                   rowFocused: focus.area == .capsules,
-                   covers: covers.covers,
-                   states: covers.state,
-                   icons: library.icons,
-                   scrolledID: $allScrolledID,
-                   onScrolled: { id in focus.select(id: id) },
-                   onTap: { g in tapCapsule(g) },
-                   onLongPress: { g in longPress(g) })
-    }
-
-    private func recentRow(width: CGFloat, isWide: Bool) -> some View {
-        CapsuleRow(title: "Recently played",
-                   games: recents,
-                   rowWidth: width,
-                   isWide: isWide,
-                   selectedID: recentSelectedID,
-                   rowFocused: focus.area == .recent,
-                   covers: covers.covers,
-                   states: covers.state,
-                   icons: library.icons,
-                   scrolledID: $recentScrolledID,
-                   onScrolled: { id in focus.selectRecent(id: id) },
-                   onTap: { g in tapRecent(g) },
-                   onLongPress: { g in longPress(g) })
+        let focusedIndex: Int? = focus.area == .card ? focus.cardIndex : nil
+        let id: String = game.id
+        return GameCard(game: game,
+                        cover: covers.covers[id],
+                        icon: library.icons[id],
+                        loading: covers.state[id] == .loading,
+                        playState: playState,
+                        focusedIndex: focusedIndex,
+                        panelWidth: panelW,
+                        coverWidth: coverW,
+                        coverHeight: coverH,
+                        onPlay: { primaryAction(id: id) },
+                        onMore: {
+                            if let g = library.game(withID: id) { optionsGame = g }
+                        })
     }
 
     // MARK: Status line
@@ -724,9 +628,9 @@ struct LauncherView: View {
         switch session {
         case .idle:
             if let name = pad.controllerName {
-                return "\(name) · D-pad to browse, A to play, Y adds a game"
+                return "\(name) · D-pad to browse, A to select, B to go back, Y adds a game"
             }
-            return "Tap a game to play · connect a controller to browse"
+            return "Tap a game to open it · connect a controller to browse"
         case .enablingJIT:
             return "Enabling JIT… (StikDebug)"
         case .launching(let t):
@@ -749,179 +653,125 @@ struct LauncherView: View {
             .padding(.vertical, 8)
             .background(LauncherPalette.bgBottom.opacity(0.85))
     }
-
-    /// "Games\Hollow Knight" for a folder below drive_c.
-    private static func relativeFolder(_ url: URL) -> String {
-        let root = GameLibrary.driveC.standardizedFileURL.path + "/"
-        let p = url.standardizedFileURL.path
-        let rel = p.hasPrefix(root) ? String(p.dropFirst(root.count)) : p
-        return rel.replacingOccurrences(of: "/", with: "\\")
-    }
-}
-
-// MARK: - Backdrop
-
-private struct LauncherBackdrop: View {
-    let key: String
-    let image: UIImage?
-
-    var body: some View {
-        ZStack {
-            LinearGradient(colors: [LauncherPalette.bgTop, LauncherPalette.bgBottom],
-                           startPoint: .top, endPoint: .bottom)
-            if let image {
-                GeometryReader { g in
-                    Image(uiImage: image)
-                        .resizable()
-                        .interpolation(.low)
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: g.size.width, height: g.size.height)
-                        .clipped()
-                }
-                .id(key)
-                .transition(.opacity)
-            }
-            LinearGradient(stops: [
-                .init(color: Color.black.opacity(0.35), location: 0),
-                .init(color: LauncherPalette.bgBottom.opacity(0.92), location: 0.7),
-                .init(color: LauncherPalette.bgBottom, location: 1),
-            ], startPoint: .top, endPoint: .bottom)
-        }
-        .animation(.easeInOut(duration: 0.4), value: key)
-        .ignoresSafeArea()
-    }
 }
 
 // MARK: - Top bar pill
 
 private struct TopPill: View {
-    let title: String
     let systemImage: String
+    let label: String
     let focused: Bool
     let spinning: Bool
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: systemImage)
-                    .rotationEffect(.degrees(spinning ? 360 : 0))
-                    .animation(spinning ? .linear(duration: 0.9).repeatForever(autoreverses: false)
-                                        : .linear(duration: 0.2), value: spinning)
-                Text(title)
-            }
-            .font(.subheadline.weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .frame(height: 36)
-            .background(focused ? LauncherPalette.panelRaised : LauncherPalette.panel, in: Capsule())
-            .overlay(Capsule().stroke(focused ? LauncherPalette.accent : Color.white.opacity(0.08),
-                                      lineWidth: focused ? 3 : 1))
-            .shadow(color: focused ? LauncherPalette.accent.opacity(0.4) : Color.clear, radius: 8)
+            Image(systemName: systemImage)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white)
+                .rotationEffect(.degrees(spinning ? 360 : 0))
+                .animation(spinning ? .linear(duration: 0.9).repeatForever(autoreverses: false)
+                                    : .linear(duration: 0.2), value: spinning)
+                .frame(width: 42, height: 36)
+                .background(focused ? LauncherPalette.panelRaised : LauncherPalette.panel, in: Capsule())
+                .overlay(Capsule().stroke(focused ? LauncherPalette.accent : Color.white.opacity(0.08),
+                                          lineWidth: focused ? 3 : 1))
+                .shadow(color: focused ? LauncherPalette.accent.opacity(0.4) : Color.clear, radius: 8)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
         .animation(LauncherPalette.focusAnim, value: focused)
     }
 }
 
-// MARK: - Hero pieces
+// MARK: - Cover art
 
-private struct HeroButton: View {
-    enum Kind { case play, reopen, secondary }
-
-    let title: String
-    let systemImage: String
-    let kind: Kind
-    let focused: Bool
-    let disabled: Bool
-    let minWidth: CGFloat
-    let action: () -> Void
-
-    private var background: Color {
-        switch kind {
-        case .play: return focused ? LauncherPalette.playFocused : LauncherPalette.play
-        case .reopen: return LauncherPalette.accent
-        case .secondary: return focused ? LauncherPalette.panelRaised : LauncherPalette.panel
-        }
-    }
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: systemImage)
-                Text(title)
-            }
-            .font(.system(size: 17, weight: .bold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 18)
-            .frame(minWidth: minWidth, minHeight: 48)
-            .background(background, in: shape)
-            .overlay(shape.stroke(focused ? LauncherPalette.accent : Color.white.opacity(0.08),
-                                  lineWidth: focused ? 3 : 1))
-            .shadow(color: focused ? LauncherPalette.accent.opacity(0.45) : Color.clear, radius: 10)
-            .opacity(disabled ? 0.45 : 1)
-            .contentShape(shape)
-        }
-        .buttonStyle(.plain)
-        .disabled(disabled)
-        .animation(LauncherPalette.focusAnim, value: focused)
-    }
-}
-
-private struct HeroCover: View, Equatable {
+/// The cover image, or the generated placeholder (hue-hashed gradient, exe
+/// icon, title), with a shimmer while the cover is being resolved. Always
+/// 2.14:1; it takes the width it is offered (the grid cell or an explicit
+/// frame) and derives the height.
+private struct CoverArt: View, Equatable {
     let title: String
     let cover: UIImage?
     let icon: UIImage?
     let loading: Bool
-    let width: CGFloat
-    let height: CGFloat
+    let cornerRadius: CGFloat
+    /// Card size: bigger icon and headline in the placeholder.
+    let large: Bool
 
-    static func == (a: HeroCover, b: HeroCover) -> Bool {
+    static func == (a: CoverArt, b: CoverArt) -> Bool {
         a.title == b.title && a.cover === b.cover && a.icon === b.icon
-            && a.loading == b.loading && a.width == b.width && a.height == b.height
+            && a.loading == b.loading && a.cornerRadius == b.cornerRadius && a.large == b.large
     }
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
-        ZStack {
-            if let cover {
-                Image(uiImage: cover)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fill)
-            } else {
-                LauncherPalette.placeholderGradient(for: title)
-                VStack(spacing: 8) {
-                    if let icon {
-                        Image(uiImage: icon)
-                            .resizable()
-                            .interpolation(.high)
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 56, height: 56)
-                    } else {
-                        Image(systemName: "gamecontroller.fill")
-                            .font(.system(size: 40))
-                            .foregroundStyle(.white.opacity(0.6))
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        GeometryReader { g in
+            ZStack {
+                if let cover {
+                    Image(uiImage: cover)
+                        .resizable()
+                        .interpolation(large ? .high : .medium)
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    LauncherPalette.placeholderGradient(for: title)
+                    placeholder
+                }
+                if loading {
+                    TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { ctx in
+                        Shimmer(phase: Shimmer.phase(at: ctx.date))
                     }
-                    Text(title)
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 16)
                 }
             }
-            if loading {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { ctx in
-                    Shimmer(phase: Shimmer.phase(at: ctx.date))
-                }
-            }
+            .frame(width: g.size.width, height: g.size.height)
+            .clipShape(shape)
         }
-        .frame(width: width, height: height)
-        .clipShape(shape)
-        .overlay(shape.stroke(Color.white.opacity(0.1), lineWidth: 1))
-        .shadow(color: Color.black.opacity(0.45), radius: 16, y: 8)
+        .aspectRatio(LauncherPalette.coverAspect, contentMode: .fit)
+    }
+
+    @ViewBuilder
+    private var placeholder: some View {
+        if large {
+            VStack(spacing: 8) {
+                if let icon {
+                    Image(uiImage: icon)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 56, height: 56)
+                } else {
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
+            }
+        } else {
+            HStack(spacing: 8) {
+                if let icon {
+                    Image(uiImage: icon)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 30, height: 30)
+                } else {
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                Text(title)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+            .padding(.horizontal, 10)
+        }
     }
 }
 
@@ -946,169 +796,52 @@ private struct Shimmer: View {
     }
 }
 
-// MARK: - Capsule rows
+// MARK: - Grid tile
 
-private struct CapsuleRow: View {
-    let title: String
-    let games: [LauncherGame]
-    let rowWidth: CGFloat
-    let isWide: Bool
-    let selectedID: String?
-    let rowFocused: Bool
-    let covers: [String: UIImage]
-    let states: [String: CoverState]
-    let icons: [String: UIImage]
-    @Binding var scrolledID: String?
-    let onScrolled: (String) -> Void
-    let onTap: (LauncherGame) -> Void
-    let onLongPress: (LauncherGame) -> Void
-
-    private var capsuleSize: CGSize { isWide ? CGSize(width: 176, height: 82) : CGSize(width: 168, height: 78) }
-    private var rowHeight: CGFloat { isWide ? 104 : 100 }
-
-    private var anyLoading: Bool {
-        games.contains { states[$0.id] == .loading }
-    }
-
-    var body: some View {
-        let size: CGSize = capsuleSize
-        let margin: CGFloat = max(0, (rowWidth - size.width) / 2)
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.headline)
-                .foregroundStyle(.white.opacity(0.85))
-                .padding(.horizontal, 16)
-            ScrollView(.horizontal) {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !anyLoading)) { ctx in
-                    let phase: CGFloat = Shimmer.phase(at: ctx.date)
-                    HStack(spacing: 14) {
-                        ForEach(games) { game in
-                            let selected: Bool = selectedID == game.id
-                            let loading: Bool = states[game.id] == .loading
-                            GameCapsule(id: game.id,
-                                        title: game.title,
-                                        cover: covers[game.id],
-                                        icon: icons[game.id],
-                                        loading: loading,
-                                        shimmerPhase: loading ? phase : 0,
-                                        only32Bit: game.only32Bit,
-                                        selected: selected,
-                                        focused: selected && rowFocused,
-                                        size: size)
-                                .equatable()
-                                .onTapGesture { onTap(game) }
-                                .onLongPressGesture(minimumDuration: 0.5) { onLongPress(game) }
-                                .onAppear { SteamCovers.shared.ensureCover(for: game) }
-                                .id(game.id)
-                        }
-                    }
-                    .scrollTargetLayout()
-                }
-            }
-            .frame(height: rowHeight)
-            .scrollClipDisabled()
-            .contentMargins(.horizontal, margin, for: .scrollContent)
-            .scrollTargetBehavior(.viewAligned)
-            .scrollPosition(id: $scrolledID)
-            .scrollIndicators(.hidden)
-            .onChange(of: scrolledID) { _, id in
-                if let id, id != selectedID { onScrolled(id) }
-            }
-            .onChange(of: selectedID) { _, id in
-                if id != scrolledID {
-                    withAnimation(LauncherPalette.focusAnim) { scrolledID = id }
-                }
-            }
-            .onAppear {
-                DispatchQueue.main.async {
-                    if scrolledID != selectedID { scrolledID = selectedID }
-                }
-            }
-        }
-    }
-}
-
-/// One tile. Equatable on exactly what it draws so the row's TimelineView
-/// only re-renders the tiles whose shimmer phase moved.
-private struct GameCapsule: View, Equatable {
+/// One grid tile. Equatable on exactly what it draws so a cover arriving or
+/// the highlight moving only re-renders the tiles concerned.
+private struct GameTile: View, Equatable {
     let id: String
     let title: String
     let cover: UIImage?
     let icon: UIImage?
     let loading: Bool
-    let shimmerPhase: CGFloat
     let only32Bit: Bool
-    let selected: Bool
     let focused: Bool
-    let size: CGSize
 
-    static func == (a: GameCapsule, b: GameCapsule) -> Bool {
+    static func == (a: GameTile, b: GameTile) -> Bool {
         a.id == b.id && a.title == b.title && a.cover === b.cover && a.icon === b.icon
-            && a.loading == b.loading && a.shimmerPhase == b.shimmerPhase
-            && a.only32Bit == b.only32Bit && a.selected == b.selected && a.focused == b.focused
-            && a.size == b.size
+            && a.loading == b.loading && a.only32Bit == b.only32Bit && a.focused == b.focused
     }
 
-    /// 0 normal, 1 selected (row unfocused), 2 selected + focused.
-    private var level: Int { focused ? 2 : (selected ? 1 : 0) }
-
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
-        ZStack {
-            if let cover {
-                Image(uiImage: cover)
-                    .resizable()
-                    .interpolation(.medium)
-                    .aspectRatio(contentMode: .fill)
-            } else {
-                LauncherPalette.placeholderGradient(for: title)
-                HStack(spacing: 8) {
-                    if let icon {
-                        Image(uiImage: icon)
-                            .resizable()
-                            .interpolation(.high)
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 30, height: 30)
-                    } else {
-                        Image(systemName: "gamecontroller.fill")
-                            .font(.system(size: 22))
-                            .foregroundStyle(.white.opacity(0.6))
-                    }
-                    Text(title)
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                }
-                .padding(.horizontal, 10)
-            }
-            if loading {
-                Shimmer(phase: shimmerPhase)
-            }
-            if only32Bit {
-                VStack {
-                    Spacer()
-                    HStack {
+        VStack(alignment: .leading, spacing: 6) {
+            CoverArt(title: title, cover: cover, icon: icon, loading: loading,
+                     cornerRadius: 12, large: false)
+                .overlay(alignment: .bottomLeading) {
+                    if only32Bit {
                         Text("32-bit")
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(LauncherPalette.danger.opacity(0.9), in: Capsule())
                             .foregroundStyle(.white)
-                        Spacer()
+                            .padding(6)
                     }
                 }
-                .padding(6)
-            }
+                .overlay(ring)
+                .shadow(color: focused ? LauncherPalette.accent.opacity(0.55) : Color.clear, radius: 12)
+                .scaleEffect(focused ? 1.04 : 1.0)
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(focused ? Color.white : Color.white.opacity(0.85))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(width: size.width, height: size.height)
-        .clipShape(shape)
-        .overlay(ring)
-        .shadow(color: focused ? LauncherPalette.accent.opacity(0.55) : Color.clear, radius: 14)
-        .scaleEffect(focused ? 1.10 : (selected ? 1.06 : 1.0))
-        .zIndex(focused ? 2 : (selected ? 1 : 0))
-        .animation(LauncherPalette.focusAnim, value: level)
-        .contentShape(shape)
+        .zIndex(focused ? 1 : 0)
+        .animation(LauncherPalette.focusAnim, value: focused)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -1117,13 +850,146 @@ private struct GameCapsule: View, Equatable {
             RoundedRectangle(cornerRadius: 15, style: .continuous)
                 .stroke(LauncherPalette.accent, lineWidth: 3)
                 .padding(-3)
-        } else if selected {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.35), lineWidth: 2)
         } else {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.white.opacity(0.08), lineWidth: 1)
         }
+    }
+}
+
+// MARK: - Card
+
+/// The opened game: big cover, title, details, Play and "…".
+private struct GameCard: View {
+    let game: LauncherGame
+    let cover: UIImage?
+    let icon: UIImage?
+    let loading: Bool
+    let playState: CardPlayState
+    /// 0 = Play, 1 = More; nil while the card is not the focused area.
+    let focusedIndex: Int?
+    let panelWidth: CGFloat
+    let coverWidth: CGFloat
+    let coverHeight: CGFloat
+    let onPlay: () -> Void
+    let onMore: () -> Void
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
+        let coverShape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        VStack(alignment: .leading, spacing: 12) {
+            CoverArt(title: game.title, cover: cover, icon: icon, loading: loading,
+                     cornerRadius: 14, large: true)
+                .equatable()
+                .frame(width: coverWidth, height: coverHeight)
+                .overlay(coverShape.stroke(Color.white.opacity(0.1), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.45), radius: 16, y: 8)
+            Text(game.title)
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .minimumScaleFactor(0.7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            details
+            HStack(spacing: 12) {
+                CardPlayButton(state: playState, focused: focusedIndex == 0, action: onPlay)
+                CardMoreButton(focused: focusedIndex == 1, action: onMore)
+            }
+        }
+        .padding(16)
+        .frame(width: panelWidth)
+        .background(LauncherPalette.panelRaised, in: shape)
+        .overlay(shape.stroke(Color.white.opacity(0.1), lineWidth: 1))
+        .shadow(color: Color.black.opacity(0.5), radius: 24, y: 10)
+    }
+
+    private var details: some View {
+        var line: Text
+        if let exe = game.exe {
+            line = Text(exe.lastPathComponent).font(.system(.caption, design: .monospaced))
+        } else {
+            line = Text(relativeFolder(game.folder)).font(.system(.caption, design: .monospaced))
+        }
+        if let played = game.lastPlayed {
+            let rel = RelativeDateTimeFormatter().localizedString(for: played, relativeTo: Date())
+            line = line + Text("  ·  Last played \(rel)")
+        }
+        if game.only32Bit {
+            line = line + Text("  ·  ") + Text("32-bit — not supported").foregroundStyle(LauncherPalette.danger)
+        }
+        return line
+            .font(.caption)
+            .foregroundStyle(LauncherPalette.textSecondary)
+            .lineLimit(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct CardPlayButton: View {
+    let state: CardPlayState
+    let focused: Bool
+    let action: () -> Void
+
+    private var title: String {
+        state == .reopen ? "Reopen Madeira" : "Play"
+    }
+
+    private var symbol: String {
+        state == .reopen ? "arrow.counterclockwise" : "play.fill"
+    }
+
+    private var fill: Color {
+        switch state {
+        case .disabled: return LauncherPalette.panel
+        case .reopen: return LauncherPalette.accent
+        case .play: return focused ? LauncherPalette.playFocused : LauncherPalette.play
+        }
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        let disabled: Bool = state == .disabled
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                Text(title)
+            }
+            .font(.system(size: 17, weight: .bold))
+            .foregroundStyle(disabled ? Color.white.opacity(0.45) : Color.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 52)
+            .background(fill, in: shape)
+            .overlay(shape.stroke(focused ? LauncherPalette.accent : Color.white.opacity(0.08),
+                                  lineWidth: focused ? 3 : 1))
+            .shadow(color: focused ? LauncherPalette.accent.opacity(0.45) : Color.clear, radius: 10)
+            .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .animation(LauncherPalette.focusAnim, value: focused)
+    }
+}
+
+private struct CardMoreButton: View {
+    let focused: Bool
+    let action: () -> Void
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        Button(action: action) {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 52, height: 52)
+                .background(focused ? LauncherPalette.panelRaised : LauncherPalette.panel, in: shape)
+                .overlay(shape.stroke(focused ? LauncherPalette.accent : Color.white.opacity(0.12),
+                                      lineWidth: focused ? 3 : 1))
+                .shadow(color: focused ? LauncherPalette.accent.opacity(0.45) : Color.clear, radius: 10)
+                .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("More")
+        .animation(LauncherPalette.focusAnim, value: focused)
     }
 }
 

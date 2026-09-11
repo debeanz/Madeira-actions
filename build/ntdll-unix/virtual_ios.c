@@ -14164,9 +14164,21 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             if (bigres_n <= 4 || (bigres_n >= 18 && bigres_n <= 30))
             {
                 uint64_t *sp = (uint64_t *)__builtin_frame_address(0);
+                /* ml793: this walk read 8 KB above the frame unconditionally. When
+                 * the frame sits within 8 KB of the thread's stack TOP the read
+                 * leaves the stack mapping — a host SEGV inside
+                 * NtAllocateVirtualMemoryEx itself. Hollow Knight on 0.1.39 hit it
+                 * on the game's first 256 MB reserve (fault at exactly stack_top,
+                 * "[mach_exc] sym pc=...NtAllocateVirtualMemoryEx+..."), the
+                 * syscall was abandoned, and the game stored through the NULL it
+                 * got back (c0000005 at UnityPlayer+0x2af75e); the next launch
+                 * placed the frame lower and worked. Stop at the pthread stack
+                 * top; every thread here is a pthread, custom stacks included. */
+                uint64_t *sp_top = (uint64_t *)pthread_get_stackaddr_np( pthread_self() );
                 int w, hits = 0;
                 for (w = 0; w < 1024 && hits < 20; w++)
                 {
+                    if (sp_top && &sp[w + 1] > sp_top) break;
                     uint64_t mod = 0, va = ios_jit_reverse_translate( sp[w], &mod );
                     if (va && mod && va != sp[w])
                     {
@@ -15417,9 +15429,21 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             if (bigres_n <= 4 || (bigres_n >= 18 && bigres_n <= 30))
             {
                 uint64_t *sp = (uint64_t *)__builtin_frame_address(0);
+                /* ml793: this walk read 8 KB above the frame unconditionally. When
+                 * the frame sits within 8 KB of the thread's stack TOP the read
+                 * leaves the stack mapping — a host SEGV inside
+                 * NtAllocateVirtualMemoryEx itself. Hollow Knight on 0.1.39 hit it
+                 * on the game's first 256 MB reserve (fault at exactly stack_top,
+                 * "[mach_exc] sym pc=...NtAllocateVirtualMemoryEx+..."), the
+                 * syscall was abandoned, and the game stored through the NULL it
+                 * got back (c0000005 at UnityPlayer+0x2af75e); the next launch
+                 * placed the frame lower and worked. Stop at the pthread stack
+                 * top; every thread here is a pthread, custom stacks included. */
+                uint64_t *sp_top = (uint64_t *)pthread_get_stackaddr_np( pthread_self() );
                 int w, hits = 0;
                 for (w = 0; w < 1024 && hits < 20; w++)
                 {
+                    if (sp_top && &sp[w + 1] > sp_top) break;
                     uint64_t mod = 0, va = ios_jit_reverse_translate( sp[w], &mod );
                     if (va && mod && va != sp[w])
                     {

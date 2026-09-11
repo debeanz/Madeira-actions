@@ -176,8 +176,19 @@ final class MetalBackedView: UIView {
     /// not our full bounds — otherwise landscape stretches the game to the
     /// display edges (2026-07-05). Touch mapping uses the same rect so
     /// letterboxing never skews input.
+    /// ml793: the logical screen is whatever MADEIRA_SCREEN_W/H say (the
+    /// Settings resolution, applied to direct game launches as well as the
+    /// desktop); 1024x768 only when the env is unset.
+    static func logicalScreen() -> (CGFloat, CGFloat) {
+        func env(_ name: String, _ def: CGFloat) -> CGFloat {
+            guard let v = getenv(name), let i = Int(String(cString: v)), i > 0 else { return def }
+            return CGFloat(i)
+        }
+        return (env("MADEIRA_SCREEN_W", 1024), env("MADEIRA_SCREEN_H", 768))
+    }
+
     private func gameRect() -> CGRect {
-        let gw: CGFloat = 1024, gh: CGFloat = 768
+        let (gw, gh) = Self.logicalScreen()
         let scale = min(bounds.width / gw, bounds.height / gh)
         let w = gw * scale, h = gh * scale
         return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2,
@@ -233,8 +244,9 @@ final class MetalBackedView: UIView {
     private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
         let p = touch.location(in: self)
         let r = gameRect()
-        let x = Int32(min(max((p.x - r.minX) * 1024 / r.width, 0), 1023))
-        let y = Int32(min(max((p.y - r.minY) * 768 / r.height, 0), 767))
+        let (gw, gh) = Self.logicalScreen()
+        let x = Int32(min(max((p.x - r.minX) * gw / r.width, 0), gw - 1))
+        let y = Int32(min(max((p.y - r.minY) * gh / r.height, 0), gh - 1))
         return (x, y)
     }
 
@@ -1203,8 +1215,15 @@ struct ContentView: View {
             setenv("MADEIRA_EXE", game.exeWindowsPath, 1)
             unsetenv("MADEIRA_ARGS")
             unsetenv("MADEIRA_DESKTOP")
-            unsetenv("MADEIRA_SCREEN_W")
-            unsetenv("MADEIRA_SCREEN_H")
+            // ml793: the Settings resolution is the game's screen too —
+            // win32u reports it as SM_CXSCREEN and the mode list, so the
+            // game defaults to it instead of the legacy 1024x768, and the
+            // Metal host / touch mapping follow the same aspect
+            // (MetalBackedView.logicalScreen).
+            let (screenW, screenH) = desktopSize
+            setenv("MADEIRA_SCREEN_W", String(screenW), 1)
+            setenv("MADEIRA_SCREEN_H", String(screenH), 1)
+            logStore.log("Games: screen \(screenW)x\(screenH) (Settings → Virtual Desktop resolution)")
             desktopFullScreen = true
             runWineFullSequence()
             watchDirectGame(game.title)
@@ -1641,13 +1660,13 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Virtual Desktop") {
-                    Picker("Desktop resolution", selection: $desktopResolution) {
+                Section("Screen") {
+                    Picker("Resolution", selection: $desktopResolution) {
                         ForEach(Self.desktopResolutions, id: \.self) { r in
                             Text(r).tag(r)
                         }
                     }
-                    Text("Screen size for the Wine Virtual Desktop launcher, and the largest resolution games can pick in their own settings. Bigger desktops look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch.")
+                    Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
