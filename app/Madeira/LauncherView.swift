@@ -428,23 +428,30 @@ struct LauncherView: View {
         }
     }
 
+    /// OptionsSheet has its own initializer, so onForceClose is set after
+    /// construction (0.1.48: "extra argument 'onForceClose' in call").
+    private func optionsSheet(for game: LauncherGame) -> some View {
+        var s = OptionsSheet(game: game,
+                             session: session,
+                             onPlay: { g in play(g) },
+                             onRename: { g in
+                                 afterDismiss {
+                                     renameText = g.title
+                                     renameGame = g
+                                 }
+                             },
+                             onChangeCover: { g in
+                                 afterDismiss { coverSearchGame = g }
+                             },
+                             dismiss: { optionsGame = nil })
+        s.onForceClose = onForceClose
+        return s
+    }
+
     var body: some View {
         core
         .sheet(item: $optionsGame) { game in
-            OptionsSheet(game: game,
-                         session: session,
-                         onForceClose: onForceClose,
-                         onPlay: { g in play(g) },
-                         onRename: { g in
-                             afterDismiss {
-                                 renameText = g.title
-                                 renameGame = g
-                             }
-                         },
-                         onChangeCover: { g in
-                             afterDismiss { coverSearchGame = g }
-                         },
-                         dismiss: { optionsGame = nil })
+            optionsSheet(for: game)
                 .presentationDetents([.medium])
                 .presentationDragIndicator(.visible)
         }
