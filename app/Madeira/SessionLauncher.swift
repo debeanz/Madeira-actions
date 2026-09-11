@@ -43,6 +43,31 @@ final class SessionLauncher {
         try? FileManager.default.removeItem(at: readyURL)
         try? FileManager.default.removeItem(at: requestURL)
         try? FileManager.default.removeItem(at: resultURL)
+        try? FileManager.default.removeItem(at: exitURL)
+    }
+
+    /// ml797: the agent appends "pid=N code=C" to C:\madeira\exit.txt when a
+    /// program it started ends. Polls until that pid shows up; completion on
+    /// main with the exit code.
+    private var exitURL: URL { agentDir.appendingPathComponent("exit.txt") }
+
+    func waitForExit(pid: Int, completion: @escaping (Int) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            let needle = "pid=\(pid) "
+            while true {
+                if let s = try? String(contentsOf: self.exitURL, encoding: .utf8),
+                   let r = s.range(of: needle) {
+                    let rest = s[r.upperBound...]
+                    var code = 0
+                    if let c = rest.range(of: "code=") {
+                        code = Int(rest[c.upperBound...].prefix { $0.isNumber || $0 == "-" }) ?? 0
+                    }
+                    DispatchQueue.main.async { completion(code) }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 1.0)
+            }
+        }
     }
 
     func launch(exe: String, dir: String, args: String = "", readyTimeout: TimeInterval = 120,

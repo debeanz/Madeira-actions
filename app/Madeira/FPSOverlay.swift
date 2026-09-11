@@ -61,7 +61,7 @@ struct FPSOverlay: View {
                 EmptyView()
             } else if collapsed {
                 Circle()
-                    .fill(Color.black.opacity(0.3))
+                    .fill(Color(red: 0.12, green: 0.15, blue: 0.20).opacity(0.92))
                     .frame(width: 12, height: 12)
                     .contentShape(Circle().scale(2.5))
                     .onTapGesture { collapsed = false }
@@ -76,7 +76,7 @@ struct FPSOverlay: View {
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
-                .background(Color.black.opacity(0.55))
+                .background(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.92))
                 .cornerRadius(6)
                 .onTapGesture { collapsed = true }
             } else {
@@ -106,7 +106,7 @@ struct FPSOverlay: View {
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(Color.black.opacity(0.55))
+                .background(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.92))
                 .cornerRadius(6)
                 .onTapGesture { collapsed = true }
             }

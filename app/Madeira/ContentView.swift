@@ -951,6 +951,7 @@ struct ContentView: View {
     /// ml796: the game behind the loading screen, and whether it has drawn.
     @State private var launchingGame: LauncherGame? = nil
     @State private var firstFrameSeen = false
+    @State private var launchBarPhase = false
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
     @State private var showRelaunchAlert = false
@@ -1100,7 +1101,7 @@ struct ContentView: View {
     /// The games' Metal host and the desktop compositor are visible only on
     /// the Desktop tab, and not while the desktop is shut down (ml790).
     private func applySurfaceVisibility(tab: MadeiraTab) {
-        let hidden = tab != .desktop || desktopShutDown
+        let hidden = tab != .desktop || desktopShutDown || showLaunchOverlay
         MetalHostView.shared.isHidden = hidden
         winios_set_compositor_hidden(hidden ? 1 : 0)
     }
@@ -1121,6 +1122,105 @@ struct ContentView: View {
     /// ml791: the Games tab. A console-style grid of the game folders on
     /// C:, playable by tap or controller (LauncherView).
     private var launcherScreen: some View {
+        LauncherView(session: launcherSession, onPlay: playGameHosted, onOpenDesktop: openDesktopFromGames, onQuitApp: quitApp)
+    }
+
+    /// ml797: Play from the Games tab runs the game INSIDE a hidden desktop
+    /// session, so it can be played again after quitting: the runtime is
+    /// one-shot, and a game launched as the root process could never be
+    /// followed by another (that is what "Reopen Madeira" was). The desktop
+    /// stays underneath, covered by the game; the loading screen covers the
+    /// start; the agent reports the game's exit so Play comes back.
+    private func playGameHosted(_ game: LauncherGame) {
+        guard let exe = game.exe else {
+            logStore.log("\(game.title): only 32-bit executables found — not supported on this port", level: .error)
+            return
+        }
+        switch launcherSession {
+        case .enablingJIT, .launching:
+            return
+        case .playing:
+            selectedTab = .desktop
+            desktopFullScreen = true
+            return
+        default:
+            break
+        }
+        if wineserver_is_running() == 0 && wine_process_exit_code() != -1 {
+            showRelaunchAlert = true      // the runtime already ran and died
+            return
+        }
+        let exePath = GameLibrary.windowsPath(exe)
+        launchingGame = game
+        firstFrameSeen = false
+        launcherSession = .launching(game.title)
+        let startInSession: () -> Void = {
+            logStore.log("Games: launching \(game.title) → \(exePath)")
+            SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath) { outcome in
+                switch outcome {
+                case .started(let pid):
+                    logStore.log("\(game.title) started (pid \(pid))", level: .success)
+                    GameLibrary.shared.markPlayed(game)
+                    launcherSession = .playing(game.title)
+                    watchHostedGame(pid: pid, title: game.title)
+                    return
+                case .failed(let code):
+                    logStore.log("\(game.title) failed to start: Windows error \(code)", level: .error)
+                case .agentNotReady:
+                    logStore.log("\(game.title): the desktop did not become ready in time", level: .error)
+                case .noAnswer:
+                    logStore.log("\(game.title): no answer from the desktop agent (C:\\madeira\\agent.log)", level: .error)
+                }
+                launcherSession = .idle
+                launchingGame = nil
+                desktopFullScreen = false
+                selectedTab = .games
+            }
+        }
+        if wineserver_is_running() != 0 {
+            if desktopShutDown { resumeDesktop() }
+            selectedTab = .desktop
+            desktopFullScreen = true
+            startInSession()
+        } else {
+            ensureJIT { ok in
+                guard ok else { launcherSession = .idle; launchingGame = nil; return }
+                launcherSession = .launching(game.title)
+                SessionLauncher.shared.clearReady()
+                desktopFullScreen = true
+                // Let the loading screen paint before the JIT pool freeze.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    launchVirtualDesktop()
+                    startInSession()
+                }
+            }
+        }
+    }
+
+    /// Loading screen until the game has presented, then wait for the
+    /// agent's exit report so Play returns.
+    private func watchHostedGame(pid: Int, title: String) {
+        DispatchQueue.global(qos: .utility).async {
+            let presents0 = madeira_get_present_count()
+            var waited = 0.0
+            while madeira_get_present_count() < presents0 + 2 && waited < 120 {
+                Thread.sleep(forTimeInterval: 0.25)
+                waited += 0.25
+            }
+            DispatchQueue.main.async { self.firstFrameSeen = true }
+        }
+        SessionLauncher.shared.waitForExit(pid: pid) { code in
+            logStore.log("\(title) ended (exit code \(code))")
+            if case .playing = launcherSession {
+                launcherSession = .idle
+                launchingGame = nil
+                desktopFullScreen = false
+                selectedTab = .games
+            }
+        }
+    }
+
+    private var launcherScreenUnused: some View {
         LauncherView(session: launcherSession,
                      onPlay: playGame,
                      onOpenDesktop: openDesktopFromGames,
@@ -1540,34 +1640,62 @@ struct ContentView: View {
         ZStack {
             LinearGradient(colors: [Color(red: 0.06, green: 0.07, blue: 0.11), Color(red: 0.02, green: 0.02, blue: 0.04)],
                            startPoint: .top, endPoint: .bottom)
-            VStack(spacing: 18) {
-                if let g = launchingGame, let cover = SteamCovers.shared.covers[g.id] {
-                    Image(uiImage: cover)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 320, height: 150)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .shadow(color: .black.opacity(0.6), radius: 20)
+            VStack(spacing: 22) {
+                // GameHub-style: system ⇄ game icon.
+                HStack(spacing: 28) {
+                    Image(systemName: "desktopcomputer")
+                        .font(.system(size: 52, weight: .regular))
+                        .foregroundStyle(.white)
+                        .shadow(color: .white.opacity(0.35), radius: 16)
+                    Image(systemName: "arrow.left.arrow.right")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                    if let g = launchingGame, let icon = GameLibrary.shared.icons[g.id] {
+                        Image(uiImage: icon)
+                            .resizable()
+                            .interpolation(.high)
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 84, height: 84)
+                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .shadow(color: .black.opacity(0.5), radius: 12)
+                    } else {
+                        Image(systemName: "gamecontroller.fill")
+                            .font(.system(size: 52))
+                            .foregroundStyle(.white)
+                    }
                 }
                 Text(launchingGame?.title ?? "")
                     .font(.system(size: 24, weight: .bold))
                     .foregroundStyle(.white)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
-                ProgressView()
-                    .tint(.white)
-                    .scaleEffect(1.3)
-                Text({
-                    switch launcherSession {
-                    case .enablingJIT: return "Enabling JIT…"
-                    case .launching: return "Starting…"
-                    default: return "Loading…"
+                Text(launchStatusText)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.12))
+                    Capsule().fill(Color(red: 0.10, green: 0.62, blue: 1.0))
+                        .frame(width: 110)
+                        .offset(x: launchBarPhase ? 150 : 0)
+                }
+                .frame(width: 260, height: 6)
+                .clipShape(Capsule())
+                .onAppear {
+                    launchBarPhase = false
+                    withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                        launchBarPhase = true
                     }
-                }())
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.7))
+                }
             }
             .padding(32)
+        }
+    }
+
+    private var launchStatusText: String {
+        switch launcherSession {
+        case .enablingJIT: return "Enabling JIT…"
+        case .launching: return "Launching game…"
+        default: return "Loading…"
         }
     }
 
@@ -1593,9 +1721,16 @@ struct ContentView: View {
         .ignoresSafeArea()
         .statusBarHidden(true)
         .perfMonitored()
+        // ml797: the Metal host and the compositor are window-level views
+        // ABOVE this SwiftUI tree, so they must stay hidden while the
+        // loading screen is up or it is covered by a black surface.
+        .onChange(of: showLaunchOverlay) { _, show in
+            MetalHostView.shared.isHidden = show
+            winios_set_compositor_hidden(show ? 1 : 0)
+        }
         .onAppear {
-            MetalHostView.shared.isHidden = false
-            winios_set_compositor_hidden(0)
+            MetalHostView.shared.isHidden = showLaunchOverlay
+            winios_set_compositor_hidden(showLaunchOverlay ? 1 : 0)
             touchControls.fullScreen = true
             if touchControls.visible { touchControls.ensureDefaultLayout() }
             TouchControlsHost.attach()

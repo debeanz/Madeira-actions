@@ -274,7 +274,7 @@ private func relativeFolder(_ url: URL) -> String {
 }
 
 /// What the card's primary button does.
-private enum CardPlayState { case play, reopen, disabled }
+private enum CardPlayState { case play, resume, reopen, disabled }
 
 // MARK: - Launcher
 
@@ -466,6 +466,11 @@ struct LauncherView: View {
             onQuitApp()
             return
         }
+        // Resume: the game is running, ContentView just re-enters full screen.
+        if case .playing = session, let g = library.game(withID: id) {
+            onPlay(g)
+            return
+        }
         if let g = library.game(withID: id) { play(g) }
     }
 
@@ -653,8 +658,12 @@ struct LauncherView: View {
         let coverW: CGFloat = panelW - 32
         let coverH: CGFloat = coverW / LauncherPalette.coverAspect
         let playState: CardPlayState
+        var isRunningThisGame = false
+        if case .playing = session { isRunningThisGame = true }
         if isEnded {
             playState = .reopen
+        } else if isRunningThisGame {
+            playState = .resume
         } else if game.only32Bit || game.exe == nil || sessionBusy {
             playState = .disabled
         } else {
@@ -986,7 +995,11 @@ private struct CardPlayButton: View {
     let action: () -> Void
 
     private var title: String {
-        state == .reopen ? "Reopen Madeira" : "Play"
+        switch state {
+        case .reopen: return "Reopen Madeira"
+        case .resume: return "Resume"
+        default: return "Play"
+        }
     }
 
     private var symbol: String {
@@ -996,6 +1009,7 @@ private struct CardPlayButton: View {
     private var fill: Color {
         switch state {
         case .disabled: return LauncherPalette.panel
+        case .resume: return LauncherPalette.accent
         case .reopen: return LauncherPalette.accent
         case .play: return focused ? LauncherPalette.playFocused : LauncherPalette.play
         }

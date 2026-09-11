@@ -44,6 +44,44 @@
 #define RESULT_PATH  L"C:\\madeira\\launch.result"
 #define READY_PATH   L"C:\\madeira\\agent.ready"
 #define LOG_PATH     L"C:\\madeira\\agent.log"
+#define EXIT_PATH    L"C:\\madeira\\exit.txt"
+
+/* ml797: programs we started, so their exit can be reported (the app's
+ * Games tab turns "Resume" back into "Play"). */
+static HANDLE g_child_handle[32];
+static DWORD  g_child_pid[32];
+static int    g_child_n;
+
+static void append_text_file( const WCHAR *path, const char *text )
+{
+    HANDLE h = CreateFileW( path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
+    DWORD written;
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile( h, text, (DWORD)strlen( text ), &written, NULL );
+    CloseHandle( h );
+}
+
+static void reap_children( void )
+{
+    int i = 0;
+    while (i < g_child_n)
+    {
+        if (WaitForSingleObject( g_child_handle[i], 0 ) == WAIT_OBJECT_0)
+        {
+            DWORD code = 0;
+            char line[96];
+            GetExitCodeProcess( g_child_handle[i], &code );
+            CloseHandle( g_child_handle[i] );
+            snprintf( line, sizeof(line), "pid=%lu code=%ld\r\n", (unsigned long)g_child_pid[i], (long)(int)code );
+            append_text_file( EXIT_PATH, line );
+            g_child_n--;
+            g_child_handle[i] = g_child_handle[g_child_n];
+            g_child_pid[i] = g_child_pid[g_child_n];
+            continue;
+        }
+        i++;
+    }
+}
 
 static void agent_log( const char *fmt, ... )
 {
@@ -150,7 +188,13 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
     {
         pid = pi.dwProcessId;
         CloseHandle( pi.hThread );
-        CloseHandle( pi.hProcess );
+        if (g_child_n < 32)
+        {
+            g_child_handle[g_child_n] = pi.hProcess;
+            g_child_pid[g_child_n] = pi.dwProcessId;
+            g_child_n++;
+        }
+        else CloseHandle( pi.hProcess );
     }
     HeapFree( GetProcessHeap(), 0, cmdline );
     return pid;
@@ -224,10 +268,12 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
     snprintf( ready, sizeof(ready), "pid=%lu\r\n", (unsigned long)GetCurrentProcessId() );
     write_text_file( READY_PATH, ready );
 
+    DeleteFileW( EXIT_PATH );
     for (;;)
     {
         Sleep( 200 );
         if (GetFileAttributesW( REQUEST_PATH ) != INVALID_FILE_ATTRIBUTES) handle_request();
+        if (g_child_n) reap_children();
     }
     return 0;
 }
