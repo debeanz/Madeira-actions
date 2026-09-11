@@ -54,6 +54,8 @@ static DWORD  g_child_pid[32];
 static DWORD  g_child_kill_at[32];   /* ml799: tick when a hard kill is due, 0 = none */
 static int    g_child_n;
 
+static void agent_log( const char *fmt, ... );   /* defined below; reap_children logs */
+
 /* ml799: a violent TerminateProcess from outside wedges the desktop on
  * this port (the victim's threads never get the signal and keep their
  * locks), so "force close" first asks every window of the process to
