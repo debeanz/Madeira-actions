@@ -476,6 +476,17 @@ final class MetalBackedView: UIView {
     /// mapped through the Metal host's frame, which is already the aspect-fit
     /// game rect in window coordinates.
     private func moveGameCursorOverlay(fracX: CGFloat, fracY: CGFloat) {
+        // ml817: the window level above cannot help against the loading and
+        // "Closing game…" panels — those are main-window SwiftUI, so the
+        // pointer is above them at ANY level that clears the game surface.
+        // The app already hides the pointer when a panel goes up, but
+        // GameCursorHost.move() sets appVisible back to true unconditionally
+        // (that is how the FIRST glide reveals it), so one glide put the arrow
+        // straight back on top of the panel. Since ml816 raises a panel MID-GAME
+        // while a finger is still on the glass, that is now easy to hit.
+        // The Metal host is hidden exactly when a panel is up, so gate on it:
+        // no game surface on screen, no pointer on screen.
+        guard !MetalHostView.shared.isHidden else { return }
         let r = MetalHostView.shared.frame
         guard r.width > 1, r.height > 1 else { return }
         // ml807: the real wine cursor is sized in wine pixels, so tell the
@@ -740,9 +751,28 @@ enum GameCursorHost {
                         ?? scenes.first else { return }
         if overlay == nil {
             let w = PassthroughWindow(windowScene: scene)
-            // Above the touch controls (+101) and the pad (+100): a pointer
-            // belongs on top of everything, like a real cursor.
-            w.windowLevel = .normal + 102
+            // ml817: BELOW the app's own chrome, not above it.
+            //
+            // This was +102, above the touch controls (+101) and the pad
+            // (+100), on the reasoning that "a pointer belongs on top of
+            // everything, like a real cursor". That is wrong here: the toolbar
+            // and the performance readout are the APP's UI, not the game's, and
+            // a Windows cursor sliding over them reads as a glitch.
+            //
+            // +99 is all the compositing order actually requires. The game
+            // surface (MetalHostView) is a subview of the MAIN window at
+            // .normal, so any level above .normal clears its CAMetalLayer.
+            // Nothing in the app reads windowLevel, so this changes paint order
+            // and nothing else. Input is unaffected at any level: this window
+            // hitTests to nil unconditionally.
+            //
+            // ml810 does not regress. MadeiraAppDelegate returns orientationLock
+            // for EVERY window and prefersHomeIndicatorAutoHidden: false is the
+            // UIViewController default, so it makes no difference whether the
+            // topmost window is this one or ControlsWindow — and ControlsWindow
+            // is already topmost whenever the pointer is hidden, which is most
+            // of the time, including the moment onDisappear asks for portrait.
+            w.windowLevel = .normal + 99
             w.backgroundColor = .clear
             // ml810: created HIDDEN. refreshHidden() is the only thing that
             // shows it, so an overlay window never sits on top of the app
