@@ -22,8 +22,10 @@ mkdir -p "$OUT"
 echo "=== madeira-agent.exe ==="
 # -municode: wWinMain entry; -mwindows: GUI subsystem, so Wine never gives
 # it a console window.
+# -ladvapi32: ml813 uses the SCM (OpenSCManagerW/StartServiceW) to wait for
+# services.exe and RPCSS before declaring the session ready.
 "$CC" -O2 -Wall -municode -mwindows -s \
-    -o "$OUT/madeira-agent.exe" "$DIR/madeira-agent.c"
+    -o "$OUT/madeira-agent.exe" "$DIR/madeira-agent.c" -ladvapi32
 "$TC/llvm-readobj" --file-headers "$OUT/madeira-agent.exe" | grep -E "Machine|Subsystem|Characteristics" | head -4
 "$TC/llvm-readobj" --coff-imports "$OUT/madeira-agent.exe" | grep -E "^\s*Name:" | sort -u
 ls -l "$OUT/madeira-agent.exe"

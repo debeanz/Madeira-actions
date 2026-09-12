@@ -343,6 +343,68 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
         else agent_log( "failed to start %ls: %lu", cmdline, (unsigned long)GetLastError() );
     }
 
+    /* ml813: WAIT FOR THE SESSION TO BE USABLE before declaring readiness.
+     *
+     * agent.ready used to be written the instant CreateProcessW returned, which
+     * only means services.exe EXISTS. SessionLauncher's own comment says this
+     * file means "services.exe is up" — it did not. In the 0.1.66 log the game
+     * was spawned 227 ms after services.exe ([phase] spawn services t+9.312s,
+     * spawn Untitled.exe t+9.539s) and RPCSS only came up at t+12.205s, 2.7 s
+     * INTO the game's own startup, demand-started by the game itself AFTER its
+     * first COM call had already failed. The wreckage is all over that log:
+     * CLSID_WbemLocator dead, \??\pipe\wine_plugplay NOT FOUND,
+     * device_notify_proc "failed to open RPC handle, error 1722",
+     * \??\pipe\lrpc\irpcss NOT FOUND.
+     *
+     * A DESKTOP session never had this problem: explorer boots the shell and
+     * does its own COM registration over several seconds, so RPCSS is long up
+     * before the user gets round to pressing Play. That is the real difference
+     * behind "Untitled Goose Game works from the desktop but not from the Games
+     * tab" — it dies on a virtual call through a NULL back-pointer in a Unity
+     * singleton whose COM-dependent subsystem never finished initialising.
+     *
+     * So do explicitly, and quickly, what explorer did incidentally and slowly.
+     * Hard caps throughout: readiness is ALWAYS declared, so a stuck service can
+     * never wedge SessionLauncher's wait. */
+    {
+        DWORD t0 = GetTickCount();
+        SC_HANDLE scm;
+
+        /* 1. services.exe publishes \\.\pipe\svcctl when its RPC_Init is done. */
+        while ((DWORD)(GetTickCount() - t0) < 5000)
+        {
+            if (WaitNamedPipeW( L"\\\\.\\pipe\\svcctl", 50 )) break;
+            Sleep( 50 );
+        }
+        agent_log( "SCM pipe available after %lu ms", (unsigned long)(GetTickCount() - t0) );
+
+        /* 2. Demand-start RPCSS ourselves rather than leaving the first game to
+         *    trip over it mid-init. */
+        scm = OpenSCManagerW( NULL, NULL, SC_MANAGER_CONNECT );
+        if (scm)
+        {
+            SC_HANDLE svc = OpenServiceW( scm, L"RpcSs", SERVICE_START | SERVICE_QUERY_STATUS );
+            if (svc)
+            {
+                SERVICE_STATUS st;
+                memset( &st, 0, sizeof(st) );
+                StartServiceW( svc, 0, NULL );     /* already-running is fine */
+                while ((DWORD)(GetTickCount() - t0) < 8000)
+                {
+                    if (QueryServiceStatus( svc, &st ) && st.dwCurrentState == SERVICE_RUNNING) break;
+                    Sleep( 50 );
+                }
+                agent_log( "RpcSs state=%lu after %lu ms total",
+                           (unsigned long)st.dwCurrentState,
+                           (unsigned long)(GetTickCount() - t0) );
+                CloseServiceHandle( svc );
+            }
+            else agent_log( "OpenServiceW(RpcSs) failed: %lu", (unsigned long)GetLastError() );
+            CloseServiceHandle( scm );
+        }
+        else agent_log( "OpenSCManagerW failed: %lu", (unsigned long)GetLastError() );
+    }
+
     snprintf( ready, sizeof(ready), "pid=%lu\r\n", (unsigned long)GetCurrentProcessId() );
     write_text_file( READY_PATH, ready );
 
