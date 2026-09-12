@@ -2235,7 +2235,11 @@ struct ContentView: View {
         // ml816: the same panel covers the CLOSING wait. Without it the user
         // stares at the game's frozen last frame with nothing to say the app
         // noticed — which is why 20 s felt like a hang rather than a wait.
-        if closingGame { return true }
+        // Tied to `.playing` on purpose: every path that clears the flag is an
+        // async main-thread hop, so a lost race would otherwise strand the user
+        // on a "Closing game…" panel with no way out. Leaving `.playing` kills
+        // the panel whether or not the flag was cleared.
+        if closingGame, case .playing = launcherSession { return true }
         guard launchingGame != nil, !firstFrameSeen else { return false }
         switch launcherSession {
         case .enablingJIT, .launching, .playing: return true
