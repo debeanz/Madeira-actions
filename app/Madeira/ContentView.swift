@@ -1215,6 +1215,15 @@ struct ContentView: View {
     /// wait visibly progresses instead of looking hung.
     @State private var launchElapsed = 0
     @State private var playingPid: Int = 0
+    /// ml812: a game in this session ended ABNORMALLY (crashed). A crash does
+    /// not unwind the game's other threads on this port — the wineserver marks
+    /// them dead but they get no signal (ml788) — so one can die still holding a
+    /// critical section in a DLL shared across pseudo-processes. The next game
+    /// then blocks on it forever: "RtlpWaitForCriticalSection ... blocked by
+    /// 012c" with the launch never completing. We cannot unwind that safely, so
+    /// at least say so instead of letting every later Play fail silently.
+    @State private var sessionCrashed = false
+    @State private var showSessionCrashedAlert = false
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
     @State private var showRelaunchAlert = false
@@ -1321,6 +1330,14 @@ struct ContentView: View {
         } message: {
             Text("A game already ran in this session and the Wine runtime can only be started once per launch. Quit and reopen Madeira, then pick the next game.")
         }
+        .alert("Reopen Madeira to keep playing", isPresented: $showSessionCrashedAlert) {
+            Button("Quit Madeira", role: .destructive) { quitApp() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A game crashed earlier in this session. On this port a crash leaves its other "
+                 + "threads running, and they can hold a lock that stops any further game from "
+                 + "starting. Quit and reopen Madeira to clear it.")
+        }
         .alert("Desktop unavailable in this run", isPresented: $showDesktopUnavailableAlert) {
             Button("Quit Madeira", role: .destructive) { quitApp() }
             Button("Cancel", role: .cancel) {}
@@ -1352,7 +1369,15 @@ struct ContentView: View {
         .onChange(of: desktopShutDown) { _, _ in
             applySurfaceVisibility(tab: selectedTab)
         }
-        .onChange(of: desktopFullScreen) { _, _ in
+        .onChange(of: desktopFullScreen) { _, full in
+            // ml812: the pointer belongs to full screen. Driving this from the
+            // STATE rather than from fullScreenDesktop.onDisappear is what makes
+            // it reliable: the arrow was left frozen over the Games grid because
+            // appVisible stayed true from the user's first glide, and the
+            // attach() that requestOrientation performs on the way out then
+            // re-showed the window (log: two "[cursor] ml806 attach" lines after
+            // the game had already ended).
+            if !full { GameCursorHost.setHidden(true) }
             // ml806: leaving full screen MUST re-apply surface visibility. A
             // game session never changes selectedTab (it stays on .games, see
             // playGameHosted), so the .onChange(of: selectedTab) above never
@@ -1492,6 +1517,12 @@ struct ContentView: View {
                 case .noAnswer:
                     logStore.log("\(game.title): no answer from the desktop agent (C:\\madeira\\agent.log)", level: .error)
                 }
+                // ml812: if a game crashed earlier in this session, THAT is
+                // almost certainly why this one never started — its orphaned
+                // threads can hold a lock in a shared DLL that the new game
+                // blocks on. Say so plainly instead of silently bouncing the
+                // user back to the grid to try again forever.
+                if sessionCrashed { showSessionCrashedAlert = true }
                 launcherSession = .idle
                 launchingGame = nil
                 desktopFullScreen = false
@@ -1607,6 +1638,14 @@ struct ContentView: View {
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
             logStore.log("\(title) ended (exit code \(code))")
+            // ml812: a non-zero exit is a crash (a clean quit and our WM_CLOSE
+            // force-close both report 0). Remember it: the threads it left
+            // behind can wedge the next launch.
+            if code != 0 {
+                sessionCrashed = true
+                logStore.log("\(title) crashed — its leftover threads may block the next launch; "
+                             + "reopen Madeira if games stop starting", level: .error)
+            }
             if case .playing = launcherSession {
                 launcherSession = .idle
                 launchingGame = nil

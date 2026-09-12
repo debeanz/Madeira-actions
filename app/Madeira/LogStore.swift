@@ -278,21 +278,28 @@ final class LogStore: ObservableObject {
     /// thousands of lines a run; FileHandle.seekToEndOfFile + write is two
     /// non-atomic steps against that, so the offset was stale by the time the
     /// write landed. O_APPEND makes each write atomic with respect to wine's.
-    private var appendFD: Int32 = -1
+    /// ml812: open, write, close on EVERY line — do not cache the descriptor.
+    ///
+    /// ml811 kept one O_APPEND fd and logging still died the moment Wine
+    /// started. Wine dup2()s this file onto stdout/stderr and this port closes
+    /// fds aggressively by number (see the [fdtrace] "CROSS! close fd=" lines),
+    /// so a cached descriptor of ours gets closed underneath us and every
+    /// subsequent write fails silently forever. App-side lines are rare (~40 a
+    /// session) so an open/close each time costs nothing and cannot be
+    /// invalidated by anyone else. O_APPEND still makes the write itself atomic
+    /// against Wine's.
     private let appendLock = NSLock()
 
     private func appendToFile(_ message: String, level: LogEntry.Level = .info) {
         let line = "[\(dateFormatter.string(from: Date()))] [\(level.rawValue)] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         appendLock.lock()
-        if appendFD < 0 {
-            appendFD = open(logFileURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        }
-        let fd = appendFD
+        let fd = open(logFileURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
         if fd >= 0 {
             data.withUnsafeBytes { buf in
                 if let base = buf.baseAddress { _ = write(fd, base, buf.count) }
             }
+            close(fd)
         }
         appendLock.unlock()
     }
