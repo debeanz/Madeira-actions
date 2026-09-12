@@ -1198,6 +1198,17 @@ struct ContentView: View {
         launchingGame = game
         firstFrameSeen = false
         launcherSession = .launching(game.title)
+        // ml804: set the logical screen size BEFORE going full screen. The
+        // full-screen Metal host aspect-fits to MetalBackedView.logicalScreen()
+        // (MADEIRA_SCREEN_W/H) on its FIRST layout, and its bounds never change
+        // after, so it never recomputes. launchGameSession() used to set these
+        // 0.35 s later, so the first game's host view locked to the 1024x768
+        // fallback (4:3) and the 16:9 game was pillarboxed into it. Setting it
+        // here — before desktopFullScreen — makes the first layout correct.
+        // Harmless for the running-session path: the value is unchanged.
+        let (screenW0, screenH0) = desktopSize
+        setenv("MADEIRA_SCREEN_W", String(screenW0), 1)
+        setenv("MADEIRA_SCREEN_H", String(screenH0), 1)
         let startInSession: () -> Void = {
             logStore.log("Games: launching \(game.title) → \(exePath)")
             SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath) { outcome in
