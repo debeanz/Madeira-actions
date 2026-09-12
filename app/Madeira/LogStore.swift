@@ -290,6 +290,21 @@ final class LogStore: ObservableObject {
     /// against Wine's.
     private let appendLock = NSLock()
 
+    /// ml815: write app-side lines to BOTH the file and STDERR.
+    ///
+    /// Three attempts at this have now failed the same way: app-side lines stop
+    /// the moment Wine starts and never come back. ml811 blamed a cached
+    /// descriptor, ml812 switched to open/write/close per line — and the 0.1.68
+    /// log STILL ends its app-side output at "Waiting for Wine to finish PE
+    /// loading...", so our own open() into that file is not landing once Wine
+    /// owns it, for a reason I have not isolated.
+    ///
+    /// Stop trying to out-think it. Wine writes tens of thousands of lines to
+    /// this exact file through fd 2, because WineProcessBridge dup2()s the log
+    /// onto stderr with O_APPEND. That transport is PROVEN to work. So use it
+    /// too, and keep the direct write for the pre-Wine phase when stderr is
+    /// still the console. Whichever path is live, the line lands; if both are,
+    /// a duplicated diagnostic line is a trivial price for not being blind.
     private func appendToFile(_ message: String, level: LogEntry.Level = .info) {
         let line = "[\(dateFormatter.string(from: Date()))] [\(level.rawValue)] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
@@ -300,6 +315,10 @@ final class LogStore: ObservableObject {
                 if let base = buf.baseAddress { _ = write(fd, base, buf.count) }
             }
             close(fd)
+        }
+        // The transport Wine itself uses. Unconditional on purpose.
+        data.withUnsafeBytes { buf in
+            if let base = buf.baseAddress { _ = write(STDERR_FILENO, base, buf.count) }
         }
         appendLock.unlock()
     }

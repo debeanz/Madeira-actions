@@ -1662,13 +1662,26 @@ struct ContentView: View {
             // ml809 was about. We only stop SHOWING it; the game is left to
             // finish dying on its own, because hurrying a teardown along is how
             // orphaned threads get made (ml811).
+            // ml815: say whether the watchdog is even armed. 0.1.68 shipped this
+            // and nothing changed on device, and with app-side logging broken
+            // there was no way to tell whether it never armed (drew == false),
+            // never tripped (the present counter keeps ticking after the game
+            // stops — DXMT has a steady-rate re-present), or tripped and the
+            // guard rejected it. Now the log says which.
+            logStore.log("\(title): stall watchdog \(drew ? "armed" : "NOT armed (never saw a frame)")")
             guard drew else { return }
             var lastCount = madeira_get_present_count()
             var stalled = 0.0
+            var since = 0.0
             while stalled < 20 && !done.done {
                 Thread.sleep(forTimeInterval: 0.5)
+                since += 0.5
                 let c = madeira_get_present_count()
                 if c != lastCount { lastCount = c; stalled = 0 } else { stalled += 0.5 }
+                // Heartbeat every 15 s: proves whether presents actually stop.
+                if since.truncatingRemainder(dividingBy: 15) < 0.25 {
+                    logStore.log("\(title): presents=\(c) stalled=\(Int(stalled))s")
+                }
             }
             guard !done.done else { return }
             DispatchQueue.main.async {
