@@ -76,6 +76,43 @@ final class MetalHostView: UIView {
         metalLayer.drawableSize = CGSize(width: 800, height: 600)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    // ml805: on-screen mouse pointer for game mode. In desktop mode the wine
+    // cursor is drawn by the compositor, but game mode has no compositor, so
+    // draw our own. A non-interactive subview: it never eats touches (this
+    // host has userInteractionEnabled=false anyway) and, being a child of the
+    // host, it hides automatically whenever the host is hidden (loading
+    // overlay, tab switch). Positioned in host-local points; the host is
+    // framed to the aspect-fit game rect, so a [0,1] fraction maps directly.
+    private var gameCursorView: UIImageView?
+    private func ensureGameCursor() -> UIImageView {
+        if let c = gameCursorView { return c }
+        let cfg = UIImage.SymbolConfiguration(pointSize: 26, weight: .regular)
+        let img = UIImage(systemName: "cursorarrow.fill", withConfiguration: cfg)?
+            .withTintColor(.white, renderingMode: .alwaysOriginal)
+        let iv = UIImageView(image: img)
+        iv.isUserInteractionEnabled = false
+        iv.sizeToFit()
+        iv.layer.shadowColor = UIColor.black.cgColor
+        iv.layer.shadowOpacity = 0.8
+        iv.layer.shadowRadius = 1.0
+        iv.layer.shadowOffset = CGSize(width: 0.5, height: 1.0)
+        addSubview(iv)
+        gameCursorView = iv
+        return iv
+    }
+    /// Move (and reveal) the pointer. fracX/fracY are the cursor position as a
+    /// fraction of the game area, matching the absolute position sent to wine.
+    func moveGameCursor(fracX: CGFloat, fracY: CGFloat) {
+        let c = ensureGameCursor()
+        let sz = c.bounds.size
+        // Hotspot ≈ the arrow tip near the glyph's top-left.
+        c.frame = CGRect(x: fracX * bounds.width - sz.width * 0.12,
+                         y: fracY * bounds.height - sz.height * 0.08,
+                         width: sz.width, height: sz.height)
+        c.isHidden = false
+    }
+    func setGameCursorHidden(_ hidden: Bool) { gameCursorView?.isHidden = hidden }
 }
 
 // SwiftUI-hosted placeholder: geometry + touch input only.
@@ -217,6 +254,15 @@ final class MetalBackedView: UIView {
             w.addSubview(host)
         }
         host.frame = convert(gameRect(), to: w)
+        // ml805: reveal the pointer at its current spot the moment a game goes
+        // full screen (game mode only), so a first tap has a visible target;
+        // in relative (mouselook) mode and desktop mode it stays hidden.
+        if !desktopMode && !InputSettings.shared.relative {
+            let (gw, gh) = Self.logicalScreen()
+            host.moveGameCursor(fracX: Self.cursor.x / gw, fracY: Self.cursor.y / gh)
+        } else {
+            host.setGameCursorHidden(true)
+        }
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
         // the games' Metal layer — never over the whole phone screen.
@@ -289,6 +335,14 @@ final class MetalBackedView: UIView {
         guard let v = getenv("MADEIRA_DESKTOP") else { return false }
         return v.pointee == 49  // '1'
     }
+    /// ml805: which touch model to use. Desktop mode always used the trackpad
+    /// pointer — glide moves the cursor, tap clicks, two fingers scroll. Games
+    /// now use it too: the user asked for a visible mouse pointer for
+    /// menu-driven PC titles instead of the old absolute touch injection.
+    /// Kept as a property so a future per-game "native touch" toggle can turn
+    /// it off (the `guard trackpadMode else { … winios_post_touch_* }` fallback
+    /// in the touch handlers is that path).
+    private var trackpadMode: Bool { true }
     private func envInt(_ name: String, _ def: Int) -> Int {
         guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
         return i
@@ -319,7 +373,7 @@ final class MetalBackedView: UIView {
             chromeTapStart = t.location(in: self)
             chromeTapTime = Date().timeIntervalSinceReferenceDate
         }
-        guard desktopMode else {
+        guard trackpadMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_down(x, y)
@@ -363,7 +417,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard desktopMode else {
+        guard trackpadMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_move(x, y)
@@ -419,6 +473,9 @@ final class MetalBackedView: UIView {
          * by dragging RIGHT. That is the same sign as a mouse. Negate both terms
          * for content-drag (finger-follows-world) feel. */
         if InputSettings.shared.relative {
+            // ml805: mouselook hides the pointer — the finger is the camera,
+            // there is no cursor to show.
+            if !desktopMode { MetalHostView.shared.setGameCursorHidden(true) }
             let sens = CGFloat(InputSettings.shared.sensRel)
             relCarryX += dx * sens
             relCarryY += dy * sens
@@ -436,6 +493,12 @@ final class MetalBackedView: UIView {
         Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
         Self.cursor.y = min(max(Self.cursor.y + dy * sens, 0), maxY)
         postPointer(F_MOVE | F_ABS)
+        // ml805: move the on-screen pointer overlay to match (game mode only —
+        // desktop mode draws the wine cursor through the compositor).
+        if !desktopMode {
+            MetalHostView.shared.moveGameCursor(fracX: Self.cursor.x / max(maxX, 1),
+                                                fracY: Self.cursor.y / max(maxY, 1))
+        }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -446,7 +509,7 @@ final class MetalBackedView: UIView {
                 NotificationCenter.default.post(name: .madeiraSurfaceTap, object: nil)
             }
         }
-        guard desktopMode else {
+        guard trackpadMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
@@ -487,7 +550,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard desktopMode else {
+        guard trackpadMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
