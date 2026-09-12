@@ -472,6 +472,10 @@ final class MetalBackedView: UIView {
     private func moveGameCursorOverlay(fracX: CGFloat, fracY: CGFloat) {
         let r = MetalHostView.shared.frame
         guard r.width > 1, r.height > 1 else { return }
+        // ml807: the real wine cursor is sized in wine pixels, so tell the
+        // overlay how many points one wine pixel is on screen right now.
+        let (gw, _) = Self.logicalScreen()
+        GameCursorHost.pxToPt = r.width / max(gw, 1)
         GameCursorHost.move(to: CGPoint(x: r.minX + fracX * r.width,
                                         y: r.minY + fracY * r.height))
     }
@@ -641,6 +645,22 @@ enum GameCursorHost {
     private static var arrow: UIImageView?
     private static var loggedMove = false
 
+    // ml807: visibility has TWO owners and both must agree.
+    //   appVisible     — the app: a game is full screen, not loading, etc.
+    //   windowsVisible — the GAME: it calls SetCursor(NULL) to hide the cursor
+    //                    during play and restores it in menus.
+    // Before this, the drawn arrow ignored the game entirely and sat on screen
+    // during gameplay.
+    private static var appVisible = false
+    private static var windowsVisible = true
+    /// The real wine cursor, when the game has set one. Until then the drawn
+    /// arrow below is the fallback (some games never call SetCursor).
+    private static var realHotspotPx: CGPoint = .zero
+    private static var realSizePx: CGSize = .zero
+    private static var lastPoint: CGPoint = .zero
+    /// Points per wine pixel, so the cursor is scaled like the game is.
+    static var pxToPt: CGFloat = 1
+
     /// Drawn, NOT an SF Symbol. `cursorarrow.fill` does not exist — the family
     /// has cursorarrow, .square, .square.fill, .click, .rays … but no bare
     /// .fill — so `UIImage(systemName:)` returned nil in 0.1.57, the optional
@@ -706,21 +726,82 @@ enum GameCursorHost {
               stderr)
     }
 
-    /// `p` is where the arrow TIP should sit, in window coordinates.
+    /// `p` is where the cursor's HOTSPOT should sit, in window coordinates.
     static func move(to p: CGPoint) {
         if overlay == nil { attach() }
-        guard let iv = arrow, let sz = iv.image?.size else { return }
-        iv.frame = CGRect(x: p.x - tipInset, y: p.y - tipInset,
-                          width: sz.width, height: sz.height)
-        iv.isHidden = false
+        guard arrow != nil else { return }
+        lastPoint = p
+        appVisible = true
+        applyGeometry()
+        refreshHidden()
         if !loggedMove {
             loggedMove = true
-            fputs("[cursor] ml806 first move p=\(p) frame=\(iv.frame) "
-                  + "host=\(MetalHostView.shared.frame)\n", stderr)
+            fputs("[cursor] ml806 first move p=\(p) frame=\(arrow?.frame ?? .zero) "
+                  + "host=\(MetalHostView.shared.frame) real=\(realSizePx)\n", stderr)
         }
     }
 
-    static func setHidden(_ hidden: Bool) { arrow?.isHidden = hidden }
+    /// ml807: the real wine cursor bitmap, straight from the game (Winios.m →
+    /// madeira_game_cursor_image). Carries its own size and hotspot, so the
+    /// point that clicks is exactly the point Windows says it is.
+    static func setRealCursor(_ img: UIImage, hotX: CGFloat, hotY: CGFloat,
+                              w: CGFloat, h: CGFloat) {
+        if overlay == nil { attach() }
+        realHotspotPx = CGPoint(x: hotX, y: hotY)
+        realSizePx = CGSize(width: w, height: h)
+        arrow?.image = img
+        applyGeometry()
+        refreshHidden()
+    }
+
+    /// The game showed or hid its cursor.
+    static func setWindowsVisible(_ visible: Bool) {
+        windowsVisible = visible
+        refreshHidden()
+    }
+
+    /// The app's own gate (leaving full screen, loading screen, desktop mode).
+    static func setHidden(_ hidden: Bool) {
+        appVisible = !hidden
+        refreshHidden()
+    }
+
+    private static func refreshHidden() {
+        arrow?.isHidden = !(appVisible && windowsVisible)
+    }
+
+    private static func applyGeometry() {
+        guard let iv = arrow else { return }
+        if realSizePx.width > 0, realSizePx.height > 0 {
+            // Scale the wine cursor the same way the game itself is scaled.
+            let s = max(pxToPt, 0.01)
+            iv.frame = CGRect(x: lastPoint.x - realHotspotPx.x * s,
+                              y: lastPoint.y - realHotspotPx.y * s,
+                              width: realSizePx.width * s,
+                              height: realSizePx.height * s)
+        } else if let sz = iv.image?.size {
+            iv.frame = CGRect(x: lastPoint.x - tipInset, y: lastPoint.y - tipInset,
+                              width: sz.width, height: sz.height)
+        }
+    }
+}
+
+/// ml807: Winios.m hands the REAL wine cursor here in game mode, where there is
+/// no desktop compositor to host it. Both are called on the main thread.
+@_cdecl("madeira_game_cursor_image")
+public func madeira_game_cursor_image(_ cgimage: UnsafeMutableRawPointer?,
+                                      _ w: Int32, _ h: Int32,
+                                      _ hotX: Int32, _ hotY: Int32) {
+    guard let cgimage, w > 0, h > 0 else { return }
+    let cg = Unmanaged<CGImage>.fromOpaque(cgimage).takeUnretainedValue()
+    GameCursorHost.setRealCursor(UIImage(cgImage: cg),
+                                 hotX: CGFloat(hotX), hotY: CGFloat(hotY),
+                                 w: CGFloat(w), h: CGFloat(h))
+}
+
+@_cdecl("madeira_game_cursor_show")
+public func madeira_game_cursor_show(_ show: Int32) {
+    GameCursorHost.setWindowsVisible(show != 0)
 }
 
 /// The expanded pad, drawn in window space at the button's location.

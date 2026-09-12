@@ -275,7 +275,10 @@ static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
     char bmibuf[sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD)];
     BITMAPINFO *bmi = (BITMAPINFO *)bmibuf;
 
-    if (!winios_desktop_mode() || !winios_cursor_set) return;
+    /* ml807: was desktop-only. Game mode now draws the real wine cursor too
+     * (routed to the Swift overlay window), so the only requirement is that
+     * the app side is linked. */
+    if (!winios_cursor_set) return;
     if (!cursor)
     {
         if (winios_cursor_show) winios_cursor_show( 0 );
@@ -1565,7 +1568,9 @@ static void load_display_driver(void)
         if (winios_pCreateWindow)        winios_user_driver.pCreateWindow        = winios_pCreateWindow;
         if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
         if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
-        if (winios_desktop_mode())       winios_user_driver.pSetCursor           = winios_drv_set_cursor;
+        /* ml807: the real cursor bitmap path is no longer desktop-only — games
+         * get their own cursor art, hotspot and hide/show as well. */
+        if (winios_cursor_set)           winios_user_driver.pSetCursor           = winios_drv_set_cursor;
         else if (winios_pSetCursor)      winios_user_driver.pSetCursor           = winios_pSetCursor;
         if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;

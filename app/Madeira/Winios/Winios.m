@@ -1255,6 +1255,21 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
 
 static CALayer *g_cursor_layer;
 
+/* ml807: game mode (no desktop) has no compositor view to host
+ * g_cursor_layer, so the REAL wine cursor — same bitmap and hotspot the
+ * desktop path uses — is handed to the Swift overlay window instead
+ * (GameCursorHost). Implemented in ContentView.swift via @_cdecl; weak so a
+ * build without the Swift side still links. */
+extern void madeira_game_cursor_image(void *cgimage, int w, int h,
+                                      int hot_x, int hot_y) __attribute__((weak_import));
+extern void madeira_game_cursor_show(int show) __attribute__((weak_import));
+
+static int winios_game_mode(void) {
+    static int gm = -1;
+    if (gm < 0) { const char *d = getenv("MADEIRA_DESKTOP"); gm = !(d && *d == '1'); }
+    return gm;
+}
+
 static UIImage *winios_cursor_image(void) {
     static UIImage *img;
     static dispatch_once_t once;
@@ -1334,23 +1349,33 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
     if (w <= 0 || h <= 0 || !bgra) return;
     NSData *data = [NSData dataWithBytes:bgra length:(size_t)w * h * 4];
     dispatch_async(dispatch_get_main_queue(), ^{
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
-        winios_ensure_cursor_layer();
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
         CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs,
                                        kCGBitmapByteOrder32Little | kCGImageAlphaFirst,
                                        dp, NULL, false, kCGRenderingIntentDefault);
-        if (img) {
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            g_cursor_layer.contents = (__bridge id)img;
-            g_cur_w = w; g_cur_h = h; g_cur_hx = hot_x; g_cur_hy = hot_y;
-            winios_cursor_place();
-            [CATransaction commit];
-            CGImageRelease(img);
+        /* ml807: game mode — hand the real cursor to the Swift overlay. */
+        if (winios_game_mode()) {
+            if (img && madeira_game_cursor_image)
+                madeira_game_cursor_image( img, w, h, hot_x, hot_y );
+            if (img) CGImageRelease(img);
+            CGDataProviderRelease(dp);
+            CGColorSpaceRelease(cs);
+            return;
         }
+        winios_ensure_compositor();
+        if (g_compositor_view) {
+            winios_ensure_cursor_layer();
+            if (img) {
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                g_cursor_layer.contents = (__bridge id)img;
+                g_cur_w = w; g_cur_h = h; g_cur_hx = hot_x; g_cur_hy = hot_y;
+                winios_cursor_place();
+                [CATransaction commit];
+            }
+        }
+        if (img) CGImageRelease(img);
         CGDataProviderRelease(dp);
         CGColorSpaceRelease(cs);
     });
@@ -1358,6 +1383,13 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
 
 void winios_cursor_show(int show) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        /* ml807: in game mode the game's own show/hide drives the overlay —
+         * this is what stops a stale arrow sitting on screen during gameplay
+         * once the game hides the cursor. */
+        if (winios_game_mode()) {
+            if (madeira_game_cursor_show) madeira_game_cursor_show( show );
+            return;
+        }
         if (g_cursor_layer) g_cursor_layer.hidden = !show;
     });
 }
