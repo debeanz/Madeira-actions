@@ -4122,6 +4122,12 @@ skip_reclaim_band: ;
                         static volatile uint64_t stuck_page;
                         static volatile uint64_t stuck_pc;
                         static volatile uint32_t stuck_n;
+                        /* ml811: (page, pc) pairs ALREADY PROVEN unrecoverable by the
+                         * 50-fault breaker below. See the block comment there. */
+#define IOS_STUCK_KNOWN_MAX 16
+                        static volatile uint64_t stuck_known_page[IOS_STUCK_KNOWN_MAX];
+                        static volatile uint64_t stuck_known_pc[IOS_STUCK_KNOWN_MAX];
+                        static volatile uint32_t stuck_known_n;
                         uint64_t fpage = (uint64_t)fault_addr & ~0x3fffull;
                         /* ml385: NULL-page faults keyed as 1, not 0 — `if (fpage &&`
                          * excluded them entirely and a NULL-write loop in
@@ -4130,7 +4136,65 @@ skip_reclaim_band: ;
                          * had detached). */
                         if (!fpage) fpage = 1;
 
-                        if (fpage == stuck_page && fault_pc_check == stuck_pc)
+                        /* ml811: THE ORPHAN-THREAD WEDGE.
+                         *
+                         * When a game CRASHES, process_exit_wrapper unwinds only the
+                         * thread that faulted; the wineserver marks the siblings dead
+                         * ([srv-kill] ... violent=1) but on this port they get no
+                         * signal (ml788) and keep running against a process whose
+                         * mappings have just been torn down. Untitled Goose Game left
+                         * ~50 such threads spinning on ONE non-executable page
+                         * (ntdll.dll+0x5f91c, prot=1/3), holding critical sections
+                         * ("wait timed out in thread 04f8, blocked by 04fc") and
+                         * jamming the launch agent, so every later game timed out and
+                         * bounced the user back to the Games tab, with resident memory
+                         * pinned at ~3.2GB. That is the "it stopped launching and the
+                         * RAM froze" report.
+                         *
+                         * The breaker below did fire — but it diverts ONE thread per 50
+                         * identical faults, and stuck_n is a single global that any
+                         * other fault resets, so 50 threads were never going to clear:
+                         * it fired 3 times in 3 minutes. Once a (page, pc) has been
+                         * proven unrecoverable for one thread, it is unrecoverable for
+                         * all of them, so divert every later arrival there immediately.
+                         * Bounded table; only locations the 50-fault rule already
+                         * condemned are ever added. */
+                        int known_bad = 0;
+                        {
+                            uint32_t k, kn = stuck_known_n;
+                            if (kn > IOS_STUCK_KNOWN_MAX) kn = IOS_STUCK_KNOWN_MAX;
+                            for (k = 0; k < kn; k++)
+                            {
+                                if (stuck_known_page[k] != fpage) continue;
+                                if (stuck_known_pc[k] != fault_pc_check) continue;
+                                {
+                                    extern void abort_thread( int status );
+                                    uint64_t cur_sp = __darwin_arm_thread_state64_get_sp(state);
+                                    static volatile uint32_t fast_n;
+                                    uint32_t fn = __sync_add_and_fetch(&fast_n, 1);
+                                    if (fn <= 8 || (fn % 64) == 0)
+                                        dprintf(STDERR_FILENO,
+                                            "[fault-stuck] ml811 known-bad page 0x%llx pc 0x%llx "
+                                            "-> aborting this thread at once (#%u)\n",
+                                            (unsigned long long)fpage,
+                                            (unsigned long long)fault_pc_check, fn);
+                                    state.__x[0] = 1;
+                                    __darwin_arm_thread_state64_set_sp(state, cur_sp & ~0xfull);
+                                    __darwin_arm_thread_state64_set_pc_fptr(state, (void *)abort_thread);
+                                    thread_set_state( thread, ARM_THREAD_STATE64,
+                                                      (thread_state_t)&state, count );
+                                    handled = 1;
+                                    known_bad = 1;
+                                }
+                                break;
+                            }
+                        }
+
+                        if (known_bad)
+                        {
+                            /* already diverted above */
+                        }
+                        else if (fpage == stuck_page && fault_pc_check == stuck_pc)
                         {
                             uint32_t n = __sync_add_and_fetch(&stuck_n, 1);
                             /* ml385 LOOP BREAKER: same page AND same pc 50 times
@@ -4155,6 +4219,18 @@ skip_reclaim_band: ;
                                                   (thread_state_t)&state, count );
                                 handled = 1;
                                 stuck_n = 0;
+                                /* ml811: condemn this (page, pc) so the other orphaned
+                                 * threads spinning on it are diverted on their FIRST
+                                 * fault instead of each needing their own 50. */
+                                {
+                                    uint32_t slot_k = __sync_fetch_and_add(&stuck_known_n, 1);
+                                    if (slot_k < IOS_STUCK_KNOWN_MAX)
+                                    {
+                                        stuck_known_pc[slot_k]   = fault_pc_check;
+                                        __sync_synchronize();
+                                        stuck_known_page[slot_k] = fpage;
+                                    }
+                                }
                             }
                             /* ml369: was 2048, which NEVER fired — the
                              * debugger script kills the app after 8

@@ -269,14 +269,31 @@ final class LogStore: ObservableObject {
     /// Write to file (called from `log()` for Swift-side messages so they
     /// land in the file alongside Wine/FEX output, picked up by the tail
     /// reader).
+    /// ml811: append through an O_APPEND descriptor, not seek-then-write.
+    ///
+    /// Every Swift-side line was being LOST for the whole of a game session —
+    /// no "<game> started (pid N)", no "Force closing …" — which is why three
+    /// rounds of diagnosis had to be done from the wine side by inference.
+    /// Wine dup2()s this same file onto stderr with O_APPEND and writes tens of
+    /// thousands of lines a run; FileHandle.seekToEndOfFile + write is two
+    /// non-atomic steps against that, so the offset was stale by the time the
+    /// write landed. O_APPEND makes each write atomic with respect to wine's.
+    private var appendFD: Int32 = -1
+    private let appendLock = NSLock()
+
     private func appendToFile(_ message: String, level: LogEntry.Level = .info) {
         let line = "[\(dateFormatter.string(from: Date()))] [\(level.rawValue)] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            if let handle = try? FileHandle(forWritingTo: logFileURL) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
+        guard let data = line.data(using: .utf8) else { return }
+        appendLock.lock()
+        if appendFD < 0 {
+            appendFD = open(logFileURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        }
+        let fd = appendFD
+        if fd >= 0 {
+            data.withUnsafeBytes { buf in
+                if let base = buf.baseAddress { _ = write(fd, base, buf.count) }
             }
         }
+        appendLock.unlock()
     }
 }
