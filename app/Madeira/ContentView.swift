@@ -650,6 +650,13 @@ final class PassthroughWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
 }
 
+/// ml814: shared "the game reported its exit" flag between watchHostedGame's
+/// background stall watchdog and the exit callback. A reference box so the
+/// watchdog never has to read @State off the main thread.
+final class WatchFlag {
+    var done = false
+}
+
 /// ml810: an overlay window's root controller must follow the app's orientation
 /// lock, not keep its own default. iOS asks the TOPMOST visible window about
 /// orientation and the home indicator, so a stale overlay left the home bar
@@ -1598,6 +1605,10 @@ struct ContentView: View {
     /// Loading screen until the game has presented, then wait for the
     /// agent's exit report so Play returns.
     private func watchHostedGame(pid: Int, title: String) {
+        // ml814: lets the exit report stop the stall watchdog below. A plain
+        // class box because the watchdog runs on a background thread and must
+        // not touch @State to decide whether to keep looping.
+        let done = WatchFlag()
         DispatchQueue.global(qos: .utility).async {
             // ml809: THE STUCK LOADING SCREEN. The present counter is per
             // swapchain and RESTARTS AT ZERO for each new game (the wine log
@@ -1635,8 +1646,43 @@ struct ContentView: View {
                     self.selectedTab = .games
                 }
             }
+
+            // ml814: STALL WATCHDOG — a game can hang inside its OWN shutdown.
+            //
+            // Untitled Goose Game's quit confirmation ran, the game stopped
+            // drawing (FPS 0.0) and its threads began terminating one at a time,
+            // but it never reached process_exit_wrapper, so the agent's
+            // WaitForSingleObject never signalled, no exit was ever reported,
+            // and waitForExit below polls forever. The user was left staring at
+            // a frozen last frame with no way back except the X button.
+            //
+            // A game that has ALREADY drawn and then stops drawing for 20 s is
+            // either quitting or hung — a loading screen still presents frames.
+            // Gating on `drew` is what keeps this off the slow-startup path that
+            // ml809 was about. We only stop SHOWING it; the game is left to
+            // finish dying on its own, because hurrying a teardown along is how
+            // orphaned threads get made (ml811).
+            guard drew else { return }
+            var lastCount = madeira_get_present_count()
+            var stalled = 0.0
+            while stalled < 20 && !done.done {
+                Thread.sleep(forTimeInterval: 0.5)
+                let c = madeira_get_present_count()
+                if c != lastCount { lastCount = c; stalled = 0 } else { stalled += 0.5 }
+            }
+            guard !done.done else { return }
+            DispatchQueue.main.async {
+                guard case .playing(let t) = self.launcherSession, t == title else { return }
+                logStore.log("\(title) stopped drawing for 20 s — it is quitting or hung, "
+                             + "returning to the Games tab", level: .error)
+                self.launcherSession = .idle
+                self.launchingGame = nil
+                self.desktopFullScreen = false
+                self.selectedTab = .games
+            }
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
+            done.done = true          // ml814: stop the stall watchdog
             logStore.log("\(title) ended (exit code \(code))")
             // ml812: a non-zero exit is a crash (a clean quit and our WM_CLOSE
             // force-close both report 0). Remember it: the threads it left
