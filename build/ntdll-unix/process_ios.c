@@ -511,8 +511,8 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
      * still inside their grace window are skipped and picked up later by the
      * pressure path in NtAllocateVirtualMemoryEx. */
     {
-        extern uint64_t ios_fexva_reclaim_dead( void );
-        ios_fexva_reclaim_dead();
+        extern uint64_t ios_fexva_reclaim_dead( int min_grace_sec );
+        ios_fexva_reclaim_dead( 0 );   /* 0 = the default grace */
     }
 
     ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );

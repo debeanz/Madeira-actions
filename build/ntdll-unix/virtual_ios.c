@@ -14903,7 +14903,20 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
  *   4. NtFreeVirtualMemory itself validates base against the live view.
  */
 #define IOS_FEXVA_MAX      2048
-#define IOS_FEXVA_DEAD_MAX 32
+/* ml808 review: was 32. Child PEBs are mmap'd and never munmap'd, so a PEB
+ * address is never recycled and the stale-death clear in ios_fexva_note never
+ * fires in practice — dead records are permanent and this table only grows. A
+ * game launch is several pseudo-processes (cmd/start/wineboot/helpers), so 32
+ * filled after a handful of launches and the ledger silently stopped working.
+ * 16 bytes an entry; make it big enough not to matter, and say so if it fills. */
+#define IOS_FEXVA_DEAD_MAX 256
+/* The pressure path can fire from a LIVE process while a sibling that died
+ * seconds ago still has running threads (process_exit_wrapper only unwinds the
+ * ONE thread that called it; on this port a sibling blocked outside a server
+ * call gets no signal at all — see ml788). The spawn path is protected by human
+ * latency between games; the pressure path is not, so make it demand much more
+ * distance from the death before unmapping anything. */
+#define IOS_FEXVA_PRESSURE_GRACE_SEC 30
 static struct { uint64_t base; uint64_t size; void *peb; } ios_fexva[IOS_FEXVA_MAX];
 static unsigned ios_fexva_n;
 static struct { void *peb; time_t died; } ios_fexva_dead[IOS_FEXVA_DEAD_MAX];
@@ -14914,6 +14927,7 @@ static void ios_fexva_note( void *base, SIZE_T size, void *peb )
 {
     uint64_t b = (uint64_t)(uintptr_t)base;
     unsigned i;
+    int free_slot = -1;
 
     if (!b || !size) return;
     pthread_mutex_lock( &ios_fexva_lock );
@@ -14924,13 +14938,24 @@ static void ios_fexva_note( void *base, SIZE_T size, void *peb )
         if (ios_fexva_dead[i].peb == peb) ios_fexva_dead[i].peb = NULL;
     for (i = 0; i < ios_fexva_n; i++)        /* guard 1: overwrite, never append */
     {
+        /* ml808 review: remember the first hole. Entries zeroed by
+         * ios_fexva_release() or claimed by a reclaim can never match a
+         * (non-zero) base, so without this the table only ever appends and
+         * leaks a slot for every arena FEX frees at a fresh address. */
+        if (!ios_fexva[i].base) { if (free_slot < 0) free_slot = (int)i; continue; }
         if (ios_fexva[i].base != b) continue;
         ios_fexva[i].size = size;
         ios_fexva[i].peb  = peb;
         pthread_mutex_unlock( &ios_fexva_lock );
         return;
     }
-    if (ios_fexva_n < IOS_FEXVA_MAX)
+    if (free_slot >= 0)
+    {
+        ios_fexva[free_slot].base = b;
+        ios_fexva[free_slot].size = size;
+        ios_fexva[free_slot].peb  = peb;
+    }
+    else if (ios_fexva_n < IOS_FEXVA_MAX)
     {
         ios_fexva[ios_fexva_n].base = b;
         ios_fexva[ios_fexva_n].size = size;
@@ -14984,6 +15009,18 @@ void ios_fexva_note_dead( void *peb )
         ios_fexva_dead[i].peb  = peb;
         ios_fexva_dead[i].died = time( NULL );
     }
+    else
+    {
+        /* ml808 review: dropping a death on the floor silently would make the
+         * 3rd-launch crash come back with no diagnostic saying why. */
+        static int warned;
+        if (!warned)
+        {
+            warned = 1;
+            dprintf( 2, "[fexva] dead-list FULL (%u) — later games will NOT be reclaimed\n",
+                     (unsigned)IOS_FEXVA_DEAD_MAX );
+        }
+    }
     pthread_mutex_unlock( &ios_fexva_lock );
 }
 
@@ -14992,18 +15029,21 @@ void ios_fexva_note_dead( void *peb )
  * boundary (virtual_mutex NOT held): NtFreeVirtualMemory re-enters the view
  * tree, and this fork's notes record that faulting under virtual_mutex
  * deadlocks the Mach fault handler. */
-uint64_t ios_fexva_reclaim_dead( void )
+uint64_t ios_fexva_reclaim_dead( int min_grace_sec )
 {
     uint64_t freed_total = 0;
-    unsigned ranges = 0, i, d;
-    void *last_peb = NULL;
+    unsigned ranges = 0, refused = 0, i, d;
+    void *last_peb = NULL, *first_refused = NULL;
+    unsigned first_status = 0;
     time_t now = time( NULL );
+    int grace = min_grace_sec > 0 ? min_grace_sec : IOS_POOL_REUSE_GRACE_SEC;
 
     for (i = 0; i < ios_fexva_n; i++)
     {
         uint64_t base, size;
         void *peb = NULL, *addr;
         SIZE_T sz = 0;
+        NTSTATUS fst;
         int dead = 0;
 
         pthread_mutex_lock( &ios_fexva_lock );
@@ -15013,7 +15053,7 @@ uint64_t ios_fexva_reclaim_dead( void )
         if (base && peb)
             for (d = 0; d < ios_fexva_dead_n; d++)
                 if (ios_fexva_dead[d].peb == peb &&
-                    now - ios_fexva_dead[d].died >= IOS_POOL_REUSE_GRACE_SEC) { dead = 1; break; }
+                    now - ios_fexva_dead[d].died >= grace) { dead = 1; break; }
         if (dead)   /* claim it before dropping the lock */
         {
             ios_fexva[i].base = 0;
@@ -15024,16 +15064,29 @@ uint64_t ios_fexva_reclaim_dead( void )
         if (!dead) continue;
 
         addr = (void *)(uintptr_t)base;
-        if (!NtFreeVirtualMemory( NtCurrentProcess(), &addr, &sz, MEM_RELEASE ))
+        fst = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &sz, MEM_RELEASE );
+        if (!fst)
         {
             freed_total += size;
             ranges++;
             last_peb = peb;
         }
+        else
+        {
+            /* ml808 review: a refusal is guard 4 doing its job (stale base, not
+             * at a reservation base, already gone). Counting it is the cheapest
+             * on-device falsification test for the whole design — without it, a
+             * ledger gone stale is indistinguishable from a ledger that is
+             * simply empty. */
+            refused++;
+            if (!first_refused) { first_refused = (void *)(uintptr_t)base; first_status = (unsigned)fst; }
+        }
     }
-    if (ranges)
-        dprintf( 2, "[fexva] RECLAIM peb=%p: %u ranges %llu MB freed rev=ml808\n",
-                 last_peb, ranges, (unsigned long long)(freed_total >> 20) );
+    if (ranges || refused)
+        dprintf( 2, "[fexva] RECLAIM peb=%p: %u ranges %llu MB freed, %u REFUSED "
+                    "(first base=%p status=%08x) grace=%ds rev=ml808\n",
+                 last_peb, ranges, (unsigned long long)(freed_total >> 20),
+                 refused, first_refused, first_status, grace );
     return freed_total;
 }
 
@@ -15693,7 +15746,16 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         {
             void *fexva_ret = *ret;
             SIZE_T fexva_size = *size_ptr;
-            int fexva_windowed = (limit_low && limit_high && (type & MEM_RESERVE));
+            /* ml808 review: the align gate belongs in the RECORD predicate too,
+             * not just the retry. Without it this also matches
+             * ios_reserve_fex_arena's 8GB TASK-GLOBAL placeholder reservation
+             * (Alignment=0x10000, both limits set, ~600 lines above): that is
+             * disabled today and owned by the session PEB, which is never
+             * marked dead, but attributing it to a child would unmap the whole
+             * arena under every live FEX instance. Keep the two predicates
+             * identical so the comment below is actually true of both. */
+            int fexva_windowed = (limit_low && limit_high && (type & MEM_RESERVE)
+                                  && align >= 0x100000);
 
             st = allocate_virtual_memory( ret, size_ptr, type, protect,
                                           limit_low, limit_high, align, attributes );
@@ -15702,9 +15764,14 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * FEX's arena chunk reservations, and get_extended_params is the only
              * writer of limit_low/align — plain NtAllocateVirtualMemory always
              * passes limit_low=0, align=0. So nothing else produces this. */
-            if (st && fexva_windowed && align >= 0x100000)
+            if (st && fexva_windowed)
             {
-                if (ios_fexva_reclaim_dead())
+                /* Demand a long distance from the death here: this runs from a
+                 * LIVE process mid-frame, and a sibling that died seconds ago
+                 * can still have running threads. The spawn-time reclaim is the
+                 * one that normally does the work, and human latency between
+                 * games protects it. */
+                if (ios_fexva_reclaim_dead( IOS_FEXVA_PRESSURE_GRACE_SEC ))
                 {
                     *ret = fexva_ret; *size_ptr = fexva_size;
                     st = allocate_virtual_memory( ret, size_ptr, type, protect,
