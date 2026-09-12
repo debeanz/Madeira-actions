@@ -1318,11 +1318,12 @@ static const struct builtin_class_descr builtin_classes[] =
  * Register a builtin control class.
  * This allows having both ANSI and Unicode winprocs for the same class.
  */
-static void register_builtin( const struct builtin_class_descr *descr )
+static ATOM register_builtin( const struct builtin_class_descr *descr )
 {
     UNICODE_STRING name, version = { .Length = 0 };
     struct client_menu_name menu_name = { 0 };
     WCHAR nameW[64];
+    ATOM atom;
     WNDCLASSEXW class = {
         .cbSize = sizeof(class),
         .hInstance = user32_module,
@@ -1339,8 +1340,13 @@ static void register_builtin( const struct builtin_class_descr *descr )
     asciiz_to_unicode( nameW, descr->name );
     RtlInitUnicodeString( &name, nameW );
 
-    if (!NtUserRegisterClassExWOW( &class, &name, &version, &menu_name, 1, 0, NULL ) && class.hCursor)
+    /* ml803: report the atom so callers can tell a real registration from a
+     * silent failure (NtUserRegisterClassExWOW frees the CLASS and returns 0
+     * when create_class or find_shared_session_object fails). */
+    atom = NtUserRegisterClassExWOW( &class, &name, &version, &menu_name, 1, 0, NULL );
+    if (!atom && class.hCursor)
         NtUserDestroyCursor( class.hCursor, 0 );
+    return atom;
 }
 
 static void register_builtins(void)
@@ -1415,6 +1421,61 @@ void register_builtin_classes(void)
  */
 void register_desktop_class(void)
 {
-    register_builtin( &desktop_builtin_class );
-    register_builtin( &message_builtin_class );
+    /* iOS-Madeira (ml803): the same shared-image trap documented for
+     * register_builtin_classes above.  This used to run only from
+     * init_user(), behind the process-global pthread_once, so ONLY the first
+     * pseudo-process ever had "#32769"/"Message" registered server-side —
+     * and the wineserver resolves classes per process (wineserver/
+     * window_ios.c:627 grab_class( current->process, ... )).
+     *
+     * That is harmless while explorer.exe owns the session: it creates
+     * desktop->top_window and every later process just inherits the handle.
+     * With no desktop (game mode, madeira-agent.exe as root) nothing owns a
+     * top_window, so the game child's first top-level CreateWindowEx takes
+     * the auto-create branch at wineserver/window_ios.c:640-647, whose
+     * recursive create_window(...DESKTOP_ATOM...) fails in grab_class and
+     * comes back as STATUS_ACCESS_DENIED (:684) — "CreateWindow failed with
+     * error 5" — until the app gives up.  Unity exits(1) there.
+     *
+     * So register once per pseudo-process, keyed on (pid, peb) exactly like
+     * register_builtin_classes.  The entry is recorded only when BOTH atoms
+     * came back non-zero, so a failed attempt retries on the next call
+     * instead of being remembered as done.
+     *
+     * Lock safety: the lock may be held across these two descriptors only.
+     * Neither declares a .cursor, so register_builtin never reaches its
+     * LoadImageW; and NtUserRegisterClassExWOW skips its own
+     * get_desktop_window() for builtin classes — so nothing re-enters here. */
+    static pthread_mutex_t desktop_class_lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct { DWORD pid; void *peb; } done[128];
+    static unsigned int done_count;
+    DWORD pid = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
+    void *peb = NtCurrentTeb()->Peb;
+    unsigned int i;
+    ATOM a1, a2;
+
+    pthread_mutex_lock( &desktop_class_lock );
+    for (i = 0; i < done_count; i++)
+    {
+        if (done[i].pid == pid && done[i].peb == peb)
+        {
+            pthread_mutex_unlock( &desktop_class_lock );
+            return;
+        }
+    }
+    a1 = register_builtin( &desktop_builtin_class );
+    a2 = register_builtin( &message_builtin_class );
+    if (a1 && a2)
+    {
+        if (done_count < ARRAYSIZE(done))
+        {
+            done[done_count].pid = pid;
+            done[done_count].peb = peb;
+            done_count++;
+        }
+        else dprintf(2, "[desktop-class] registry FULL — pid=%04x will re-register per call\n", (int)pid);
+    }
+    dprintf(2, "[desktop-class] #32769=%04x Message=%04x pid=%04x peb=%p\n",
+            a1, a2, (int)pid, peb);
+    pthread_mutex_unlock( &desktop_class_lock );
 }

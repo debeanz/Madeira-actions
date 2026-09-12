@@ -315,6 +315,17 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
     DeleteFileW( RESULT_PATH );
     agent_log( "madeira-agent started, pid=%lu, cmdline=%ls", (unsigned long)GetCurrentProcessId(), cmdline );
 
+    /* ml803: in game mode there is no explorer, so nothing owns the win32
+     * session's desktop window, and a game child cannot reliably create one
+     * itself (the wineserver looks window classes up per process). We are the
+     * first pseudo-process and the only one that never exits, so create it
+     * here, before any child exists: children then inherit desktop->top_window
+     * exactly as they do under explorer, and it outlives every game — which is
+     * what makes the second and third launch of a session work.
+     * Nothing appears on screen: winios.drv exports no SetDesktopWindow, so
+     * win32u falls back to the no-op nulldrv_SetDesktopWindow. */
+    agent_log( "session desktop window = %p", (void *)GetDesktopWindow() );
+
     /* Run the command explorer used to run itself (services.exe). It is a
      * plain command line, so no quoting games: start it as given. */
     if (cmdline && *cmdline)

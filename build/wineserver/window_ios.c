@@ -622,10 +622,20 @@ static struct window *create_window( struct window *parent, struct window *owner
     struct window_class *class;
     struct obj_locator class_locator;
 
-    if (!(desktop = get_thread_desktop( current, DESKTOP_CREATEWINDOW ))) return NULL;
+    /* ml803: these two failures both surface to the client as Win32 error 5
+     * once the auto-create branch below gives up, which made them impossible
+     * to tell apart from a log. Name them explicitly. */
+    if (!(desktop = get_thread_desktop( current, DESKTOP_CREATEWINDOW )))
+    {
+        fprintf( stderr, "[cw-fail] no desktop tid=%04x pid=%04x atom=%04x err=%08x\n",
+                 current->id, current->process->id, atom, get_error() );
+        return NULL;
+    }
 
     if (!(class = grab_class( current->process, atom, class_instance, &extra_bytes, &class_locator )))
     {
+        fprintf( stderr, "[cw-fail] no class pid=%04x atom=%04x err=%08x\n",
+                 current->process->id, atom, get_error() );
         release_object( desktop );
         return NULL;
     }

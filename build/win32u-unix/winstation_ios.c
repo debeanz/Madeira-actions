@@ -25,6 +25,7 @@
 #include <assert.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdlib.h>   /* ml803: getenv for the game-mode gate below */
 
 #include <pthread.h>
 
@@ -858,12 +859,39 @@ static inline TEB64 *NtCurrentTeb64(void) { return NULL; }
 static inline TEB64 *NtCurrentTeb64(void) { return (TEB64 *)NtCurrentTeb()->GdiBatchCount; }
 #endif
 
+/* ml803: defined in class_ios.c. Declared here unconditionally — a duplicate
+ * of the ntuser_private.h prototype is legal C and removes any dependency on
+ * which header the build tree happens to provide. */
+extern void register_desktop_class(void);
+
 HWND get_desktop_window(void)
 {
     struct ntuser_thread_info *thread_info = NtUserGetThreadInfo();
     BOOL is_service;
 
     if (thread_info->top_window) return UlongToHandle( thread_info->top_window );
+
+    /* ml803: in game mode (no explorer, no desktop) nothing owns the session's
+     * desktop window, and the server resolves window classes per process
+     * (wineserver/window_ios.c:627). Make sure THIS pseudo-process owns
+     * "#32769" before asking the server to create the desktop window below,
+     * otherwise the create fails with STATUS_ACCESS_DENIED and the app never
+     * gets an HWND. Must stay ABOVE the SERVER_START_REQ — that ordering is
+     * load-bearing, not cosmetic.
+     *
+     * Desktop mode is deliberately untouched: there explorer.exe creates
+     * top_window and children inherit it, and letting an arbitrary child
+     * create the desktop window instead would hand its lifetime to a process
+     * that exits. */
+    {
+        static int game_mode = -1;
+        if (game_mode < 0)
+        {
+            const char *e = getenv( "MADEIRA_DESKTOP" );
+            game_mode = !(e && *e == '1');
+        }
+        if (game_mode) register_desktop_class();
+    }
 
     /* don't create an actual explorer desktop window for services */
     is_service = is_service_process();
