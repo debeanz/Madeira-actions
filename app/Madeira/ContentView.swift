@@ -665,7 +665,7 @@ enum GameCursorHost {
             p.addLine(to: pt(11.2, 11.4))
             p.close()
             p.lineWidth = 1.6
-            p.lineJoin = .round
+            p.lineJoinStyle = .round
             UIColor.white.setFill(); p.fill()
             UIColor.black.setStroke(); p.stroke()
         }
