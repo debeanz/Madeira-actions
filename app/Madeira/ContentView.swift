@@ -945,6 +945,12 @@ struct ContentView: View {
     /// restarted in-process — but it is hidden and the Desktop tab offers
     /// Start Desktop again, which simply shows it (see resumeDesktop).
     @State private var desktopShutDown = false
+    /// ml802: the runtime was started by the Games tab as a game-only
+    /// session (session agent + services.exe, no explorer, no virtual
+    /// desktop). The display path is fixed at runtime start, so the Desktop
+    /// tab cannot show a desktop for the rest of this run.
+    @State private var gameSessionOnly = false
+    @State private var showDesktopUnavailableAlert = false
     /// ml792: what the Games tab is doing with the one-shot runtime. Drives
     /// the launcher's status pill and gates a second launch (see playGame).
     @State private var launcherSession: LauncherSession = .idle
@@ -1027,7 +1033,7 @@ struct ContentView: View {
             // though DXMT continues presenting underneath it.
             if desktopFullScreen {
                 fullScreenDesktop
-            } else if vSizeClass == .compact && selectedTab == .desktop {
+            } else if vSizeClass == .compact && selectedTab == .desktop && !gameSessionOnly {
                 landscapeBody
             } else {
                 TabView(selection: $selectedTab) {
@@ -1058,6 +1064,12 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("A game already ran in this session and the Wine runtime can only be started once per launch. Quit and reopen Madeira, then pick the next game.")
+        }
+        .alert("Desktop unavailable in this run", isPresented: $showDesktopUnavailableAlert) {
+            Button("Quit Madeira", role: .destructive) { quitApp() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Games launched from the Games tab run on their own, without the Windows desktop, and the runtime can only be started once per launch. Quit and reopen Madeira, then use Start Desktop before playing a game.")
         }
         .onAppear {
             jit_install_trap_handler()
@@ -1107,7 +1119,9 @@ struct ContentView: View {
     private func applySurfaceVisibility(tab: MadeiraTab) {
         // Full screen manages the surfaces itself (fullScreenDesktop).
         if desktopFullScreen { return }
-        let hidden = tab != .desktop || desktopShutDown || showLaunchOverlay
+        // ml802: a game-only session has no desktop to show on the Desktop
+        // tab; its game is only ever shown full screen.
+        let hidden = tab != .desktop || desktopShutDown || showLaunchOverlay || gameSessionOnly
         MetalHostView.shared.isHidden = hidden
         winios_set_compositor_hidden(hidden ? 1 : 0)
     }
@@ -1116,7 +1130,7 @@ struct ContentView: View {
     /// desktop is showing. After Exit desktop the runtime is still up but the
     /// button must offer Start Desktop again.
     private var desktopIsRunning: Bool {
-        wineserver_is_running() != 0 && !desktopShutDown
+        wineserver_is_running() != 0 && !desktopShutDown && !gameSessionOnly
     }
 
     /// ml791: the pad navigates the Games grid only while that tab is on
@@ -1208,11 +1222,11 @@ struct ContentView: View {
                 selectedTab = .games
             }
         }
-        // ml800: the desktop stays OFF on the Desktop tab unless the user
-        // turns it on there. A game session started here keeps
-        // desktopShutDown set; full screen shows the game regardless.
+        // A desktop session started from the Desktop tab hosts the game
+        // inside the desktop (the only option while it runs); a game-only
+        // session (ml802) simply launches the next game through its agent.
         if wineserver_is_running() != 0 {
-            selectedTab = .desktop
+            if !gameSessionOnly { selectedTab = .desktop }
             desktopFullScreen = true
             startInSession()
         } else {
@@ -1223,11 +1237,54 @@ struct ContentView: View {
                 desktopFullScreen = true
                 // Let the loading screen paint before the JIT pool freeze.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    launchVirtualDesktop()
-                    desktopShutDown = true
+                    launchGameSession()
                     startInSession()
                 }
             }
+        }
+    }
+
+    /// ml802: the Games tab's own runtime, GameHub style. The session agent
+    /// is the ROOT process with services.exe as its child: no explorer, no
+    /// virtual desktop window, no desktop compositor (MADEIRA_DESKTOP unset,
+    /// so win32u keeps the games' invisible surfaces and DXMT presents into
+    /// the full-screen Metal layer at the Settings resolution). Games are
+    /// the agent's children, so quitting one returns to Play and the next
+    /// one starts on the warm runtime. The port never auto-starts explorer
+    /// (winstation_ios.c), so nothing desktop-like ever appears.
+    ///
+    /// The display path is chosen once at runtime start, so the Desktop tab
+    /// is unavailable for the rest of this run (gameSessionOnly).
+    private func launchGameSession() {
+        let (screenW, screenH) = desktopSize
+        logStore.log("Games: game session — madeira-agent.exe + services.exe, no desktop; screen \(screenW)x\(screenH)")
+        // Bare name (no backslash, no "x64") → aarch64-windows bundle; the
+        // agent is native AArch64, its children pick arm64ec via the
+        // cross-arch links exactly as under the desktop session.
+        setenv("MADEIRA_EXE", "madeira-agent.exe", 1)
+        setenv("MADEIRA_ARGS", "C:\\windows\\system32\\services.exe", 1)
+        unsetenv("MADEIRA_DESKTOP")
+        // Keep the debugger attached for the session's life like a desktop
+        // session does (runWineFullSequence): later launches on this
+        // runtime are untested detached. Speed experiment for a later build.
+        setenv("MADEIRA_AGENT_ROOT", "1", 1)
+        setenv("MADEIRA_SCREEN_W", String(screenW), 1)
+        setenv("MADEIRA_SCREEN_H", String(screenH), 1)
+        gameSessionOnly = true
+        desktopShutDown = false
+        runWineFullSequence()
+    }
+
+    /// The game session's root process (the agent) ended: the runtime is
+    /// stopped with it and cannot be restarted in this process.
+    private func gameSessionDied(exitCode: Int) {
+        logStore.log("Game session ended (agent exit code \(exitCode)) — the Wine runtime is stopped; relaunch Madeira to play again", level: .error)
+        DispatchQueue.main.async {
+            if case .playing = self.launcherSession { self.launcherSession = .idle }
+            if case .launching = self.launcherSession { self.launcherSession = .idle }
+            self.launchingGame = nil
+            self.desktopFullScreen = false
+            self.selectedTab = .games
         }
     }
 
@@ -1441,7 +1498,9 @@ struct ContentView: View {
     /// is still unused, and otherwise offers to quit — the runtime ran
     /// already and cannot be started again in this process.
     private func openDesktopFromGames() {
-        if desktopShutDown {
+        if gameSessionOnly {
+            showDesktopUnavailableAlert = true
+        } else if desktopShutDown {
             resumeDesktop()
         } else if wineserver_is_running() != 0 {
             selectedTab = .desktop
@@ -1472,6 +1531,7 @@ struct ContentView: View {
     /// Runtime status sheet: "Off" after Exit desktop — the runtime is still
     /// resident (it cannot be restarted in-process), but the desktop is not.
     private var desktopStatusText: String {
+        if gameSessionOnly { return "Unavailable (game session)" }
         if desktopIsRunning { return "Running" }
         if desktopShutDown { return "Off (runtime idle)" }
         return "Ready"
@@ -1986,7 +2046,8 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Windows Desktop")
                         .font(.headline)
-                    Label(desktopIsRunning ? "Session running"
+                    Label(gameSessionOnly ? "Unavailable in this run"
+                          : desktopIsRunning ? "Session running"
                           : desktopShutDown ? "Desktop off (runtime idle)" : "Ready to launch",
                           systemImage: "circle.fill")
                         .font(.caption)
@@ -2002,12 +2063,34 @@ struct ContentView: View {
             }
             .padding(.horizontal)
 
-            MadeiraMetalView()
+            if gameSessionOnly {
+                // ml802: no desktop exists in a game-only session, and the
+                // runtime cannot be started again in this process.
+                VStack(spacing: 10) {
+                    Image(systemName: "gamecontroller.fill")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                    Text("Games are running without the desktop")
+                        .font(.headline)
+                    Text("Games launched from the Games tab run on their own, like an app. To use the Windows desktop, quit and reopen Madeira, then press Start Desktop before playing a game.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
                 .frame(maxWidth: .infinity)
                 .frame(height: hSizeClass == .regular ? 520 : 360)
-                .background(Color.black)
+                .padding(.horizontal, 24)
+                .background(Color(uiColor: .secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
                 .padding(.horizontal)
+            } else {
+                MadeiraMetalView()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: hSizeClass == .regular ? 520 : 360)
+                    .background(Color.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .padding(.horizontal)
+            }
 
             if perfOverlayEnabled {
                 FPSOverlay()
@@ -2057,7 +2140,9 @@ struct ContentView: View {
             // Same launch as Settings → Developer launchers → Wine Virtual
             // Desktop, reachable from the tab where the desktop is shown.
             Button {
-                if desktopShutDown {
+                if gameSessionOnly {
+                    showDesktopUnavailableAlert = true
+                } else if desktopShutDown {
                     resumeDesktop()
                 } else {
                     ensureJIT { ok in
@@ -2068,12 +2153,14 @@ struct ContentView: View {
                     }
                 }
             } label: {
-                Label(desktopIsRunning ? "Running" : "Start Desktop",
-                      systemImage: desktopIsRunning ? "desktopcomputer.and.arrow.down" : "play.fill")
+                Label(gameSessionOnly ? "Restart Madeira to use the desktop"
+                      : desktopIsRunning ? "Running" : "Start Desktop",
+                      systemImage: gameSessionOnly ? "arrow.counterclockwise"
+                      : desktopIsRunning ? "desktopcomputer.and.arrow.down" : "play.fill")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .tint(.mint)
+            .tint(gameSessionOnly ? .gray : .mint)
             .disabled(desktopIsRunning)
 
             // The touch-controller toggle lives in the full-screen toolbar
@@ -2340,6 +2427,7 @@ struct ContentView: View {
         setenv("MADEIRA_ARGS",
                "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\madeira-agent.exe C:\\windows\\system32\\services.exe", 1)
         setenv("MADEIRA_DESKTOP", "1", 1)
+        unsetenv("MADEIRA_AGENT_ROOT")
         setenv("MADEIRA_SCREEN_W", String(deskW), 1)
         setenv("MADEIRA_SCREEN_H", String(deskH), 1)
         runWineFullSequence()
@@ -3419,6 +3507,17 @@ struct ContentView: View {
             // with explorer.exe leaving __wine_main; that is the only signal
             // the app gets, and it has to act on it (see desktopSessionEnded).
             let desktopSession = getenv("MADEIRA_DESKTOP").map { $0.pointee == 49 } ?? false
+            // ml802: a game-only session's root is the agent; if it ends,
+            // the runtime is gone and the Games tab must know.
+            let agentRootSession = getenv("MADEIRA_AGENT_ROOT").map { $0.pointee == 49 } ?? false
+            if agentRootSession && wine_process_is_running() != 0 {
+                DispatchQueue.global(qos: .utility).async {
+                    while wine_process_is_running() != 0 {
+                        Thread.sleep(forTimeInterval: 0.5)
+                    }
+                    self.gameSessionDied(exitCode: Int(wine_process_exit_code()))
+                }
+            }
             if desktopSession && wine_process_is_running() != 0 {
                 DispatchQueue.global(qos: .utility).async {
                     while wine_process_is_running() != 0 {
@@ -3493,7 +3592,10 @@ struct ContentView: View {
                 // attached-debugger facilities. Desktop sessions stay
                 // attached until the desktop exits (or the safety cap).
                 let isDesktopSession = getenv("MADEIRA_DESKTOP").map { $0.pointee == 49 } ?? false
-                if !isDesktopSession {
+                // ml802: same for a game-only session — the agent launches
+                // more programs later on this runtime.
+                let isAgentRoot = getenv("MADEIRA_AGENT_ROOT").map { $0.pointee == 49 } ?? false
+                if !isDesktopSession && !isAgentRoot {
                     if presentingSince == nil && madeira_get_present_count() >= 1 {
                         presentingSince = now
                         logStore.log("Game is presenting (#1, splash) — early detach in \(Int(settleAfterFirstPresent))s")
