@@ -2333,7 +2333,12 @@ int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
  */
 void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset 8) */
 #define IOS_JIT_TRAMPOLINE_SIZE 16    /* Bytes per trampoline slot */
-#define IOS_JIT_MAX_SLOTS 256         /* Max threads with trampolines */
+/* ml808: was 256. ios_jit_next_slot is a monotonic fetch-and-add with no free
+ * path, and overflow silently returns slot 0 — a SHARED TEB trampoline, which
+ * would present as impossible x18 corruption. ~52 slots are consumed per game
+ * launch (the 3-launch crash log reached 154), so 256 runs out around the 5th
+ * game. This is the next accumulator after the FEX band; one constant. */
+#define IOS_JIT_MAX_SLOTS 1024        /* Max threads with trampolines */
 static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
 
 /* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
@@ -14862,6 +14867,178 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
 
 
 /***********************************************************************
+ *           FEX arena-band ledger  (ml808)
+ *
+ * THE 3rd-LAUNCH CRASH. FEX picks an 8GB band for itself ([va-profile] ml706
+ * SELECTED base=0xc00000000 end=0xdffffffff) and reserves 16MB-aligned 16MB
+ * chunks inside it through VirtualAlloc2 -> NtAllocateVirtualMemoryEx with
+ * MEM_ADDRESS_REQUIREMENTS. Measured cost at the packing frontier: 64MB of
+ * band per guest thread. Hollow Knight runs ~53 guest threads, ~93% of them
+ * still alive when the game exits.
+ *
+ * FEX frees the arenas of guest threads that exit NORMALLY (69 of launch 2's
+ * slots reuse launch-1 addresses), but nothing frees the ones still live at
+ * PROCESS exit, and process_exit_wrapper reclaims the fd cache and the JIT
+ * pool and no address space at all — it structurally cannot, because
+ * struct file_view has no owner field. So the band high-water climbs
+ * monotonically across launches: 3.78GB -> 6.72GB -> 7.98GB, and partway into
+ * the third game there is no 16MB hole left ([va-scan] FAILED views=815
+ * maxgap=0x10000). The request fails HARD (ceiling_relaxable is false whenever
+ * the caller passed limit_high), FEX does not check the result and stores
+ * through the NULL, the guest AV cannot be dispatched, and the redelivery
+ * guard calls task_terminate on the WHOLE Mach task — the app dies.
+ *
+ * So: record these reservations per pseudo-process and release a dead game's
+ * ranges. Keyed on PROCESS death, which is the only sound condition here —
+ * ml330/ml332 (see ios_steer_reclaim_dead above, and the note at the foot of
+ * NtFreeVirtualMemory) established that THREAD death is not, because FEX's
+ * jemalloc heap is shared across threads; releasing on thread exit corrupted
+ * FEX's containers and was reverted twice. Do not re-litigate that.
+ *
+ * Guards against ever freeing a live range:
+ *   1. a same-base note OVERWRITES, never appends, so a range FEX freed and
+ *      wine re-issued to another pseudo-process carries the NEW owner;
+ *   2. MEM_RELEASE drops the entry, so FEX's own frees can't be double-freed;
+ *   3. a grace window after the death, for laggard exit threads;
+ *   4. NtFreeVirtualMemory itself validates base against the live view.
+ */
+#define IOS_FEXVA_MAX      2048
+#define IOS_FEXVA_DEAD_MAX 32
+static struct { uint64_t base; uint64_t size; void *peb; } ios_fexva[IOS_FEXVA_MAX];
+static unsigned ios_fexva_n;
+static struct { void *peb; time_t died; } ios_fexva_dead[IOS_FEXVA_DEAD_MAX];
+static unsigned ios_fexva_dead_n;
+static pthread_mutex_t ios_fexva_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ios_fexva_note( void *base, SIZE_T size, void *peb )
+{
+    uint64_t b = (uint64_t)(uintptr_t)base;
+    unsigned i;
+
+    if (!b || !size) return;
+    pthread_mutex_lock( &ios_fexva_lock );
+    /* A PEB that is still allocating is demonstrably alive — clear any stale
+     * death record. PEB addresses are recycled, same hazard ios_thread_alive()
+     * exists for (ml181). */
+    for (i = 0; i < ios_fexva_dead_n; i++)
+        if (ios_fexva_dead[i].peb == peb) ios_fexva_dead[i].peb = NULL;
+    for (i = 0; i < ios_fexva_n; i++)        /* guard 1: overwrite, never append */
+    {
+        if (ios_fexva[i].base != b) continue;
+        ios_fexva[i].size = size;
+        ios_fexva[i].peb  = peb;
+        pthread_mutex_unlock( &ios_fexva_lock );
+        return;
+    }
+    if (ios_fexva_n < IOS_FEXVA_MAX)
+    {
+        ios_fexva[ios_fexva_n].base = b;
+        ios_fexva[ios_fexva_n].size = size;
+        ios_fexva[ios_fexva_n].peb  = peb;
+        ios_fexva_n++;
+    }
+    else
+    {
+        static int warned;
+        if (!warned)
+        {
+            warned = 1;
+            dprintf( 2, "[fexva] table FULL (%u entries) — later ranges will not be reclaimed\n",
+                     (unsigned)IOS_FEXVA_MAX );
+        }
+    }
+    pthread_mutex_unlock( &ios_fexva_lock );
+}
+
+static void ios_fexva_release( void *base )      /* guard 2 */
+{
+    uint64_t b = (uint64_t)(uintptr_t)base;
+    unsigned i;
+
+    if (!b) return;
+    pthread_mutex_lock( &ios_fexva_lock );
+    for (i = 0; i < ios_fexva_n; i++)
+    {
+        if (ios_fexva[i].base != b) continue;
+        ios_fexva[i].base = 0;
+        ios_fexva[i].size = 0;
+        ios_fexva[i].peb  = NULL;
+        break;
+    }
+    pthread_mutex_unlock( &ios_fexva_lock );
+}
+
+/* Called from process_exit_wrapper (server_ios.c) — a death certificate only.
+ * Nothing is released here: the dying process's laggard threads may still be
+ * running. The grace window in ios_fexva_reclaim_dead() covers them. */
+void ios_fexva_note_dead( void *peb )
+{
+    unsigned i;
+
+    if (!peb) return;
+    pthread_mutex_lock( &ios_fexva_lock );
+    for (i = 0; i < ios_fexva_dead_n; i++) if (!ios_fexva_dead[i].peb) break;
+    if (i == ios_fexva_dead_n && ios_fexva_dead_n < IOS_FEXVA_DEAD_MAX) ios_fexva_dead_n++;
+    if (i < IOS_FEXVA_DEAD_MAX)
+    {
+        ios_fexva_dead[i].peb  = peb;
+        ios_fexva_dead[i].died = time( NULL );
+    }
+    pthread_mutex_unlock( &ios_fexva_lock );
+}
+
+/* Release every recorded range owned by a pseudo-process that has died and is
+ * past its grace window. Returns bytes freed. MUST be called at a syscall
+ * boundary (virtual_mutex NOT held): NtFreeVirtualMemory re-enters the view
+ * tree, and this fork's notes record that faulting under virtual_mutex
+ * deadlocks the Mach fault handler. */
+uint64_t ios_fexva_reclaim_dead( void )
+{
+    uint64_t freed_total = 0;
+    unsigned ranges = 0, i, d;
+    void *last_peb = NULL;
+    time_t now = time( NULL );
+
+    for (i = 0; i < ios_fexva_n; i++)
+    {
+        uint64_t base, size;
+        void *peb = NULL, *addr;
+        SIZE_T sz = 0;
+        int dead = 0;
+
+        pthread_mutex_lock( &ios_fexva_lock );
+        base = ios_fexva[i].base;
+        size = ios_fexva[i].size;
+        peb  = ios_fexva[i].peb;
+        if (base && peb)
+            for (d = 0; d < ios_fexva_dead_n; d++)
+                if (ios_fexva_dead[d].peb == peb &&
+                    now - ios_fexva_dead[d].died >= IOS_POOL_REUSE_GRACE_SEC) { dead = 1; break; }
+        if (dead)   /* claim it before dropping the lock */
+        {
+            ios_fexva[i].base = 0;
+            ios_fexva[i].size = 0;
+            ios_fexva[i].peb  = NULL;
+        }
+        pthread_mutex_unlock( &ios_fexva_lock );
+        if (!dead) continue;
+
+        addr = (void *)(uintptr_t)base;
+        if (!NtFreeVirtualMemory( NtCurrentProcess(), &addr, &sz, MEM_RELEASE ))
+        {
+            freed_total += size;
+            ranges++;
+            last_peb = peb;
+        }
+    }
+    if (ranges)
+        dprintf( 2, "[fexva] RECLAIM peb=%p: %u ranges %llu MB freed rev=ml808\n",
+                 last_peb, ranges, (unsigned long long)(freed_total >> 20) );
+    return freed_total;
+}
+
+
+/***********************************************************************
  *             NtAllocateVirtualMemoryEx   (NTDLL.@)
  *             ZwAllocateVirtualMemoryEx   (NTDLL.@)
  */
@@ -15512,8 +15689,50 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             }
         }
 
-        st = allocate_virtual_memory( ret, size_ptr, type, protect,
-                                      limit_low, limit_high, align, attributes );
+        /* ml808: save the request so the band-reclaim retry below can repeat it. */
+        {
+            void *fexva_ret = *ret;
+            SIZE_T fexva_size = *size_ptr;
+            int fexva_windowed = (limit_low && limit_high && (type & MEM_RESERVE));
+
+            st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                          limit_low, limit_high, align, attributes );
+
+            /* A caller-supplied window plus >=1MB alignment is the exact shape of
+             * FEX's arena chunk reservations, and get_extended_params is the only
+             * writer of limit_low/align — plain NtAllocateVirtualMemory always
+             * passes limit_low=0, align=0. So nothing else produces this. */
+            if (st && fexva_windowed && align >= 0x100000)
+            {
+                if (ios_fexva_reclaim_dead())
+                {
+                    *ret = fexva_ret; *size_ptr = fexva_size;
+                    st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                                  limit_low, limit_high, align, attributes );
+                }
+                if (st)
+                {
+                    /* ml808 INTERIM GUARD: the band is full even after reclaiming.
+                     * Returning the NULL hands FEX a pointer it does not check; it
+                     * stores through it, the guest AV cannot be dispatched, and the
+                     * redelivery guard terminates the whole Mach task. Kill THIS
+                     * pseudo-process instead — the exit() shim longjmps the session
+                     * back and the Games tab sees an ordinary game exit, so the app
+                     * survives and the user loses one game, not everything. Only for
+                     * child pseudo-processes; the session process has no slot. */
+                    extern int ios_peb_is_child( void );
+                    if (ios_peb_is_child())
+                    {
+                        dprintf( 2, "[fexva] band 0x%llx..0x%llx exhausted after reclaim — "
+                                    "terminating this game, not the app rev=ml808\n",
+                                 (unsigned long long)limit_low, (unsigned long long)limit_high );
+                        NtTerminateProcess( GetCurrentProcess(), STATUS_NO_MEMORY );
+                    }
+                }
+            }
+            if (!st && fexva_windowed)
+                ios_fexva_note( *ret, *size_ptr, ios_jit_current_peb() );
+        }
 
         if (is_jumbo) ios_jumbo_census( jumbo_hint, jumbo_size, st ? NULL : *ret, (unsigned)st );
         if (!st && *size_ptr >= 0x10000000 && *size_ptr < 0x40000000 && (type & MEM_RESERVE))
@@ -15665,6 +15884,9 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     /* ml433 (#72): keep the jumbo ledger honest — see ios_bigres_release. */
     if (type & MEM_RELEASE) ios_bigres_release( base );
+    /* ml808: FEX freeing its own arena must drop our entry, so the range can
+     * never be released twice (guard 2 of the FEX band ledger). */
+    if (type & MEM_RELEASE) ios_fexva_release( base );
     /* ml435 (#73): band span lifecycle census — resolve MEM_RELEASE size=0 from the view. */
     if ((type & MEM_RELEASE) && (uintptr_t)base >= 0x7c00000000ULL)
     {

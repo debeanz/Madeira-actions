@@ -503,6 +503,18 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     ERR("spawn_process: creating child thread for %s (fd=%d, unixdir=%d, dup_unixdir=%d)\n",
         debugstr_us(&params->CommandLine), socketfd, unixdir, args->unixdir);
 
+    /* ml808: hand the next game a clean FEX arena band. Games are launched one
+     * after another in a single app run, and each leaves ~3GB of an 8GB window
+     * reserved by guest threads that were still alive at its exit. Reclaiming
+     * HERE (rather than only under allocation pressure) means launch N+1 starts
+     * from a clean band instead of reclaiming ~200 ranges mid-frame. Entries
+     * still inside their grace window are skipped and picked up later by the
+     * pressure path in NtAllocateVirtualMemoryEx. */
+    {
+        extern uint64_t ios_fexva_reclaim_dead( void );
+        ios_fexva_reclaim_dead();
+    }
+
     ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );
     if (ret) {
         ERR("spawn_process: pthread_create failed: %d\n", ret);

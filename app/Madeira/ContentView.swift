@@ -274,6 +274,11 @@ final class MetalBackedView: UIView {
     private static var cursor = CGPoint(x: 480, y: 270)
     private var lastPanPoint = CGPoint.zero
     private var touchStartPoint = CGPoint.zero
+    /// ml808: where the cursor was when the finger landed. A "tap" tolerates
+    /// 10 pt of finger roll, and at sensAbs=2.0 that roll has already dragged
+    /// the cursor up to 20 wine px (~12 pt) before the click is posted — so a
+    /// tap could click well away from where the arrow was aimed.
+    private var cursorAtDown = CGPoint.zero
     private var touchStartTime: TimeInterval = 0
     private var movedBeyondSlop = false
     private var dragActive = false
@@ -358,6 +363,7 @@ final class MetalBackedView: UIView {
         guard let t = touches.first else { return }
         let p = t.location(in: self)
         touchStartPoint = p
+        cursorAtDown = Self.cursor          // ml808: anchor the tap's click point
         lastPanPoint = p
         touchStartTime = now
         movedBeyondSlop = false
@@ -523,6 +529,17 @@ final class MetalBackedView: UIView {
         // weapon. Left/right click are on-screen buttons there instead.
         if !movedBeyondSlop && now - touchStartTime < 0.5 && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
+            // ml808: click where the arrow was when the finger LANDED, not where
+            // the finger's roll dragged it. The position must be re-posted: a
+            // button-only event reuses the server's current cursor.
+            Self.cursor = cursorAtDown
+            postPointer(F_MOVE | F_ABS)
+            if !desktopMode {
+                let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
+                let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
+                moveGameCursorOverlay(fracX: Self.cursor.x / max(maxX, 1),
+                                      fracY: Self.cursor.y / max(maxY, 1))
+            }
             postPointer(F_LDOWN)
             postPointer(F_LUP)
         }

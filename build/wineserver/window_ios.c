@@ -670,20 +670,28 @@ static struct window *create_window( struct window *parent, struct window *owner
                     desktop->winstation->flags |= 1 /* WSF_VISIBLE */;
                     desktop->winstation->input_desktop = desktop;
                 }
-                /* iOS: monitors_get_union_rect returns (0,0,0,0) since we
-                 * never report a monitor. That makes cursor.clip degenerate
-                 * and update_desktop_cursor_pos clips every (x,y) to (0,0),
-                 * dropping all hardware mouse coords. Initialize the desktop
-                 * shared cursor.clip directly to match SM_CXSCREEN/CYSCREEN
-                 * (1024x768 in sysparams_ios.c). */
+                /* iOS: monitors_get_union_rect returns (0,0,0,0) here, which
+                 * makes cursor.clip degenerate and update_desktop_cursor_pos
+                 * clips every (x,y) to (0,0), dropping all hardware mouse
+                 * coords. Initialize the desktop shared cursor.clip to the
+                 * real screen size.
+                 * ml808: was hardcoded 1024x768 while MADEIRA_SCREEN is
+                 * 1280x720, which pinned the cursor to x<=1023 and made the
+                 * right fifth of the screen unreachable. Read the same env the
+                 * rest of the port uses (sysparams_ios.c ios_screen_size);
+                 * this is one Mach process, so getenv works here too. */
                 {
                     desktop_shm_t *desktop_shm = desktop->shared;
+                    const char *we = getenv( "MADEIRA_SCREEN_W" );
+                    const char *he = getenv( "MADEIRA_SCREEN_H" );
+                    int sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
+                    int sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
                     SHARED_WRITE_BEGIN( desktop_shm, desktop_shm_t )
                     {
                         shared->cursor.clip.left = 0;
                         shared->cursor.clip.top = 0;
-                        shared->cursor.clip.right = 1024;
-                        shared->cursor.clip.bottom = 768;
+                        shared->cursor.clip.right = sw;
+                        shared->cursor.clip.bottom = sh;
                     }
                     SHARED_WRITE_END;
                 }
@@ -2386,18 +2394,24 @@ DECL_HANDLER(get_desktop_window)
                 desktop->winstation->flags |= 1 /* WSF_VISIBLE */;
                 desktop->winstation->input_desktop = desktop;
             }
-            /* Initialize cursor.clip to screen size — monitors_get_union_rect
-             * returns (0,0,0,0) on iOS so update_desktop_cursor_pos clips
-             * every (x,y) to (0,0) by default. Hardcode 1024x768 to match
-             * sysparams_ios.c SM_CXSCREEN/CYSCREEN. */
+            /* Initialize cursor.clip to the screen size — monitors_get_union_rect
+             * returns (0,0,0,0) on iOS so update_desktop_cursor_pos clips every
+             * (x,y) to (0,0) by default.
+             * ml808: was hardcoded 1024x768; see the companion patch in
+             * create_window. Use MADEIRA_SCREEN_W/H, the same source as
+             * sysparams_ios.c ios_screen_size. */
             {
                 desktop_shm_t *desktop_shm = desktop->shared;
+                const char *we = getenv( "MADEIRA_SCREEN_W" );
+                const char *he = getenv( "MADEIRA_SCREEN_H" );
+                int sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
+                int sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
                 SHARED_WRITE_BEGIN( desktop_shm, desktop_shm_t )
                 {
                     shared->cursor.clip.left = 0;
                     shared->cursor.clip.top = 0;
-                    shared->cursor.clip.right = 1024;
-                    shared->cursor.clip.bottom = 768;
+                    shared->cursor.clip.right = sw;
+                    shared->cursor.clip.bottom = sh;
                 }
                 SHARED_WRITE_END;
             }

@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <stdlib.h>   /* ml808: getenv/atoi for the cursor client-rect mapping */
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -61,6 +62,7 @@ extern void winios_pWindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
                                       const struct window_rects *new_rects, struct window_surface *surface ) __attribute__((weak));
 
 static struct user_driver_funcs winios_user_driver;
+static int winios_desktop_mode(void);   /* ml808: used by winios_drv_post_mouse below */
 
 /* C bridge for Winios.m to inject mouse input without pulling in Wine
  * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
@@ -70,6 +72,54 @@ static struct user_driver_funcs winios_user_driver;
 void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, HWND hwnd)
 {
     INPUT input;
+
+    /* ml808: THE CURSOR AIM OFFSET.
+     *
+     * The app maps the pointer onto the 1280x720 wine DESKTOP, but what the
+     * Metal layer shows is the game's CLIENT area. Unity asks for a 1280x720
+     * client and AdjustWindowRect grows the window to 1288x747 (this build's
+     * own SM_CXFRAME=4, SM_CYCAPTION=19: 4+1280+4 and 23+720+4), so the client
+     * origin is desktop (4,23). An arrow drawn over content pixel (u,v) was
+     * posted as desktop (u,v), which the game hit-tests as client (u-4,v-23) —
+     * the game's cursor sat 23px above and 4px left of the drawn arrow, so the
+     * user had to aim below-and-right of every button. Constant everywhere,
+     * which is why the cursor otherwise felt right.
+     *
+     * Map absolute moves through the foreground window's client rect. Button
+     * events must NOT be translated: the server reuses the current cursor for
+     * those. Game mode only — in desktop mode translating through whatever app
+     * window has focus would be catastrophic. If the client rect turns out to
+     * equal the desktop, this is the identity and changes nothing. */
+    if ((flags & MOUSEEVENTF_MOVE) && (flags & MOUSEEVENTF_ABSOLUTE) && !winios_desktop_mode())
+    {
+        HWND fg = NtUserGetForegroundWindow();
+        struct window_rects r;
+        const char *we = getenv( "MADEIRA_SCREEN_W" ), *he = getenv( "MADEIRA_SCREEN_H" );
+        int sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
+        int sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
+
+        memset( &r, 0, sizeof(r) );
+        if (fg && get_window_rects( fg, COORDS_SCREEN, &r, get_thread_dpi() ))
+        {
+            int cw = r.client.right - r.client.left, ch = r.client.bottom - r.client.top;
+            /* Ignore the 1x1 message/IME windows that also take focus. */
+            if (cw > sw / 2 && ch > sh / 2)
+            {
+                static int logged;
+                if (!logged)
+                {
+                    logged = 1;
+                    dprintf( 2, "[winios] ml808 cursor maps through client={%d,%d,%d,%d} "
+                                "(screen %dx%d) hwnd=%p\n",
+                             (int)r.client.left, (int)r.client.top,
+                             (int)r.client.right, (int)r.client.bottom, sw, sh, fg );
+                }
+                x = r.client.left + (int)((long long)x * cw / sw);
+                y = r.client.top  + (int)((long long)y * ch / sh);
+            }
+        }
+    }
+
     input.type           = INPUT_MOUSE;
     input.mi.dx          = x;
     input.mi.dy          = y;
@@ -516,9 +566,17 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         if (n <= 1200 || (n % 128) == 0)
         {
             const RECT *v = &new_rects->visible;
+            /* ml808: print the CLIENT rect too. This is the proof for the cursor
+             * aim offset — if the game's window logs vis={0,0,1288,747} with
+             * client={4,23,1284,743}, the client-origin mapping in
+             * winios_drv_post_mouse is addressing the right thing; if client
+             * equals vis, that mapping is a no-op and the offset is elsewhere. */
+            const RECT *c = &new_rects->client;
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
-                     "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
-                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+                     "client={%d,%d,%d,%d} surface=%p rev=ml808\n",
+                     n, hwnd, insert_after, (unsigned)swp_flags,
+                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom,
+                     (int)c->left, (int)c->top, (int)c->right, (int)c->bottom, surface );
         }
     }
 

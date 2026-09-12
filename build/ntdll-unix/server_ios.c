@@ -197,6 +197,16 @@ static int ios_proc_socket_index(void)
     return -1;
 }
 
+/* ml808: is the caller a CHILD pseudo-process (a game), rather than the
+ * session/root process? Children register a socket slot; the root never does,
+ * which is exactly why process_exit_wrapper has its `else close(fd_socket)`
+ * branch. Used by the FEX band guard to kill a starved game instead of the
+ * whole app. */
+int ios_peb_is_child(void)
+{
+    return ios_proc_socket_index() >= 0;
+}
+
 /* Master socket for the CURRENT thread's pseudo-process (parent = global). */
 static int ios_current_fd_socket(void)
 {
@@ -2289,6 +2299,15 @@ void process_exit_wrapper( int status )
          * the session (else-branch) lives as long as the app. Reuse is
          * grace-delayed inside the allocator for laggard exit threads. */
         ios_jit_reclaim_process( dead_peb );
+        /* ml808: and record the death for the FEX arena-band ledger. The band
+         * is where each game's ~53 guest threads reserve 64MB apiece; nothing
+         * released it before, so two games filled the 8GB window and the third
+         * took the whole app down. Release is deferred (grace window) — this
+         * process's laggard threads may still be running. */
+        {
+            extern void ios_fexva_note_dead( void *peb );
+            ios_fexva_note_dead( dead_peb );
+        }
         /* 2026-09-10: drop the compositor layers this process's windows
          * owned (Winios.m). The server destroys the windows with the
          * process but the display driver never gets pDestroyWindow for
