@@ -1188,6 +1188,9 @@ struct ContentView: View {
     @State private var launchingGame: LauncherGame? = nil
     @State private var firstFrameSeen = false
     @State private var launchBarPhase = false
+    /// ml809: seconds the loading screen has been up, so a long first-frame
+    /// wait visibly progresses instead of looking hung.
+    @State private var launchElapsed = 0
     @State private var playingPid: Int = 0
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
@@ -1542,13 +1545,28 @@ struct ContentView: View {
     /// agent's exit report so Play returns.
     private func watchHostedGame(pid: Int, title: String) {
         DispatchQueue.global(qos: .utility).async {
-            let presents0 = madeira_get_present_count()
+            // ml809: THE STUCK LOADING SCREEN. The present counter is per
+            // swapchain and RESTARTS AT ZERO for each new game (the wine log
+            // shows [FRAME_STATS] beginning again at #64 every launch). Taking
+            // a baseline once and waiting for `baseline + 2` therefore worked
+            // only for the FIRST game of a session: every later launch compared
+            // a fresh counter against the previous game's total, could never
+            // reach it, and sat on "Launching game…" for the full 60 s while
+            // the game was in fact running fine behind it. The user force-closed
+            // those games, which is what made them look like launch failures.
+            //
+            // Re-baseline whenever the counter goes BACKWARDS: that is the new
+            // swapchain starting. Works whether the counter resets or not.
+            var base = madeira_get_present_count()
             var waited = 0.0
-            while madeira_get_present_count() < presents0 + 2 && waited < 60 {
+            var drew = false
+            while waited < 60 {
+                let c = madeira_get_present_count()
+                if c < base { base = c }          // new swapchain — re-baseline
+                if c >= base + 2 { drew = true; break }
                 Thread.sleep(forTimeInterval: 0.25)
                 waited += 0.25
             }
-            let drew = madeira_get_present_count() >= presents0 + 2
             DispatchQueue.main.async {
                 self.firstFrameSeen = true
                 // ml801: a game that never drew within 60 s died at startup
@@ -2047,13 +2065,23 @@ struct ContentView: View {
             }
             .padding(32)
         }
+        // ml809: tick the elapsed counter while the loading screen is up.
+        .onAppear { launchElapsed = 0 }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            if showLaunchOverlay { launchElapsed += 1 }
+        }
     }
 
     private var launchStatusText: String {
+        // ml809: show the elapsed seconds once a load runs long. Hollow Knight
+        // takes ~15 s to reach its first frame, and a motionless "Launching
+        // game…" for that long reads as frozen — which is exactly why the user
+        // force-closed games that were starting normally.
+        let tail = launchElapsed >= 5 ? "  \(launchElapsed)s" : ""
         switch launcherSession {
-        case .enablingJIT: return "Enabling JIT…"
-        case .launching: return "Launching game…"
-        default: return "Loading…"
+        case .enablingJIT: return "Enabling JIT…" + tail
+        case .launching, .playing: return "Launching game…" + tail
+        default: return "Loading…" + tail
         }
     }
 
@@ -3844,9 +3872,27 @@ struct ContentView: View {
             var presentingSince: CFAbsoluteTime? = nil
             let pollStart = CFAbsoluteTimeGetCurrent()
             var lastHeartbeat = CFAbsoluteTimeGetCurrent()
+            var loggingResumed = false
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)
                 let now = CFAbsoluteTimeGetCurrent()
+                // ml809: RESTORE APP-SIDE LOGGING for sessions that never exit.
+                // Step 5 below re-enables the Swift log channel, but a desktop
+                // or game session only reaches it when its ROOT process ends —
+                // i.e. after the 1200 s cap. So every LogStore line for a whole
+                // game session was dropped: no "<game> started (pid N)", no
+                // "never drew", no exit report. That blind spot is why the
+                // stuck loading screen above had to be diagnosed from the wine
+                // side by inference. The pause exists to stop os_log/SwiftUI
+                // contention during the attached-debugger phase, which is over
+                // within a couple of seconds, so lift it once the session is up.
+                if !loggingResumed && now - pollStart > 5 {
+                    loggingResumed = true
+                    DispatchQueue.main.async {
+                        ws_log_quiet = 0
+                        logStore.uiPaused = false
+                    }
+                }
                 // Diagnostic heartbeat: 2026-07-03's detach-at-#1 run never
                 // triggered despite presents visibly counting — log what this
                 // loop actually observes so that can't happen silently again.
