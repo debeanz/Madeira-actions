@@ -76,43 +76,6 @@ final class MetalHostView: UIView {
         metalLayer.drawableSize = CGSize(width: 800, height: 600)
     }
     required init?(coder: NSCoder) { fatalError() }
-
-    // ml805: on-screen mouse pointer for game mode. In desktop mode the wine
-    // cursor is drawn by the compositor, but game mode has no compositor, so
-    // draw our own. A non-interactive subview: it never eats touches (this
-    // host has userInteractionEnabled=false anyway) and, being a child of the
-    // host, it hides automatically whenever the host is hidden (loading
-    // overlay, tab switch). Positioned in host-local points; the host is
-    // framed to the aspect-fit game rect, so a [0,1] fraction maps directly.
-    private var gameCursorView: UIImageView?
-    private func ensureGameCursor() -> UIImageView {
-        if let c = gameCursorView { return c }
-        let cfg = UIImage.SymbolConfiguration(pointSize: 26, weight: .regular)
-        let img = UIImage(systemName: "cursorarrow.fill", withConfiguration: cfg)?
-            .withTintColor(.white, renderingMode: .alwaysOriginal)
-        let iv = UIImageView(image: img)
-        iv.isUserInteractionEnabled = false
-        iv.sizeToFit()
-        iv.layer.shadowColor = UIColor.black.cgColor
-        iv.layer.shadowOpacity = 0.8
-        iv.layer.shadowRadius = 1.0
-        iv.layer.shadowOffset = CGSize(width: 0.5, height: 1.0)
-        addSubview(iv)
-        gameCursorView = iv
-        return iv
-    }
-    /// Move (and reveal) the pointer. fracX/fracY are the cursor position as a
-    /// fraction of the game area, matching the absolute position sent to wine.
-    func moveGameCursor(fracX: CGFloat, fracY: CGFloat) {
-        let c = ensureGameCursor()
-        let sz = c.bounds.size
-        // Hotspot ≈ the arrow tip near the glyph's top-left.
-        c.frame = CGRect(x: fracX * bounds.width - sz.width * 0.12,
-                         y: fracY * bounds.height - sz.height * 0.08,
-                         width: sz.width, height: sz.height)
-        c.isHidden = false
-    }
-    func setGameCursorHidden(_ hidden: Bool) { gameCursorView?.isHidden = hidden }
 }
 
 // SwiftUI-hosted placeholder: geometry + touch input only.
@@ -254,15 +217,16 @@ final class MetalBackedView: UIView {
             w.addSubview(host)
         }
         host.frame = convert(gameRect(), to: w)
-        // ml805: reveal the pointer at its current spot the moment a game goes
-        // full screen (game mode only), so a first tap has a visible target;
-        // in relative (mouselook) mode and desktop mode it stays hidden.
-        if !desktopMode && !InputSettings.shared.relative {
-            let (gw, gh) = Self.logicalScreen()
-            host.moveGameCursor(fracX: Self.cursor.x / gw, fracY: Self.cursor.y / gh)
-        } else {
-            host.setGameCursorHidden(true)
-        }
+        // ml806: create the pointer window now, but do NOT reveal the arrow
+        // here. didMoveToWindow runs before SwiftUI lays this view out
+        // (makeUIView hands back a fixed 800x600 frame) and before the
+        // portrait->landscape rotation this screen requests, so any position
+        // computed now is wrong — and it runs while the loading screen is up.
+        // The first finger glide reveals it at a correct position
+        // (touchesMoved -> moveGameCursorOverlay), reading the live host frame
+        // that layoutSubviews keeps current.
+        GameCursorHost.attach()
+        GameCursorHost.setHidden(true)
         // S2 desktop mode: the winios compositor renders the wine virtual
         // desktop aspect-fit inside THIS placeholder's area, exactly like
         // the games' Metal layer — never over the whole phone screen.
@@ -475,7 +439,7 @@ final class MetalBackedView: UIView {
         if InputSettings.shared.relative {
             // ml805: mouselook hides the pointer — the finger is the camera,
             // there is no cursor to show.
-            if !desktopMode { MetalHostView.shared.setGameCursorHidden(true) }
+            if !desktopMode { GameCursorHost.setHidden(true) }
             let sens = CGFloat(InputSettings.shared.sensRel)
             relCarryX += dx * sens
             relCarryY += dy * sens
@@ -496,9 +460,20 @@ final class MetalBackedView: UIView {
         // ml805: move the on-screen pointer overlay to match (game mode only —
         // desktop mode draws the wine cursor through the compositor).
         if !desktopMode {
-            MetalHostView.shared.moveGameCursor(fracX: Self.cursor.x / max(maxX, 1),
-                                                fracY: Self.cursor.y / max(maxY, 1))
+            moveGameCursorOverlay(fracX: Self.cursor.x / max(maxX, 1),
+                                  fracY: Self.cursor.y / max(maxY, 1))
         }
+    }
+
+    /// Place the pointer overlay at a position given as a fraction of the game
+    /// area. The overlay lives in its own window (ml806), so the fraction is
+    /// mapped through the Metal host's frame, which is already the aspect-fit
+    /// game rect in window coordinates.
+    private func moveGameCursorOverlay(fracX: CGFloat, fracY: CGFloat) {
+        let r = MetalHostView.shared.frame
+        guard r.width > 1, r.height > 1 else { return }
+        GameCursorHost.move(to: CGPoint(x: r.minX + fracX * r.width,
+                                        y: r.minY + fracY * r.height))
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -652,6 +627,100 @@ enum JoystickPadHost {
 /// steal input from the game surface or the SwiftUI controls.
 final class PassthroughWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
+}
+
+/// ml806: the in-game mouse pointer.
+///
+/// The pointer lives in its own window above the app's, the pattern
+/// JoystickPadHost documents for the thumbstick: window level dominates
+/// view-hierarchy ordering absolutely, and TouchControlsHost already proves on
+/// device that a PassthroughWindow composites above the game's CAMetalLayer.
+/// Plain UIKit rather than SwiftUI — this moves on every touch sample.
+enum GameCursorHost {
+    private static var overlay: PassthroughWindow?
+    private static var arrow: UIImageView?
+    private static var loggedMove = false
+
+    /// Drawn, NOT an SF Symbol. `cursorarrow.fill` does not exist — the family
+    /// has cursorarrow, .square, .square.fill, .click, .rays … but no bare
+    /// .fill — so `UIImage(systemName:)` returned nil in 0.1.57, the optional
+    /// chain swallowed it, and `sizeToFit()` left a 0x0 view. THAT is why the
+    /// pointer was invisible while the input worked (menu items highlighted
+    /// under it: that path never touches the image). Drawing it removes the
+    /// catalog dependency, puts the tip at a known offset, and gives a white
+    /// arrow with a black outline that reads on any game background.
+    private static let tipInset: CGFloat = 2
+    private static func arrowImage() -> UIImage {
+        let s: CGFloat = 1.7, pad = tipInset
+        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x * s + pad, y: y * s + pad) }
+        let size = CGSize(width: 11.2 * s + pad * 2, height: 18 * s + pad * 2)
+        return UIGraphicsImageRenderer(size: size).image { _ in
+            let p = UIBezierPath()
+            p.move(to: pt(0, 0))
+            p.addLine(to: pt(0, 16))
+            p.addLine(to: pt(4, 12.4))
+            p.addLine(to: pt(6.4, 18))
+            p.addLine(to: pt(9.2, 16.8))
+            p.addLine(to: pt(6.8, 11.4))
+            p.addLine(to: pt(11.2, 11.4))
+            p.close()
+            p.lineWidth = 1.6
+            p.lineJoin = .round
+            UIColor.white.setFill(); p.fill()
+            UIColor.black.setStroke(); p.stroke()
+        }
+    }
+
+    /// Create the window (once) and re-sync its frame. Called on attach and
+    /// rotation, NOT per move — the scene lookup is too costly for that.
+    static func attach() {
+        // The `?? scenes.first` fallback is load-bearing, not cosmetic:
+        // attach() is called during the scene geometry change, and if the
+        // strict foregroundActive guard no-ops there the overlay keeps the old
+        // orientation's bounds for the whole session. TouchControlsHost
+        // carries the same fallback for the same reason.
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        guard let scene = scenes.first(where: { $0.activationState == .foregroundActive })
+                        ?? scenes.first else { return }
+        if overlay == nil {
+            let w = PassthroughWindow(windowScene: scene)
+            // Above the touch controls (+101) and the pad (+100): a pointer
+            // belongs on top of everything, like a real cursor.
+            w.windowLevel = .normal + 102
+            w.backgroundColor = .clear
+            w.isHidden = false
+            let vc = UIViewController()
+            vc.view.backgroundColor = .clear
+            vc.view.isUserInteractionEnabled = false
+            w.rootViewController = vc
+            let iv = UIImageView(image: arrowImage())
+            iv.isUserInteractionEnabled = false
+            iv.isHidden = true
+            vc.view.addSubview(iv)
+            arrow = iv
+            overlay = w
+        }
+        overlay?.frame = scene.coordinateSpace.bounds
+        fputs("[cursor] ml806 attach win=\(overlay?.frame ?? .zero) "
+              + "img=\(arrow?.image == nil ? "NIL" : "ok") size=\(arrow?.image?.size ?? .zero)\n",
+              stderr)
+    }
+
+    /// `p` is where the arrow TIP should sit, in window coordinates.
+    static func move(to p: CGPoint) {
+        if overlay == nil { attach() }
+        guard let iv = arrow, let sz = iv.image?.size else { return }
+        iv.frame = CGRect(x: p.x - tipInset, y: p.y - tipInset,
+                          width: sz.width, height: sz.height)
+        iv.isHidden = false
+        if !loggedMove {
+            loggedMove = true
+            fputs("[cursor] ml806 first move p=\(p) frame=\(iv.frame) "
+                  + "host=\(MetalHostView.shared.frame)\n", stderr)
+        }
+    }
+
+    static func setHidden(_ hidden: Bool) { arrow?.isHidden = hidden }
 }
 
 /// The expanded pad, drawn in window space at the button's location.
@@ -1160,6 +1229,12 @@ struct ContentView: View {
             applySurfaceVisibility(tab: selectedTab)
         }
         .onChange(of: desktopFullScreen) { _, _ in
+            // ml806: leaving full screen MUST re-apply surface visibility. A
+            // game session never changes selectedTab (it stays on .games, see
+            // playGameHosted), so the .onChange(of: selectedTab) above never
+            // fires when a game ends — the window-level Metal host stayed
+            // visible and covered the Games grid with a black rectangle.
+            applySurfaceVisibility(tab: selectedTab)
             syncGamepadUIMode()
         }
         .onReceive(NotificationCenter.default.publisher(
@@ -1187,6 +1262,9 @@ struct ContentView: View {
         let hidden = tab != .desktop || desktopShutDown || showLaunchOverlay || gameSessionOnly
         MetalHostView.shared.isHidden = hidden
         winios_set_compositor_hidden(hidden ? 1 : 0)
+        // ml806: the pointer is its own window, so it does NOT inherit the
+        // host's hidden state — take it down with the game surface.
+        if hidden { GameCursorHost.setHidden(true) }
     }
 
     /// "Running" on the Start Desktop button: the runtime is up and the
@@ -1907,8 +1985,16 @@ struct ContentView: View {
         // ABOVE this SwiftUI tree, so they must stay hidden while the
         // loading screen is up or it is covered by a black surface.
         .onChange(of: showLaunchOverlay) { _, show in
+            // ml806: a failed or timed-out launch clears desktopFullScreen in
+            // the SAME transaction that drops the loading screen. Without this
+            // guard the un-hide below re-shows the surface that the
+            // .onChange(of: desktopFullScreen) handler just took down — the
+            // black rectangle over the Games grid, again.
+            guard desktopFullScreen else { applySurfaceVisibility(tab: selectedTab); return }
             MetalHostView.shared.isHidden = show
             winios_set_compositor_hidden(show ? 1 : 0)
+            // No pointer over the loading screen.
+            if show { GameCursorHost.setHidden(true) }
         }
         .onAppear {
             MetalHostView.shared.isHidden = showLaunchOverlay
@@ -1921,6 +2007,9 @@ struct ContentView: View {
         .onDisappear {
             touchControls.editing = false
             touchControls.fullScreen = false
+            // ml806: the pointer belongs to the game surface — it must not
+            // linger over the Games grid.
+            GameCursorHost.setHidden(true)
             requestOrientation(MadeiraAppDelegate.normalOrientations)
         }
     }
@@ -1951,8 +2040,10 @@ struct ContentView: View {
                 // safe-area toolbar follows the landscape scene instead of
                 // landing in the middle of the display.
                 TouchControlsHost.attach()
+                GameCursorHost.attach()   // ml806: re-sync the pointer window's frame
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                     TouchControlsHost.attach()
+                    GameCursorHost.attach()
                 }
             }
         }
@@ -2501,6 +2592,11 @@ struct ContentView: View {
         setenv("MADEIRA_ARGS",
                "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\madeira-agent.exe C:\\windows\\system32\\services.exe", 1)
         setenv("MADEIRA_DESKTOP", "1", 1)
+        // ml806: from here the compositor draws the wine cursor — our overlay
+        // must not double up on it. It can already be showing: the Desktop tab
+        // embeds the same MetalBackedView, and a glide on it before Start
+        // Desktop reveals the arrow (desktopMode is still false at that point).
+        GameCursorHost.setHidden(true)
         unsetenv("MADEIRA_AGENT_ROOT")
         setenv("MADEIRA_SCREEN_W", String(deskW), 1)
         setenv("MADEIRA_SCREEN_H", String(deskH), 1)
