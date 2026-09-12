@@ -1231,6 +1231,10 @@ struct ContentView: View {
     /// at least say so instead of letting every later Play fail silently.
     @State private var sessionCrashed = false
     @State private var showSessionCrashedAlert = false
+    /// ml816: the game has stopped drawing and we are waiting to be sure it is
+    /// quitting rather than busy. Shows the "Closing game…" panel over the
+    /// frozen last frame so the wait reads as progress.
+    @State private var closingGame = false
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
     @State private var showRelaunchAlert = false
@@ -1494,6 +1498,7 @@ struct ContentView: View {
         let exePath = GameLibrary.windowsPath(exe)
         launchingGame = game
         firstFrameSeen = false
+        closingGame = false          // ml816: never carry a stale closing panel in
         launcherSession = .launching(game.title)
         // ml804: set the logical screen size BEFORE going full screen. The
         // full-screen Metal host aspect-fits to MetalBackedView.logicalScreen()
@@ -1670,23 +1675,41 @@ struct ContentView: View {
             // guard rejected it. Now the log says which.
             logStore.log("\(title): stall watchdog \(drew ? "armed" : "NOT armed (never saw a frame)")")
             guard drew else { return }
+            // ml816: 20 s was measured on device as exactly right in JUDGEMENT
+            // (presents froze at 2170 and never moved again) but far too long in
+            // FEEL — the user sat on the game's frozen last frame with nothing
+            // indicating the app had noticed. Halve it, and put the "Closing
+            // game…" panel up after 3 s so the remainder reads as progress
+            // instead of a hang. 10 s is still ~600 missed frames: no running
+            // game goes that quiet, and a loading screen keeps presenting.
             var lastCount = madeira_get_present_count()
             var stalled = 0.0
             var since = 0.0
-            while stalled < 20 && !done.done {
+            var announced = false
+            while stalled < 10 && !done.done {
                 Thread.sleep(forTimeInterval: 0.5)
                 since += 0.5
                 let c = madeira_get_present_count()
                 if c != lastCount { lastCount = c; stalled = 0 } else { stalled += 0.5 }
-                // Heartbeat every 15 s: proves whether presents actually stop.
+                if stalled >= 3 && !announced {
+                    announced = true
+                    DispatchQueue.main.async { self.closingGame = true }
+                } else if stalled == 0 && announced {
+                    announced = false                      // it came back to life
+                    DispatchQueue.main.async { self.closingGame = false }
+                }
                 if since.truncatingRemainder(dividingBy: 15) < 0.25 {
                     logStore.log("\(title): presents=\(c) stalled=\(Int(stalled))s")
                 }
             }
-            guard !done.done else { return }
+            guard !done.done else {
+                DispatchQueue.main.async { self.closingGame = false }
+                return
+            }
             DispatchQueue.main.async {
+                self.closingGame = false
                 guard case .playing(let t) = self.launcherSession, t == title else { return }
-                logStore.log("\(title) stopped drawing for 20 s — it is quitting or hung, "
+                logStore.log("\(title) stopped drawing for 10 s — it is quitting or hung, "
                              + "returning to the Games tab", level: .error)
                 self.launcherSession = .idle
                 self.launchingGame = nil
@@ -1696,6 +1719,7 @@ struct ContentView: View {
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
             done.done = true          // ml814: stop the stall watchdog
+            closingGame = false       // ml816: the real exit beat the watchdog
             logStore.log("\(title) ended (exit code \(code))")
             // ml812: a non-zero exit is a crash (a clean quit and our WM_CLOSE
             // force-close both report 0). Remember it: the threads it left
@@ -2199,6 +2223,7 @@ struct ContentView: View {
         // game…" for that long reads as frozen — which is exactly why the user
         // force-closed games that were starting normally.
         let tail = launchElapsed >= 5 ? "  \(launchElapsed)s" : ""
+        if closingGame { return "Closing game…" }
         switch launcherSession {
         case .enablingJIT: return "Enabling JIT…" + tail
         case .launching, .playing: return "Launching game…" + tail
@@ -2207,6 +2232,10 @@ struct ContentView: View {
     }
 
     private var showLaunchOverlay: Bool {
+        // ml816: the same panel covers the CLOSING wait. Without it the user
+        // stares at the game's frozen last frame with nothing to say the app
+        // noticed — which is why 20 s felt like a hang rather than a wait.
+        if closingGame { return true }
         guard launchingGame != nil, !firstFrameSeen else { return false }
         switch launcherSession {
         case .enablingJIT, .launching, .playing: return true
