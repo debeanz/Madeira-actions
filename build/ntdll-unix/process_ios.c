@@ -511,8 +511,11 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
      * still inside their grace window are skipped and picked up later by the
      * pressure path in NtAllocateVirtualMemoryEx. */
     {
-        extern uint64_t ios_fexva_reclaim_dead( int min_grace_sec );
-        ios_fexva_reclaim_dead( 0 );   /* 0 = the default grace */
+        /* ml810: wait out the previous game's grace window if it is still
+         * inside it — the user relaunches 1-2 s after quitting, which used to
+         * skip the reclaim on exactly the launches that needed it. */
+        extern uint64_t ios_fexva_reclaim_dead_waiting( int max_wait_sec );
+        ios_fexva_reclaim_dead_waiting( 5 );
     }
 
     ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );

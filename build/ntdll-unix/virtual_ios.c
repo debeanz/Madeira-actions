@@ -15090,6 +15090,51 @@ uint64_t ios_fexva_reclaim_dead( int min_grace_sec )
     return freed_total;
 }
 
+/* ml810: reclaim at spawn, WAITING OUT the grace window if the game that just
+ * died is still inside it.
+ *
+ * ml808 reclaimed only deaths older than IOS_POOL_REUSE_GRACE_SEC, but the user
+ * relaunches 1-2 s after quitting — inside that window — so the previous game's
+ * ~3.8GB was skipped on exactly the launches that needed it, and the band ran
+ * out one second into the next game. The device log shows this directly: a
+ * spawn 1 s after an exit prints no RECLAIM line, and the band then fails with
+ * maxgap=0xff0000 — 64KB short of the 16MB it wanted, i.e. FRAGMENTED by the
+ * previous games' interleaved ranges rather than genuinely full.
+ *
+ * Waiting here is safe (the release condition is unchanged — we only let the
+ * clock catch up) and cheap: a game takes ~15 s to reach its first frame, so a
+ * second or two before spawning is invisible, and it is the difference between
+ * the launch working and being killed by the band guard. */
+uint64_t ios_fexva_reclaim_dead_waiting( int max_wait_sec )
+{
+    uint64_t freed = 0;
+    int waited = 0;
+
+    for (;;)
+    {
+        unsigned d;
+        time_t now;
+        int pending = 0;
+
+        freed += ios_fexva_reclaim_dead( 0 );
+
+        now = time( NULL );
+        pthread_mutex_lock( &ios_fexva_lock );
+        for (d = 0; d < ios_fexva_dead_n; d++)
+            if (ios_fexva_dead[d].peb &&
+                now - ios_fexva_dead[d].died < IOS_POOL_REUSE_GRACE_SEC) { pending = 1; break; }
+        pthread_mutex_unlock( &ios_fexva_lock );
+
+        if (!pending || waited >= max_wait_sec) break;
+        usleep( 1000000 );
+        waited++;
+    }
+    if (waited)
+        dprintf( 2, "[fexva] spawn waited %ds for the previous game's grace window, "
+                    "%llu MB reclaimed rev=ml810\n", waited, (unsigned long long)(freed >> 20) );
+    return freed;
+}
+
 
 /***********************************************************************
  *             NtAllocateVirtualMemoryEx   (NTDLL.@)

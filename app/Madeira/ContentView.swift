@@ -650,6 +650,18 @@ final class PassthroughWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? { nil }
 }
 
+/// ml810: an overlay window's root controller must follow the app's orientation
+/// lock, not keep its own default. iOS asks the TOPMOST visible window about
+/// orientation and the home indicator, so a stale overlay left the home bar
+/// rotated to landscape after a game ended, even once the UI was back in
+/// portrait.
+final class OrientationFollowingController: UIViewController {
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        MadeiraAppDelegate.orientationLock
+    }
+    override var prefersHomeIndicatorAutoHidden: Bool { false }
+}
+
 /// ml806: the in-game mouse pointer.
 ///
 /// The pointer lives in its own window above the app's, the pattern
@@ -725,8 +737,11 @@ enum GameCursorHost {
             // belongs on top of everything, like a real cursor.
             w.windowLevel = .normal + 102
             w.backgroundColor = .clear
-            w.isHidden = false
-            let vc = UIViewController()
+            // ml810: created HIDDEN. refreshHidden() is the only thing that
+            // shows it, so an overlay window never sits on top of the app
+            // (and never steers orientation) while no game is using a pointer.
+            w.isHidden = true
+            let vc = OrientationFollowingController()
             vc.view.backgroundColor = .clear
             vc.view.isUserInteractionEnabled = false
             w.rootViewController = vc
@@ -738,6 +753,7 @@ enum GameCursorHost {
             overlay = w
         }
         overlay?.frame = scene.coordinateSpace.bounds
+        refreshHidden()   // ml810: never leave it showing just because we attached
         fputs("[cursor] ml806 attach win=\(overlay?.frame ?? .zero) "
               + "img=\(arrow?.image == nil ? "NIL" : "ok") size=\(arrow?.image?.size ?? .zero)\n",
               stderr)
@@ -784,7 +800,14 @@ enum GameCursorHost {
     }
 
     private static func refreshHidden() {
-        arrow?.isHidden = !(appVisible && windowsVisible)
+        let show = appVisible && windowsVisible
+        arrow?.isHidden = !show
+        // ml810: take the whole WINDOW down when the pointer is not in use.
+        // Hiding only the arrow left a visible, topmost window outside
+        // gameplay, and iOS consults the topmost window for orientation and
+        // the home indicator — which is why the home bar stayed rotated to
+        // landscape after a game ended.
+        overlay?.isHidden = !show
     }
 
     private static func applyGeometry() {
