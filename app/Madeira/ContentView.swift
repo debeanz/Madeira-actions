@@ -3893,8 +3893,11 @@ struct ContentView: View {
             //                          instead of UTILITY (Unity itself asks for LOWEST).
             //   madeira-srv-hint.txt   wineserver goes back to waking on every request and
             //                          scanning every client pipe on every wake.
+            //   madeira-unity-telemetry.txt (ml824) Unity cloud telemetry hosts resolve
+            //                          normally instead of failing fast.
             for (file, env, label) in [("madeira-bgjob-qos.txt", "MADEIRA_BGJOB_QOS", "Background job QoS"),
-                                       ("madeira-srv-hint.txt", "MADEIRA_SRV_HINT", "Wineserver request hints")] {
+                                       ("madeira-srv-hint.txt", "MADEIRA_SRV_HINT", "Wineserver request hints"),
+                                       ("madeira-unity-telemetry.txt", "MADEIRA_UNITY_TELEMETRY_BLOCK", "Unity telemetry block")] {
                 if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
                    let txt = try? String(contentsOf: d.appendingPathComponent(file), encoding: .utf8) {
                     let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4689,6 +4692,13 @@ enum TouchControlsHost {
             w.isHidden = false        // deliberately never made key
             let host = UIHostingController(rootView: TouchControlsOverlay())
             host.view.backgroundColor = .clear
+            // ml824: UIView.isMultipleTouchEnabled defaults to false, so this
+            // window's hosting view took only the FIRST finger: holding the stick
+            // made every other button dead ("i cant use other buttons while
+            // moving the stick"). The game surface already enables it
+            // (MetalBackedView); the controls window never did.
+            host.view.isMultipleTouchEnabled = true
+            w.isMultipleTouchEnabled = true
             w.rootViewController = host
             window = w
         }
@@ -5022,7 +5032,8 @@ struct TouchControlButton: View {
         let old = Set(stickKeys(stickDir, q)), new = Set(stickKeys(next, q))
         for vk in old.subtracting(new) { winios_post_key(vk, 0) }
         for vk in new.subtracting(old) { winios_post_key(vk, 1) }
-        if stickDir == -1, next != -1 { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        // ml824: no haptic for the stick — the user asked for the vibration to
+        // go. Buttons keep their press tap.
         stickDir = next
     }
 

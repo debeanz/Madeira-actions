@@ -95,8 +95,10 @@ compile_one "$BUILD_DIR/audio_null_ios.c" "audio_null_ios"
 echo "=== Building crypto/network unixlibs ==="
 "$CRYPTO_DIR/gen_gnutls_symtab.sh" > /dev/null
 compile_one "$CRYPTO_DIR/gnutls_symtab_ios.c" "gnutls_symtab_ios"
+# ml824: -include netfilter_ios.h wraps this file's getaddrinfo() so Unity's
+# cloud telemetry hosts fail fast (see the header).
 compile_unixlib "$WINE_SRC/dlls/ws2_32/unixlib.c" "ws2_32_unixlib" "ws2_32" \
-    -I"$WINE_SRC/dlls/ws2_32"
+    -I"$WINE_SRC/dlls/ws2_32" -include "$BUILD_DIR/shims/netfilter_ios.h"
 compile_unixlib "$WINE_SRC/dlls/bcrypt/gnutls.c" "bcrypt_unixlib" "bcrypt" \
     -I"$WINE_SRC/dlls/bcrypt" -I"$GNUTLS_PREFIX/include" \
     -DHAVE_GNUTLS_CIPHER_INIT=1 -DSONAME_LIBGNUTLS=\"libgnutls.so.30\" \
