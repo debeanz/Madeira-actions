@@ -563,14 +563,18 @@ unsigned int server_call_unlocked( void *req_ptr )
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
 
-    ios_srv_req_count++;
+    __atomic_add_fetch( &ios_srv_req_count, 1, __ATOMIC_RELAXED );
     if ((ret = send_request( req ))) return ret;
     /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
      * tick sleep so the request is picked up in ~50us instead of waiting
-     * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
+     * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem).
+     * ml820: after the write, so the request is fully in the pipe when the
+     * server reads the hint; tells the server WHICH thread to serve and only
+     * signals when it is not already armed (fd_ios.c madeira_srv_request_sent). */
     {
-        extern void ios_wineserver_wake(void);
-        ios_wineserver_wake();
+        extern void madeira_srv_request_sent( unsigned int tid );
+        TEB *teb = NtCurrentTeb();
+        madeira_srv_request_sent( teb ? HandleToULong( teb->ClientId.UniqueThread ) : 0 );
     }
     return wait_reply( req );
 }

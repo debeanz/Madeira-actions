@@ -45,6 +45,44 @@ void ios_wineserver_wake(void)
     if (ios_srv_wake_sem) semaphore_signal( ios_srv_wake_sem );
 }
 
+/* ml820 REQUEST HINTS. The 0.1.74 Goose garden log put the server thread at
+ * 85-94% of a core, linear in requests (27.9 us per request, r=0.986, ~33k
+ * requests/s): every request signalled the counting semaphore with no
+ * coalescing, and every wake then read() every client request pipe and
+ * poll()ed every INET fd (the synthetic and INET passes below), so each
+ * request paid for a scan of all ~85 threads. Now the client marks WHICH thread
+ * sent a request and only signals when the server is not already armed; the
+ * server serves exactly those request pipes and runs the full scans only on a
+ * timeout, a partial pipe I/O, an unattributed request, or at least every 1 ms.
+ *
+ * Ordering proof (no lost wake). Client: set word bit -> set summary bit ->
+ * exchange(armed,1), signal only on 0->1. Server: exchange(armed,0) FIRST ->
+ * take hint_all -> take summary -> take words. A bit the server's drain misses
+ * was set after its take, so that client saw armed==0 and signalled; worst case
+ * the request is served by the next iteration or the 1 ms full scan. Never a
+ * hang. Kill switch: MADEIRA_SRV_HINT=0 (Documents/madeira-srv-hint.txt),
+ * which restores signal-per-request and the scan on every wake. */
+volatile int madeira_srv_hint_on = 0;
+volatile unsigned long long madeira_srv_hint[64];
+volatile unsigned long long madeira_srv_hint_sum = 0;
+volatile int madeira_srv_hint_all = 0;
+volatile int madeira_srv_wake_armed = 0;
+int madeira_srv_partial_io = 0;              /* server thread only; set by request_ios.c */
+volatile unsigned long long madeira_srv_c_iter, madeira_srv_c_hinted, madeira_srv_c_full;
+
+void madeira_srv_request_sent( unsigned int tid )
+{
+    unsigned int idx = tid >> 2;
+    if (!madeira_srv_hint_on) { ios_wineserver_wake(); return; }      /* legacy path, unchanged */
+    if (idx && idx < 64 * 64)
+    {
+        __atomic_or_fetch( &madeira_srv_hint[idx >> 6], 1ull << (idx & 63), __ATOMIC_SEQ_CST );
+        __atomic_or_fetch( &madeira_srv_hint_sum, 1ull << (idx >> 6), __ATOMIC_SEQ_CST );
+    }
+    else __atomic_store_n( &madeira_srv_hint_all, 1, __ATOMIC_SEQ_CST );
+    if (!__atomic_exchange_n( &madeira_srv_wake_armed, 1, __ATOMIC_SEQ_CST )) ios_wineserver_wake();
+}
+
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
 
 #include <assert.h>
@@ -1039,7 +1077,16 @@ static int add_poll_user( struct fd *fd )
     pollfd[ret].revents = 0;
     poll_users[ret] = fd;
     active_users++;
-    ws_log("[wineserver-fd] add_poll_user: user=%d unix_fd=%d active_users=%d", ret, fd->unix_fd, active_users);
+    /* ml820: capped. This ran for every object on the server thread and goes
+     * through a Swift regex callback. */
+    {
+        static unsigned int apu_n;
+        if (apu_n < 64)
+        {
+            apu_n++;
+            ws_log("[wineserver-fd] add_poll_user: user=%d unix_fd=%d active_users=%d", ret, fd->unix_fd, active_users);
+        }
+    }
     return ret;
 }
 
@@ -1253,8 +1300,18 @@ void main_loop(void)
             ws_log("[wineserver-fd] request-wake semaphore: kr=%d sem=0x%x", skr, ios_srv_wake_sem);
             if (skr != KERN_SUCCESS) ios_srv_wake_sem = 0;
         }
+        {   /* ml820 request hints: see madeira_srv_request_sent */
+            const char *h = getenv( "MADEIRA_SRV_HINT" ), *nse = getenv( "MADEIRA_SRV_NOSEM" );
+            int k;
+            for (k = 0; k < 64; k++) madeira_srv_hint[k] = 0;
+            madeira_srv_hint_sum = 0; madeira_srv_hint_all = 0; madeira_srv_wake_armed = 0;
+            madeira_srv_hint_on = ios_srv_wake_sem && !(h && *h == '0') && !(nse && *nse == '1');
+            fprintf( stderr, "[srv-hint] ml820 on=%d MADEIRA_SRV_HINT=%s\n", madeira_srv_hint_on, h ? h : "unset" );
+        }
         while (active_users)
         {
+            int ios_timed_out = 0, ios_partial = madeira_srv_partial_io;   /* ml820 */
+            madeira_srv_partial_io = 0;
             /* Check stop flag */
             if (g_wineserver_should_stop)
             {
@@ -1356,6 +1413,7 @@ void main_loop(void)
                 if (!lt_tb.denom) mach_timebase_info( &lt_tb );
                 lt_t0 = mach_absolute_time();
                 if (ios_next_timer_ns < sleep_ns) sleep_ns = ios_next_timer_ns;
+                if (ios_partial && sleep_ns > 250000ull) sleep_ns = 250000ull;   /* ml820: partial pipe I/O pending */
                 if (sleep_ns > 0)
                 {
                     /* ml585 A/B, default OFF. MADEIRA_SRV_NOSEM=1 ignores the
@@ -1391,7 +1449,7 @@ void main_loop(void)
                         wts.tv_sec = (unsigned int)(sleep_ns / 1000000000ull);
                         wts.tv_nsec = (int)(sleep_ns % 1000000000ull);
                         wkr = semaphore_timedwait( ios_srv_wake_sem, wts );
-                        if (wkr == KERN_OPERATION_TIMED_OUT) ios_c_semto++;
+                        if (wkr == KERN_OPERATION_TIMED_OUT) { ios_c_semto++; ios_timed_out = 1; }
                         else ios_c_semret++;
                     }
                     else if (ios_srv_wake_sem && nosem)
@@ -1405,7 +1463,7 @@ void main_loop(void)
                         if (!tb.denom) mach_timebase_info( &tb );
                         dl = mach_absolute_time() + sleep_ns * tb.denom / tb.numer;
                         mach_wait_until( dl );
-                        ios_c_semto++;
+                        ios_c_semto++; ios_timed_out = 1;
                     }
                     else
                     {
@@ -1415,6 +1473,7 @@ void main_loop(void)
                         deadline = mach_absolute_time()
                                  + sleep_ns * ios_tb.denom / ios_tb.numer;
                         mach_wait_until( deadline );
+                        ios_timed_out = 1;
                     }
                 }
                 lt_slept_ns = (mach_absolute_time() - lt_t0) * lt_tb.numer / lt_tb.denom;
@@ -1425,6 +1484,49 @@ void main_loop(void)
                 }
             }
             set_current_time();
+
+            /* ml820 request hints: serve exactly the threads that sent requests;
+             * the INET and synthetic passes below run only on "full" iterations
+             * (timeout, partial I/O, unattributed request, post-injection, or at
+             * least every 1 ms). */
+            madeira_srv_c_iter++;
+            if (madeira_srv_hint_on)
+            {
+                static timeout_t ios_last_full;
+                unsigned long long sum;
+                int full;
+                __atomic_exchange_n( &madeira_srv_wake_armed, 0, __ATOMIC_SEQ_CST );          /* FIRST */
+                full = __atomic_exchange_n( &madeira_srv_hint_all, 0, __ATOMIC_SEQ_CST );
+                full |= ios_timed_out | ios_partial | (ios_post_inject > 0) | (ios_client_fd_start < 0)
+                      | (monotonic_time - ios_last_full >= 10000);                              /* 1 ms */
+                sum = __atomic_exchange_n( &madeira_srv_hint_sum, 0ull, __ATOMIC_SEQ_CST );
+                while (sum)
+                {
+                    int w = __builtin_ctzll( sum );
+                    unsigned long long bits = __atomic_exchange_n( &madeira_srv_hint[w], 0ull, __ATOMIC_SEQ_CST );
+                    sum &= sum - 1;
+                    while (bits)
+                    {
+                        int b = __builtin_ctzll( bits );
+                        struct thread *th;
+                        struct fd *rfd;
+                        bits &= bits - 1;
+                        if (!(th = get_thread_from_id( (thread_id_t)(((w << 6) | b) << 2) ))) { clear_error(); continue; }
+                        rfd = th->request_fd;
+                        if (rfd && rfd->poll_index >= 0 && rfd->poll_index < nb_users &&
+                            poll_users[rfd->poll_index] == rfd && pollfd[rfd->poll_index].fd >= 0 &&
+                            (pollfd[rfd->poll_index].events & POLLIN))
+                        {
+                            madeira_srv_c_hinted++;
+                            fd_poll_event( rfd, POLLIN );   /* same entry the synthetic pass uses */
+                        }
+                        release_object( th );
+                    }
+                }
+                if (!full) continue;          /* INET + synthetic passes only on full iterations */
+                ios_last_full = monotonic_time;
+                madeira_srv_c_full++;
+            }
 
             /* Real sockets first: zero-timeout poll() gives true INET
              * event semantics (connect completion, errors, data). See

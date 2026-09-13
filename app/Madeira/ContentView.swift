@@ -3866,6 +3866,23 @@ struct ContentView: View {
             // every time-gated transition in a managed game waits forever while the
             // renderer keeps drawing. Opt-in only because the old code claimed the
             // write faulted; this should become unconditional once proven.
+            // ml820: two kill switches for this build's performance changes, read the
+            // same way. Each file holding "0" restores the pre-ml820 behaviour:
+            //   madeira-bgjob-qos.txt  Unity 'Background Job.*' workers stay USER_INTERACTIVE
+            //                          instead of UTILITY (Unity itself asks for LOWEST).
+            //   madeira-srv-hint.txt   wineserver goes back to waking on every request and
+            //                          scanning every client pipe on every wake.
+            for (file, env, label) in [("madeira-bgjob-qos.txt", "MADEIRA_BGJOB_QOS", "Background job QoS"),
+                                       ("madeira-srv-hint.txt", "MADEIRA_SRV_HINT", "Wineserver request hints")] {
+                if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+                   let txt = try? String(contentsOf: d.appendingPathComponent(file), encoding: .utf8) {
+                    let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !v.isEmpty {
+                        setenv(env, v, 1)
+                        logStore.log("\(label): \(env)=\(v) via \(file)")
+                    }
+                }
+            }
             if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
                let txt = try? String(contentsOf: d.appendingPathComponent("madeira-usd-time.txt"), encoding: .utf8) {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)

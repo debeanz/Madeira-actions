@@ -1090,6 +1090,10 @@ void ios_pump_sample(void)
  * naming so no port ref leaks every 2 s. */
 extern volatile int ios_srv_req_count;                                   /* server_ios.c */
 extern uint64_t madeira_get_present_count(void) __attribute__((weak));  /* DXMT unix */
+void ios_dump_all_thread_stacks(void);                                    /* defined below */
+/* ml820 wineserver request-hint counters (build/wineserver/fd_ios.c) */
+extern volatile unsigned long long madeira_srv_c_iter, madeira_srv_c_hinted, madeira_srv_c_full;
+extern volatile int madeira_srv_hint_on;
 void ios_thread_cpu_sample(void)
 {
     enum { TC_SLOTS = 256, TC_TOP = 10 };
@@ -1111,7 +1115,21 @@ void ios_thread_cpu_sample(void)
     int ncur = 0, ntop = 0, k, j, len = 0, srv = ios_srv_req_count;
     char line[1024];
 
+    /* ml820 spin snapshot: one thread held >= 95% of a core for 10 samples in a
+     * row (~20 s) triggers the existing [thread-stacks] dumper, whose ml677
+     * SPIN SNAPSHOT captures the exact guest RIP and x86 bytes of a thread
+     * pinned in one 4KB window at cpu >= 900 (MIN_HITS 2, so it needs two
+     * dumps). It captured this very thread name in an earlier Unity title but
+     * only runs from a desktop-session timer. At most 3 dumps per app run, >= 6 s
+     * apart; the 20 s streak keeps loading screens from spending them. */
+    static unsigned spin_port, spin_streak, spin_dumps;
+    static unsigned long long spin_last_dump;
+    int want_dump = 0;
+    static unsigned long long l_it, l_hi, l_fu;
+    unsigned long long s_it = madeira_srv_c_iter, s_hi = madeira_srv_c_hinted, s_fu = madeira_srv_c_full;
+
     mach_timebase_info( &tb );
+    if (last_ticks && now <= last_ticks) return;   /* ml820: 0.1.74 logged dt=6148914513 once */
     if (last_ticks && tb.denom) ns = (now - last_ticks) * tb.numer / tb.denom;
     if (last_ticks && ns < 2000000000ull) return;
     if (task_threads( mach_task_self(), &th, &cnt ) != KERN_SUCCESS) return;
@@ -1165,6 +1183,21 @@ void ios_thread_cpu_sample(void)
             len += snprintf( line + len, sizeof(line) - len, " %s %.0f |", nm, (double)top[j].d / (dt * 1e4) );
         }
         if (len > 0 && len < (int)sizeof(line) - 1) { line[len++] = '\n'; dprintf( 2, "%.*s", len, line ); }
+
+        /* ml820: wineserver request hints — served-by-hint vs full scans */
+        dprintf( 2, "[srv-hint] ml820 on=%d loop/s=%.0f hinted/s=%.0f full/s=%.0f\n",
+                 madeira_srv_hint_on, (double)(s_it - l_it) / dt,
+                 (double)(s_hi - l_hi) / dt, (double)(s_fu - l_fu) / dt );
+
+        if (ntop > 0 && (double)top[0].d >= dt * 0.95e6)
+        {
+            if (top[0].port == spin_port) spin_streak++;
+            else { spin_port = top[0].port; spin_streak = 1; }
+        }
+        else spin_streak = 0;
+        if (spin_streak >= 10 && spin_dumps < 3 &&
+            (!spin_last_dump || now - spin_last_dump >= 6000000000ull * tb.denom / (tb.numer ? tb.numer : 1)))
+            want_dump = 1;
     }
 
     for (i = 0; i < cnt; i++) mach_port_deallocate( mach_task_self(), th[i] );
@@ -1172,6 +1205,16 @@ void ios_thread_cpu_sample(void)
     for (k = 0; k < ncur; k++) prev[k] = cur[k];
     nprev = ncur;
     last_ticks = now; last_presents = presents; last_srv = srv;
+    l_it = s_it; l_hi = s_hi; l_fu = s_fu;
+
+    if (want_dump)
+    {
+        spin_dumps++;
+        spin_last_dump = now;
+        dprintf( 2, "[thr-spin] ml820 port=0x%x at >=95%% for %u samples: [thread-stacks] dump %u/3\n",
+                 spin_port, spin_streak, spin_dumps );
+        ios_dump_all_thread_stacks();
+    }
 }
 
 /* Diagnostic: first .data fault captured by Mach handler */

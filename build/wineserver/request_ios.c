@@ -121,6 +121,11 @@ static const struct fd_ops master_socket_fd_ops =
 };
 
 
+/* ml820: fd_ios.c request hints. Set whenever a request or reply is left
+ * part-way through a pipe, so the server loop runs full scans at a 250 us
+ * cadence until it drains instead of waiting for the 1 ms one. */
+extern int madeira_srv_partial_io;
+
 struct thread *current = NULL;  /* thread handling the current request */
 unsigned int global_error = 0;  /* global error code for when no thread is current */
 timeout_t server_start_time = 0;  /* server startup time */
@@ -245,12 +250,14 @@ void write_reply( struct thread *thread )
             set_fd_events( thread->request_fd, POLLIN );
             set_fd_events( thread->reply_fd, 0 );
         }
+        else madeira_srv_partial_io = 1;   /* ml820 */
         return;
     }
     if (errno == EPIPE)
         kill_thread( thread, 0 );  /* normal death */
     else if (errno != EWOULDBLOCK && (EWOULDBLOCK == EAGAIN || errno != EAGAIN))
         fatal_protocol_error( thread, "reply write: %s\n", strerror( errno ));
+    else madeira_srv_partial_io = 1;       /* ml820: pipe full, retry soon */
 }
 
 /* send a reply to the current thread */
@@ -279,6 +286,7 @@ static void send_reply( union generic_reply *reply )
             /* couldn't write it all, wait for POLLOUT */
             set_fd_events( current->reply_fd, POLLOUT );
             set_fd_events( current->request_fd, 0 );
+            madeira_srv_partial_io = 1;   /* ml820 */
             return;
         }
     }
@@ -372,6 +380,8 @@ void read_request( struct thread *thread )
     }
 
 error:
+    /* ml820: a large request whose variable part has not fully arrived yet */
+    if (ret < 0 && thread->req_toread && (errno == EAGAIN || errno == EWOULDBLOCK)) madeira_srv_partial_io = 1;
     if (!ret)  /* closed pipe */
     {
         /* ml586: this kill was previously SILENT — the 0060-family autopsy
