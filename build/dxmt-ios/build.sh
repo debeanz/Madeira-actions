@@ -27,6 +27,10 @@ mkdir -p "$OBJ_DIR"
 
 # In-place, idempotent submodule patch: 30/40 fps present caps (modes 3/4).
 python3 "$BUILD_DIR/patch_present_cap.py" "$DXMT_SRC/winemetal/unix/winemetal_unix.c"
+# ml819: measurement-only [GPU_STATS] probe (GPU time + display intervals) at the
+# locked-60 and DXMT-duration present sites. Never fails the build; a site whose
+# shape does not match is skipped with a WARNING. Must run AFTER the cap patch.
+python3 "$BUILD_DIR/patch_frame_probe.py" "$DXMT_SRC/winemetal/unix/winemetal_unix.c"
 
 COMMON_FLAGS="-arch arm64 -isysroot $SDK $MIN_FLAG -fblocks -O2 $PLATFORM_DEFS"
 INCLUDES="-I$OBJ_DIR -I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
