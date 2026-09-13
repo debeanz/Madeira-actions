@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import QuartzCore
+import Combine
 import Metal
 import os.log
 
@@ -197,7 +198,15 @@ final class MetalBackedView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        guard let w = window else { return }   // detach: leave the host be
+        guard let w = window else {
+            // detach: leave the host be. ml826: but a view detached mid-touch
+            // may never be sent the lifts, so drop every finger it was tracking
+            // and let go of a long-press drag instead of leaving LDOWN held.
+            surfaceTouches.removeAll()
+            chromeTapTouch = nil
+            resetSurfaceGesture()
+            return
+        }
         MetalBackedView.keyboardTarget = self  // keyboard button targets the live view
         // SwiftUI ancestors attach gesture recognizers that can delay or
         // cancel raw touch delivery (double-tap timing is exactly what
@@ -245,6 +254,11 @@ final class MetalBackedView: UIView {
             MetalHostView.shared.frame = convert(gameRect(), to: w)
             let full = convert(bounds, to: w)
             winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
+            // ml826: the touch-controls window is framed by hand and never
+            // follows a rotation by itself; the 0.25 s re-attach can fire before
+            // the scene has finished rotating. The main window's bounds are
+            // current by the time this view is laid out, so re-sync from here.
+            TouchControlsHost.followScene(w.bounds)
         }
     }
 
@@ -325,22 +339,82 @@ final class MetalBackedView: UIView {
         let n = CGFloat(max(touches.count, 1))
         return CGPoint(x: x / n, y: y / n)
     }
-    private func activeTouches(_ event: UIEvent?) -> [UITouch] {
-        (event?.allTouches ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
-    }
+    /// ml826: fingers THIS view received, in landing order. The old count came
+    /// from event.allTouches, which spans EVERY window: a thumb resting on the
+    /// stick (ControlsWindow) counted as a second surface finger, so touching
+    /// the game while holding a control dropped into two-finger scroll — dead
+    /// cursor/camera, the stick's motion turned into wheel notches, and a flag
+    /// that stayed stuck until every finger in the app was up.
+    private var surfaceTouches: [UITouch] = []
+    /// ml826: the ONE finger whose motion drives the cursor/camera. Deltas are
+    /// only ever computed from it, never across two different UITouches.
+    private weak var ownerTouch: UITouch?
+    /// false for a survivor promoted out of a two-finger gesture: its lift must
+    /// never left-click.
+    private var ownerTapEligible = false
+    private var twoFingerTapEligible = false
+    /// A two-finger tap whose first finger already lifted; the survivor's lift
+    /// finishes it as a right click.
+    private var rightClickPending = false
 
     /// Quick-tap detection shared by both modes, purely for the full-screen
     /// chrome: a short, still touch on the surface posts .madeiraSurfaceTap
     /// so the auto-hidden toolbar can reappear. Game input is unaffected.
+    /// ml826: bound to the specific UITouch that landed alone.
     private var chromeTapStart = CGPoint.zero
     private var chromeTapTime: TimeInterval = 0
-    private var chromeTapCount = 0
+    private weak var chromeTapTouch: UITouch?
+
+    /// ml826: make `t` the pointer finger and re-anchor everything to where it
+    /// is NOW, so the next delta is measured from this finger only.
+    private func adoptOwner(_ t: UITouch, now: TimeInterval, tapEligible: Bool) {
+        ownerTouch = t
+        let p = t.location(in: self)
+        touchStartPoint = p
+        lastPanPoint = p
+        touchStartTime = now
+        movedBeyondSlop = false
+        ownerTapEligible = tapEligible
+        relCarryX = 0; relCarryY = 0   // ml641: never carry motion across fingers
+    }
+
+    /// ml826: drop every in-flight surface gesture. Lets go of a long-press
+    /// drag rather than leaving the Windows button held.
+    private func resetSurfaceGesture() {
+        touchGeneration += 1           // cancels a pending long-press
+        if dragActive { postPointer(F_LUP); dragActive = false }
+        dragTouch = nil
+        ownerTouch = nil
+        twoFingerActive = false
+        rightClickPending = false
+        scrollAccum = 0
+        relCarryX = 0; relCarryY = 0
+    }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if let t = touches.first {
-            chromeTapCount = activeTouches(event).count
+        let now = Date().timeIntervalSinceReferenceDate
+        // ml826: a lift sharing this UIEvent is delivered AFTER touchesBegan.
+        // Finish it now (drag drop / click), or its drag keeps LDOWN held and
+        // freezes the new owner. The later real touchesEnded for it is a no-op:
+        // it is no longer in surfaceTouches, the owner or dragTouch.
+        if trackpadMode {
+            let liftedEarly = surfaceTouches.filter { $0.phase == .ended }
+            if !liftedEarly.isEmpty { touchesEnded(Set(liftedEarly), with: event) }
+        }
+        surfaceTouches.removeAll { $0.phase == .ended || $0.phase == .cancelled }
+        for t in touches where !surfaceTouches.contains(t) { surfaceTouches.append(t) }
+        // Chrome tap keeps the old app-wide rule: no other finger anywhere (a
+        // held stick/button suppresses it), so tap-to-click while walking does
+        // not keep bringing the toolbar back.
+        let othersDown = (event?.allTouches ?? []).contains {
+            !touches.contains($0) && $0.phase != .ended && $0.phase != .cancelled
+        }
+        if surfaceTouches.count == 1, !othersDown, let t = touches.first {
+            chromeTapTouch = t
             chromeTapStart = t.location(in: self)
-            chromeTapTime = Date().timeIntervalSinceReferenceDate
+            chromeTapTime = now
+        } else {
+            chromeTapTouch = nil       // a second finger is not a chrome tap
         }
         guard trackpadMode else {
             guard let t = touches.first else { return }
@@ -348,32 +422,37 @@ final class MetalBackedView: UIView {
             winios_post_touch_down(x, y)
             return
         }
-        let now = Date().timeIntervalSinceReferenceDate
-        let active = activeTouches(event)
         touchGeneration += 1
-        if active.count >= 2 {
-            twoFingerActive = true
-            twoFingerMoved = false
-            twoFingerStartTime = now
-            lastTwoFingerY = avgPoint(active).y
-            scrollAccum = 0
+        if surfaceTouches.count >= 2 {
+            if !twoFingerActive {
+                twoFingerActive = true
+                twoFingerMoved = false
+                twoFingerStartTime = now
+                scrollAccum = 0
+                rightClickPending = false
+                // A right-click tap needs both fingers to be taps: they landed
+                // together, or the first was still a fresh, still touch.
+                twoFingerTapEligible = touches.count >= 2
+                    || (ownerTouch != nil && ownerTapEligible && !movedBeyondSlop
+                        && now - touchStartTime < 0.40)
+            }
+            // Re-baseline on every added finger, so a third finger landing
+            // cannot jump the average and fire a burst of wheel notches.
+            lastTwoFingerY = avgPoint(surfaceTouches).y
             // a drag started by the first finger stays active; harmless
             return
         }
         guard let t = touches.first else { return }
-        let p = t.location(in: self)
-        touchStartPoint = p
+        twoFingerActive = false        // ml826: a lone finger is never in two-finger mode
+        rightClickPending = false
+        adoptOwner(t, now: now, tapEligible: true)
         cursorAtDown = Self.cursor          // ml808: anchor the tap's click point
-        lastPanPoint = p
-        touchStartTime = now
-        movedBeyondSlop = false
-        relCarryX = 0; relCarryY = 0   // ml641: never carry motion across a lift
         // long-press → drag: hold still for 0.5s, haptic confirms, then move
         // the window; release drops. (Replaced double-tap-hold — it raced
         // Windows' double-click detection: wine saw WM_LBUTTONDBLCLK.)
         let gen = touchGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self, self.touchGeneration == gen, !self.dragActive,
+            guard let self, self.touchGeneration == gen, self.ownerTouch === t, !self.dragActive,
                   !self.movedBeyondSlop, !self.twoFingerActive,
                   // ml643: in mouse-look the finger is the CAMERA, not a pointer.
                   // Holding still to line up a shot must not press the mouse.
@@ -393,10 +472,9 @@ final class MetalBackedView: UIView {
             winios_post_touch_move(x, y)
             return
         }
-        let active = activeTouches(event)
         if twoFingerActive {
-            guard active.count >= 2 else { return }
-            let avg = avgPoint(active)
+            guard surfaceTouches.count >= 2 else { return }
+            let avg = avgPoint(surfaceTouches)   // ml826: surface fingers only
             let dy = avg.y - lastTwoFingerY
             lastTwoFingerY = avg.y
             if abs(dy) > 2 { twoFingerMoved = true }
@@ -413,8 +491,11 @@ final class MetalBackedView: UIView {
             guard touches.contains(d) else { return }  // only the old tap finger moved
             t = d
         } else {
-            guard let f = touches.first else { return }
-            t = f
+            // ml826: only the owner finger moves the pointer. touches.first
+            // could be any finger, and a delta between two different fingers
+            // is a jump across the screen.
+            guard let o = ownerTouch, touches.contains(o) else { return }
+            t = o
         }
         let p = t.location(in: self)
         let dx = p.x - lastPanPoint.x, dy = p.y - lastPanPoint.y
@@ -498,10 +579,12 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if let t = touches.first, chromeTapCount == 1 {
-            let p = t.location(in: self)
-            let dt = Date().timeIntervalSinceReferenceDate - chromeTapTime
-            if dt < 0.3 && hypot(p.x - chromeTapStart.x, p.y - chromeTapStart.y) < 12 {
+        let now = Date().timeIntervalSinceReferenceDate
+        surfaceTouches.removeAll { touches.contains($0) }
+        if let ct = chromeTapTouch, touches.contains(ct) {
+            chromeTapTouch = nil
+            let p = ct.location(in: self)
+            if now - chromeTapTime < 0.3 && hypot(p.x - chromeTapStart.x, p.y - chromeTapStart.y) < 12 {
                 NotificationCenter.default.post(name: .madeiraSurfaceTap, object: nil)
             }
         }
@@ -511,34 +594,77 @@ final class MetalBackedView: UIView {
             winios_post_touch_up(x, y)
             return
         }
-        let now = Date().timeIntervalSinceReferenceDate
         if twoFingerActive {
-            if activeTouches(event).isEmpty {
-                if !twoFingerMoved && now - twoFingerStartTime < 0.40
-                    && !InputSettings.shared.relative {   // ml643: see touchesBegan
+            // ml826: the drag finger lifting drops the drag whatever else stays
+            // down; otherwise a 3-finger lift order could strand LDOWN.
+            if dragActive, let d = dragTouch, touches.contains(d) {
+                fputs("[trackpad] ended: drag drop\n", stderr)
+                postPointer(F_LUP); dragActive = false; dragTouch = nil
+            }
+            if surfaceTouches.count >= 2 {
+                lastTwoFingerY = avgPoint(surfaceTouches).y   // one of 3+ lifted: no wheel jump
+                return
+            }
+            // ml826: fewer than two surface fingers left, so leave two-finger
+            // mode NOW. It used to wait for every touch in the app to lift
+            // (allTouches), which froze the survivor and ate the next tap.
+            twoFingerActive = false
+            touchGeneration += 1
+            let tapLike = twoFingerTapEligible && !twoFingerMoved
+                && now - twoFingerStartTime < 0.40
+                && !InputSettings.shared.relative   // ml643: see touchesBegan
+            if let s = surfaceTouches.first {
+                // Re-anchor on the survivor: no delta across two fingers, and
+                // its own lift finishes a two-finger tap instead of left-clicking.
+                adoptOwner(s, now: now, tapEligible: false)
+                // ml808: the survivor now drives the cursor, so pin the right
+                // click to where the arrow is at this moment.
+                cursorAtDown = Self.cursor
+                rightClickPending = tapLike
+            } else {
+                ownerTouch = nil
+                rightClickPending = false
+                if tapLike {
                     postPointer(F_RDOWN)
                     postPointer(F_RUP)
                 }
-                twoFingerActive = false
             }
             return
         }
+        guard let owner = ownerTouch, touches.contains(owner) else { return }
+        ownerTouch = nil
         touchGeneration += 1   // cancel any pending long-press
         if dragActive {
-            if let d = dragTouch, !touches.contains(d) {
-                fputs("[trackpad] ended: non-drag finger up (drag continues)\n", stderr)
-                return
-            }
             fputs("[trackpad] ended: drag drop\n", stderr)
             postPointer(F_LUP)
             dragActive = false
             dragTouch = nil
+            rightClickPending = false
+            return
+        }
+        if rightClickPending {
+            rightClickPending = false
+            if !movedBeyondSlop && now - twoFingerStartTime < 0.40 && !InputSettings.shared.relative {
+                // ml808: click where the arrow was when two-finger mode ended,
+                // not where the survivor's roll dragged it.
+                Self.cursor = cursorAtDown
+                postPointer(F_MOVE | F_ABS)
+                if !desktopMode {
+                    let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
+                    let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
+                    moveGameCursorOverlay(fracX: Self.cursor.x / max(maxX, 1),
+                                          fracY: Self.cursor.y / max(maxY, 1))
+                }
+                postPointer(F_RDOWN)
+                postPointer(F_RUP)
+            }
             return
         }
         // stationary release before the 0.5s drag threshold = click.
         // ml643: NOT in relative mode — every small aim adjustment would fire the
         // weapon. Left/right click are on-screen buttons there instead.
-        if !movedBeyondSlop && now - touchStartTime < 0.5 && !InputSettings.shared.relative {
+        if ownerTapEligible && !movedBeyondSlop && now - touchStartTime < 0.5
+            && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
             // ml808: click where the arrow was when the finger LANDED, not where
             // the finger's roll dragged it. The position must be re-posted: a
@@ -557,17 +683,30 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        surfaceTouches.removeAll { touches.contains($0) || $0.phase == .ended || $0.phase == .cancelled }
+        if let ct = chromeTapTouch, touches.contains(ct) { chromeTapTouch = nil }
         guard trackpadMode else {
             guard let t = touches.first else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
         }
-        fputs("[trackpad] CANCELLED (dragActive=\(dragActive))\n", stderr)
-        touchGeneration += 1
-        if dragActive { postPointer(F_LUP); dragActive = false }
-        dragTouch = nil
-        twoFingerActive = false
+        // Log scripts grep for the "[trackpad] CANCELLED (dragActive=" prefix.
+        fputs("[trackpad] CANCELLED (dragActive=\(dragActive) left=\(surfaceTouches.count))\n", stderr)
+        resetSurfaceGesture()
+        // ml826: re-derive state from whatever fingers survived (rare: system
+        // cancels usually take every touch at once).
+        let now = Date().timeIntervalSinceReferenceDate
+        if surfaceTouches.count >= 2 {
+            twoFingerActive = true
+            twoFingerMoved = false
+            twoFingerStartTime = now
+            twoFingerTapEligible = false
+            scrollAccum = 0
+            lastTwoFingerY = avgPoint(surfaceTouches).y
+        } else if let s = surfaceTouches.first {
+            adoptOwner(s, now: now, tapEligible: false)
+        }
     }
 }
 
@@ -2382,6 +2521,10 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.4), value: showLaunchOverlay)
         .ignoresSafeArea()
         .statusBarHidden(true)
+        // ml826: in a game an edge swipe should need a second swipe, not cancel
+        // every finger on the glass (stick, buttons and camera all at once).
+        // Advisory: cancellation is still handled everywhere.
+        .defersSystemGestures(on: .all)
         .perfMonitored()
         // ml797: the Metal host and the compositor are window-level views
         // ABOVE this SwiftUI tree, so they must stay hidden while the
@@ -4629,46 +4772,639 @@ final class TouchControlsModel: ObservableObject {
         ]
     }
 
-    /// ml644: does this WINDOW point land on something interactive?
-    ///
-    /// Hit-test geometrically, never by walking the UIView hierarchy. SwiftUI
-    /// does not back each Button with its own UIView — the entire overlay is one
-    /// _UIHostingView and taps are routed by SwiftUI's own gesture machinery. So
-    /// `super.hitTest` returns that same hosting view for EVERY point, buttons
-    /// included, and ml643's "is it the root view?" test therefore rejected every
-    /// touch in the window. Nothing responded, and edit mode — whose branch
-    /// captured everything — could never be entered to mask it.
-    func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
-        // The full-screen toolbar is safe-area-aligned at the top trailing
-        // edge. Reserve its shallow row for the controls window; below it,
-        // empty overlay space remains click-through to the Windows surface.
-        if p.y < 100 { return true }
-        guard visible else { return false }
-        for c in controls {
-            let r = Self.baseDiameter * CGFloat(c.scale) / 2
-            let cx = CGFloat(c.nx) * bounds.width
-            let cy = CGFloat(c.ny) * bounds.height
-            if hypot(p.x - cx, p.y - cy) <= r { return true }
+    /// ml826: the UIKit play-mode controls (ControlsInputView) own touches only
+    /// in this state. Editing hands the controls to SwiftUI; outside full screen
+    /// nothing is live.
+    var playing: Bool { fullScreen && visible && !editing }
+}
+
+/// ml826: the ONE geometry for on-screen controls. Hit-testing (ControlsWindow),
+/// UIKit drawing and input (ControlsInputView) and the SwiftUI layout editor
+/// (TouchControlButton) all read it, so what is drawn is exactly what is
+/// touchable. Before this, the window tested a bare circle while SwiftUI
+/// drew a 116 pt face under scaleEffect and shrank held buttons to 0.92, so a
+/// touch could be claimed by the window and then missed by every control.
+enum ControlsGeometry {
+    /// Finger tolerance past the drawn rim. A thumb 1 pt outside a button used
+    /// to fall through to the game as a camera swing or a left click.
+    static let buttonSlop: CGFloat = 10
+    static let stickSlop: CGFloat = 16
+    /// Knob diameter as a fraction of the stick diameter (as JoystickFace).
+    static let knobDiameter: CGFloat = 0.42
+    /// Knob travel as a fraction of the stick RADIUS: 0.30 of the diameter,
+    /// JoystickFace.knobTravelRatio.
+    static let knobTravel: CGFloat = 0.60
+    /// Radial deadzone as a fraction of the radius: a direction engages past
+    /// `engage` and only lets go inside `disengage`. Without the gap a thumb
+    /// resting on the boundary posted key up/down edges at touch rate.
+    static let engage: CGFloat = 0.30
+    static let disengage: CGFloat = 0.20
+    /// Degrees past a sector edge before the held direction switches, for the
+    /// same reason on the 8-way boundaries (W vs W+D flicker).
+    static let sectorHysteresis: Double = 10
+
+    static func diameter(_ c: TouchControl) -> CGFloat {
+        TouchControlsModel.baseDiameter * CGFloat(c.scale)
+    }
+    static func center(_ c: TouchControl, in size: CGSize) -> CGPoint {
+        CGPoint(x: CGFloat(c.nx) * size.width, y: CGFloat(c.ny) * size.height)
+    }
+
+    /// The control whose rim + slop contains `p`; where slop zones overlap,
+    /// the one the point is most inside (distance / radius) wins.
+    static func control(at p: CGPoint, in size: CGSize, among controls: [TouchControl],
+                        excluding busy: Set<UUID> = []) -> TouchControl? {
+        guard size.width >= 1, size.height >= 1 else { return nil }
+        var best: TouchControl?
+        var bestScore = CGFloat.greatestFiniteMagnitude
+        for c in controls where !busy.contains(c.id) {
+            let o = center(c, in: size)
+            let r = diameter(c) / 2
+            let dist = hypot(p.x - o.x, p.y - o.y)
+            let slop = c.action.stickKeys != nil ? stickSlop : buttonSlop
+            guard dist <= r + slop else { continue }
+            let score = dist / max(r, 1)
+            if score < bestScore {
+                bestScore = score
+                best = c
+            }
         }
-        return false
+        return best
+    }
+
+    /// 8-way with radial and angular hysteresis. -1 = centre, 0 = up, clockwise
+    /// (screen y grows downward).
+    static func stickDirection(dx: CGFloat, dy: CGFloat, radius r: CGFloat, current: Int) -> Int {
+        let len = (dx * dx + dy * dy).squareRoot()
+        if len < r * (current < 0 ? engage : disengage) { return -1 }
+        var a = atan2(Double(dx), Double(-dy)) * 180 / Double.pi
+        if a < 0 { a += 360 }
+        if current >= 0 {
+            var off = abs(a - Double(current) * 45)
+            if off > 180 { off = 360 - off }
+            if off <= 22.5 + sectorHysteresis { return current }
+        }
+        return Int((a + 22.5) / 45) % 8
+    }
+
+    /// Keys held for a direction; q = [up, right, down, left] (ControlAction.stickKeys).
+    /// Diagonals hold two keys.
+    static func directionKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
+        guard q.count >= 4 else { return [] }
+        switch d {
+        case 0: return [q[0]]
+        case 1: return [q[0], q[1]]
+        case 2: return [q[1]]
+        case 3: return [q[2], q[1]]
+        case 4: return [q[2]]
+        case 5: return [q[2], q[3]]
+        case 6: return [q[3]]
+        case 7: return [q[0], q[3]]
+        default: return []
+        }
     }
 }
 
-/// Click-through EXCEPT where a control actually is.
+/// ml826: where the SwiftUI chrome (toolbar, perf HUD) sits, in window
+/// coordinates — the hosting view fills the window at origin 0. Measured by
+/// preference and read by ControlsWindow.hitTest. Replaces the blanket
+/// `y < 100` band, which swallowed a quarter of a landscape screen's height
+/// for the camera and sat above any control placed near the top.
+enum ControlsChrome {
+    static var toolbar: CGRect = .null
+    static var perf: CGRect = .null
+    static func contains(_ p: CGPoint) -> Bool {
+        (!toolbar.isNull && toolbar.insetBy(dx: -6, dy: -6).contains(p))
+            || (!perf.isNull && perf.insetBy(dx: -10, dy: -10).contains(p))
+    }
+}
+
+struct ControlsChromeRectsKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+struct ChromeRectReporter: View {
+    let slot: String
+    var body: some View {
+        GeometryReader { g in
+            Color.clear.preference(key: ControlsChromeRectsKey.self,
+                                   value: [slot: g.frame(in: .global)])
+        }
+    }
+}
+
+/// Click-through EXCEPT where a control or the chrome actually is.
 ///
 /// PassthroughWindow (the joystick pad's) returns nil unconditionally because it
-/// only ever draws. This one has to take input, so it discriminates: a hit that
-/// lands on the hosting root view means empty space, and empty space belongs to
-/// the game underneath — mouse-look must keep working between the buttons.
+/// only ever draws. This one has to take input, so it discriminates: empty space
+/// belongs to the game underneath — mouse-look must keep working between the
+/// buttons.
+///
+/// ml644 still holds: never decide by walking the SwiftUI hierarchy, because
+/// SwiftUI does not back each Button with its own UIView — `super.hitTest`
+/// returns the one _UIHostingView for EVERY point, buttons included.
+///
+/// ml826: routing is geometric and ownership is per finger. Chrome goes to
+/// SwiftUI; a control goes to the UIKit ControlsInputView, which binds that
+/// UITouch to that control until it ends or is cancelled; anything else returns
+/// nil so the touch reaches the game. Play-mode controls no longer ride SwiftUI
+/// DragGestures: a cancelled DragGesture never calls onEnded (keys stuck down,
+/// dead buttons), and one hosting view taking every finger (ml824) let other
+/// fingers disturb the stick's translation — the "stick goes crazy" bursts.
 final class ControlsWindow: UIWindow {
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let m = TouchControlsModel.shared
+        // FIRST: outside full screen this invisible window must never take a
+        // touch, editing included — Settings' "Open layout editor" sets editing
+        // before the full-screen cover appears, and checking editing first let
+        // the empty window swallow the whole app.
+        guard m.fullScreen else { return nil }
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
-        guard m.fullScreen else { return nil }
-        guard m.hitsInteractive(point, in: bounds) else { return nil }
-        return super.hitTest(point, with: event)
+        if ControlsChrome.contains(point) { return super.hitTest(point, with: event) }
+        guard m.visible, let input = (rootViewController as? ControlsRootController)?.input
+        else { return nil }
+        // The input view is a sibling BELOW the hosting view. UIKit delivers a
+        // touch to exactly the view this returns, and SwiftUI's recognizers
+        // live on the hosting view, not on an ancestor of the input view, so
+        // they never see these touches.
+        return input.claims(convert(point, to: input)) ? input : nil
+    }
+}
+
+/// ml826: root of ControlsWindow. The UIKit controls view underneath, the
+/// SwiftUI overlay (toolbar, perf HUD, layout editor) on top of it.
+final class ControlsRootController: UIViewController {
+    let input: ControlsInputView
+    let host: UIHostingController<TouchControlsOverlay>
+    private var fullScreenSub: AnyCancellable?
+
+    init() {
+        input = ControlsInputView(frame: .zero)
+        host = UIHostingController(rootView: TouchControlsOverlay())
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .clear
+        view.isMultipleTouchEnabled = true
+        input.frame = view.bounds
+        input.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(input)                       // below: SwiftUI chrome paints over controls
+        addChild(host)
+        host.view.backgroundColor = .clear
+        // ml824: UIView.isMultipleTouchEnabled defaults to false, so this
+        // window's hosting view took only the FIRST finger: holding the stick
+        // made every other button dead ("i cant use other buttons while
+        // moving the stick"). Still needed for editing (drag + pinch).
+        host.view.isMultipleTouchEnabled = true
+        host.view.frame = view.bounds
+        host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(host.view)
+        host.didMove(toParent: self)
+        // Edge deferral follows full screen. $fullScreen fires BEFORE the new
+        // value is stored, so ask UIKit to re-read it on the next turn.
+        fullScreenSub = TouchControlsModel.shared.$fullScreen
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+                }
+            }
+    }
+
+    // Behave exactly as the old UIHostingController root did (ml810/ml817).
+    override var childForStatusBarHidden: UIViewController? { host }
+    override var childForStatusBarStyle: UIViewController? { host }
+    override var childForHomeIndicatorAutoHidden: UIViewController? { host }
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        host.supportedInterfaceOrientations
+    }
+    /// ml826: this window is topmost and never hidden, so it must NOT defer edge
+    /// gestures outside a game — that would make the home swipe need two
+    /// swipes all over the app.
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
+        TouchControlsModel.shared.fullScreen ? .all : []
+    }
+}
+
+/// ml826: play-mode touch controls, drawn and driven in plain UIKit.
+///
+/// Each UITouch belongs, for its whole life, to the control it began on. Stick
+/// vectors run from the stick's CENTRE (not from wherever the thumb landed), so
+/// other fingers landing or lifting cannot move them. Every way a finger can go
+/// away releases what it held: ended, cancelled, the app resigning active, the
+/// view detaching or resizing, and the model leaving play (full screen off,
+/// controls hidden, editor opened, control removed or remapped). Visuals are
+/// layer/view property changes with implicit actions off — no SwiftUI body
+/// re-evaluation per touch sample, no glass or material over the game (ml822).
+final class ControlsInputView: UIView {
+    private struct Grab {
+        /// Retained so its ObjectIdentifier key cannot be reused while held.
+        let touch: UITouch
+        let id: UUID
+        let action: ControlAction
+        var dir: Int
+        let downAt: CFTimeInterval
+    }
+
+    private final class Visual {
+        let base = UIView()
+        let label = UILabel()
+        let knob = CALayer()
+        var laidOut: TouchControl?
+        var size: CGSize = .zero
+        var isStick = false
+
+        init() {
+            base.isUserInteractionEnabled = false
+            label.isUserInteractionEnabled = false
+            label.textAlignment = .center
+            label.textColor = .white
+            label.adjustsFontSizeToFitWidth = true
+            label.minimumScaleFactor = 0.5
+            label.baselineAdjustment = .alignCenters
+            base.addSubview(label)
+            base.layer.addSublayer(knob)             // after the label: knob on top
+            knob.backgroundColor = UIColor(white: 1, alpha: 0.92).cgColor
+        }
+
+        /// Caller disables implicit actions.
+        func layout(_ c: TouchControl, in size: CGSize) {
+            laidOut = c
+            self.size = size
+            isStick = c.action.stickKeys != nil
+            let d = ControlsGeometry.diameter(c)
+            base.bounds = CGRect(x: 0, y: 0, width: d, height: d)
+            base.center = ControlsGeometry.center(c, in: size)
+            base.layer.cornerRadius = d / 2
+            knob.isHidden = !isStick
+            label.isHidden = isStick
+            if isStick {
+                let k = d * ControlsGeometry.knobDiameter
+                knob.bounds = CGRect(x: 0, y: 0, width: k, height: k)
+                knob.cornerRadius = k / 2
+                base.layer.borderWidth = max(1, d / 58)   // JoystickFace: 2 pt on a 116 pt face
+            } else {
+                let text = c.action.label
+                let fs = d * (text.count > 2 ? 0.22 : 0.34)
+                label.text = text
+                label.font = UIFont.systemFont(ofSize: fs, weight: .medium)
+                label.frame = CGRect(x: d * 0.08, y: 0, width: d * 0.84, height: d)
+                base.layer.borderWidth = 1
+            }
+            setKnob(.zero)
+            setHeld(false)
+        }
+
+        func setHeld(_ held: Bool) {
+            if isStick {
+                base.backgroundColor = UIColor(white: 0, alpha: held ? 0.36 : 0.28)
+                base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.80 : 0.55).cgColor
+            } else {
+                base.backgroundColor = held ? UIColor(white: 1, alpha: 0.32) : UIColor(white: 0, alpha: 0.28)
+                base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.75 : 0.28).cgColor
+                let pad = laidOut?.action.isPad ?? false
+                label.alpha = pad ? 0.45 : (held ? 1.0 : 0.85)
+            }
+        }
+
+        func setKnob(_ o: CGPoint) {
+            knob.position = CGPoint(x: base.bounds.midX + o.x, y: base.bounds.midY + o.y)
+        }
+    }
+
+    private var visuals: [UUID: Visual] = [:]
+    private var grabs: [ObjectIdentifier: Grab] = [:]
+    /// Press ledger: one down and one up edge per key however many controls
+    /// hold it (a stick's W plus a W button), so Wine never sees a key released
+    /// while another control still holds it.
+    private var keyRefs: [Int32: Int] = [:]
+    private var leftRefs = 0
+    private var rightRefs = 0
+    /// A button's UP edge waits until it has been down this long, so one Wine
+    /// input drain never carries both edges: a game that polls key state once
+    /// per frame would otherwise never see a quick tap at all.
+    private static let minPress: CFTimeInterval = 0.06
+    /// Bumped by releaseAll; a deferred up from an older epoch is dropped (the
+    /// ledger flush there has already posted it).
+    private var releaseEpoch = 0
+    private var syncPending = false
+    private var laidOutSize: CGSize = .zero
+    private var modelSub: AnyCancellable?
+    private let haptic: UIImpactFeedbackGenerator
+
+    override init(frame: CGRect) {
+        haptic = UIImpactFeedbackGenerator(style: .light)
+        super.init(frame: frame)
+        isMultipleTouchEnabled = true                // ml824: stick + buttons together
+        backgroundColor = .clear
+        isOpaque = false
+        isHidden = true
+        // objectWillChange fires BEFORE the mutation, so sync on the next turn
+        // (coalesced: an edit drag publishes per sample).
+        modelSub = TouchControlsModel.shared.objectWillChange.sink { [weak self] _ in
+            self?.scheduleSync()
+        }
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(appLeftForeground),
+                       name: UIApplication.willResignActiveNotification, object: nil)
+        nc.addObserver(self, selector: #selector(appLeftForeground),
+                       name: UIApplication.didEnterBackgroundNotification, object: nil)
+        scheduleSync()
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    @objc private func appLeftForeground() {
+        releaseAll(reason: "resign-active", animated: false)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            releaseAll(reason: "detached", animated: false)
+        } else {
+            defuseAncestorRecognizers()
+            scheduleSync()
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.size != laidOutSize else { return }
+        laidOutSize = bounds.size
+        // Rotation/resize: every control moves out from under its finger.
+        if !grabs.isEmpty { releaseAll(reason: "resized", animated: false) }
+        syncFromModel()
+    }
+
+    /// Called by ControlsWindow.hitTest for every new touch, with the same
+    /// geometry the controls are drawn and driven with.
+    func claims(_ p: CGPoint) -> Bool {
+        let m = TouchControlsModel.shared
+        guard m.playing, window != nil else { return false }
+        if syncPending || isHidden { syncFromModel() }
+        return ControlsGeometry.control(at: p, in: bounds.size, among: m.controls) != nil
+    }
+
+    /// Recognizers on our ANCESTORS (root view, window) still see these touches,
+    /// and one that recognized would cancel a held stick. MetalBackedView
+    /// defuses its SwiftUI ancestors the same way (didMoveToWindow). The
+    /// SwiftUI hosting view is a sibling, not an ancestor, so it is untouched.
+    /// Run on attach and on each entry into play, never per hit-test.
+    private func defuseAncestorRecognizers() {
+        var v: UIView? = superview
+        while let s = v {
+            s.gestureRecognizers?.forEach {
+                $0.cancelsTouchesInView = false
+                $0.delaysTouchesBegan = false
+                $0.delaysTouchesEnded = false
+            }
+            v = s.superview
+        }
+    }
+
+    private func scheduleSync() {
+        guard !syncPending else { return }
+        syncPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.syncPending else { return }
+            self.syncFromModel()
+        }
+    }
+
+    private func syncFromModel() {
+        syncPending = false
+        let m = TouchControlsModel.shared
+        guard m.playing, window != nil else {
+            // Full screen off, controls hidden or the editor opened: let go of
+            // everything (SwiftUI's onEnded never ran when its view went away).
+            releaseAll(reason: "inactive", animated: false)
+            if !isHidden { isHidden = true }
+            return
+        }
+        let size = bounds.size
+        for (key, g) in Array(grabs) {                 // removed or remapped while held
+            let still = m.controls.first { $0.id == g.id }
+            if still == nil || still?.action != g.action { release(key, animated: false) }
+        }
+        quietly {
+            let live = Set(m.controls.map { $0.id })
+            for id in Array(visuals.keys) where !live.contains(id) {
+                visuals[id]?.base.removeFromSuperview()
+                visuals[id] = nil
+            }
+            for c in m.controls {
+                let v: Visual
+                if let existing = visuals[c.id] {
+                    v = existing
+                } else {
+                    v = Visual()
+                    addSubview(v.base)
+                    visuals[c.id] = v
+                }
+                if v.laidOut != c || v.size != size {
+                    v.layout(c, in: size)
+                    if grabs.values.contains(where: { $0.id == c.id }) { v.setHeld(true) }
+                }
+            }
+        }
+        if isHidden {
+            isHidden = false
+            // Entering play: catch any recognizer the window gained after attach.
+            defuseAncestorRecognizers()
+        }
+    }
+
+    private func quietly(_ body: () -> Void) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        body()
+        CATransaction.commit()
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        let m = TouchControlsModel.shared
+        guard m.playing else { return }
+        if syncPending || isHidden { syncFromModel() }
+        // Safety net: a hold whose lift never arrived must not keep its
+        // control (and its keys) forever.
+        for (key, g) in Array(grabs) where g.touch.phase == .ended || g.touch.phase == .cancelled {
+            release(key, animated: false)
+        }
+        let size = bounds.size
+        for t in touches {
+            let busy = Set(grabs.values.map { $0.id })
+            // A second finger on an already-held control goes to another
+            // control in reach, or nowhere — it was claimed, so it never
+            // falls through to the game either.
+            guard let c = ControlsGeometry.control(at: t.location(in: self), in: size,
+                                                   among: m.controls, excluding: busy) else { continue }
+            let key = ObjectIdentifier(t)
+            grabs[key] = Grab(touch: t, id: c.id, action: c.action, dir: -1,
+                              downAt: CACurrentMediaTime())
+            let v = visuals[c.id]
+            if c.action.stickKeys != nil {
+                v?.knob.removeAllAnimations()          // cut a release glide still in flight
+                quietly { v?.setHeld(true) }
+                driveStick(key)                        // ml824: no haptic for the stick
+            } else {
+                quietly { v?.setHeld(true) }
+                press(c.action, down: true)
+            }
+        }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches {
+            let key = ObjectIdentifier(t)
+            if grabs[key]?.action.stickKeys != nil { driveStick(key) }   // buttons ignore motion
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches { release(ObjectIdentifier(t), animated: true) }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        var held = 0
+        for t in touches where grabs[ObjectIdentifier(t)] != nil { held += 1 }
+        for t in touches { release(ObjectIdentifier(t), animated: false) }
+        if held > 0 { fputs("[controls] ml826 touches cancelled held=\(held)\n", stderr) }
+    }
+
+    /// The vector runs from the stick's CENTRE to the finger and keeps tracking
+    /// outside the ring. Keys change only when the (hysteretic) direction does.
+    private func driveStick(_ key: ObjectIdentifier) {
+        guard var g = grabs[key], let q = g.action.stickKeys else { return }
+        guard let c = TouchControlsModel.shared.controls.first(where: { $0.id == g.id }) else {
+            release(key, animated: false)
+            return
+        }
+        let o = ControlsGeometry.center(c, in: bounds.size)
+        let p = g.touch.location(in: self)
+        let dx = p.x - o.x, dy = p.y - o.y
+        let r = ControlsGeometry.diameter(c) / 2
+        let len = (dx * dx + dy * dy).squareRoot()
+        let travel = r * ControlsGeometry.knobTravel
+        let k: CGFloat = len > travel ? travel / len : 1
+        let v = visuals[g.id]
+        quietly { v?.setKnob(CGPoint(x: dx * k, y: dy * k)) }
+        let next = ControlsGeometry.stickDirection(dx: dx, dy: dy, radius: r, current: g.dir)
+        guard next != g.dir else { return }
+        // Release what is no longer held, press what newly is. A blanket
+        // release/re-press would make a held direction stutter.
+        let old = Set(ControlsGeometry.directionKeys(g.dir, q))
+        let new = Set(ControlsGeometry.directionKeys(next, q))
+        for vk in old.subtracting(new) { keyUp(vk) }
+        for vk in new.subtracting(old) { keyDown(vk) }
+        g.dir = next
+        grabs[key] = g
+    }
+
+    private func release(_ key: ObjectIdentifier, animated: Bool) {
+        guard let g = grabs.removeValue(forKey: key) else { return }
+        let v = visuals[g.id]
+        if let q = g.action.stickKeys {
+            for vk in ControlsGeometry.directionKeys(g.dir, q) { keyUp(vk) }
+            quietly { v?.setHeld(false) }
+            if animated {
+                // ml823: one short, non-bouncy glide back to centre, on release
+                // only — never per direction change (ml822).
+                CATransaction.begin()
+                CATransaction.setAnimationDuration(0.12)
+                CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+                v?.setKnob(.zero)
+                CATransaction.commit()
+            } else {
+                quietly { v?.setKnob(.zero) }
+            }
+        } else {
+            quietly { v?.setHeld(false) }
+            // Only a real lift (animated) is deferred; cancels, the safety net,
+            // resize and leaving play release immediately.
+            let holdLeft = Self.minPress - (CACurrentMediaTime() - g.downAt)
+            if !animated || holdLeft <= 0 {
+                press(g.action, down: false)
+            } else {
+                // The ledger keeps this balanced: a re-press during the wait
+                // only bumps the refcount.
+                let action = g.action, epoch = releaseEpoch
+                DispatchQueue.main.asyncAfter(deadline: .now() + holdLeft) { [weak self] in
+                    guard let self, self.releaseEpoch == epoch else { return }
+                    self.press(action, down: false)
+                }
+            }
+        }
+    }
+
+    /// Same semantics as the old TouchControlButton.press. Haptic on the DOWN
+    /// edge only, and never for a stick (ml824).
+    private func press(_ action: ControlAction, down: Bool) {
+        switch action {
+        case .key(let vk):
+            if down { keyDown(vk) } else { keyUp(vk) }
+        case .mouseLeft:
+            mouse(left: true, down: down)
+        case .mouseRight:
+            mouse(left: false, down: down)
+        case .keyboardToggle:
+            if down { MetalBackedView.toggleKeyboard() }
+        case .none, .joystickWASD, .joystickArrows:
+            break
+        case .pad:
+            break     // ml645: no XInput yet — deliberately inert, and labelled so
+        }
+        if down { haptic.impactOccurred() }
+    }
+
+    private func keyDown(_ vk: Int32) {
+        let n = keyRefs[vk] ?? 0
+        keyRefs[vk] = n + 1
+        if n == 0 { winios_post_key(vk, 1) }
+    }
+
+    private func keyUp(_ vk: Int32) {
+        guard let n = keyRefs[vk], n > 0 else { return }
+        if n == 1 {
+            keyRefs[vk] = nil
+            winios_post_key(vk, 0)
+        } else {
+            keyRefs[vk] = n - 1
+        }
+    }
+
+    /// Button-only pointer events (0x2/0x4 left, 0x8/0x10 right): they reuse
+    /// the server's cursor position.
+    private func mouse(left: Bool, down: Bool) {
+        var n = left ? leftRefs : rightRefs
+        if down {
+            n += 1
+            if n == 1 { winios_pointer(0, 0, left ? 0x0002 : 0x0008, 0) }
+        } else {
+            guard n > 0 else { return }
+            n -= 1
+            if n == 0 { winios_pointer(0, 0, left ? 0x0004 : 0x0010, 0) }
+        }
+        if left { leftRefs = n } else { rightRefs = n }
+    }
+
+    private func releaseAll(reason: String, animated: Bool) {
+        releaseEpoch += 1          // drop deferred button ups; the flush below posts them
+        let held = grabs.count
+        for key in Array(grabs.keys) { release(key, animated: animated) }
+        // Safety net; posts nothing while the ledger is balanced.
+        for vk in Array(keyRefs.keys) { winios_post_key(vk, 0) }
+        keyRefs.removeAll()
+        if leftRefs > 0 { leftRefs = 0; winios_pointer(0, 0, 0x0004, 0) }
+        if rightRefs > 0 { rightRefs = 0; winios_pointer(0, 0, 0x0010, 0) }
+        if held > 0 { fputs("[controls] ml826 release-all reason=\(reason) held=\(held)\n", stderr) }
     }
 }
 
@@ -4690,21 +5426,29 @@ enum TouchControlsHost {
             w.windowLevel = .normal + 101
             w.backgroundColor = .clear
             w.isHidden = false        // deliberately never made key
-            let host = UIHostingController(rootView: TouchControlsOverlay())
-            host.view.backgroundColor = .clear
-            // ml824: UIView.isMultipleTouchEnabled defaults to false, so this
-            // window's hosting view took only the FIRST finger: holding the stick
-            // made every other button dead ("i cant use other buttons while
-            // moving the stick"). The game surface already enables it
-            // (MetalBackedView); the controls window never did.
-            host.view.isMultipleTouchEnabled = true
+            // ml824: multi-touch on the window too (and on the views inside,
+            // see ControlsRootController), or the stick blocks every other button.
             w.isMultipleTouchEnabled = true
-            w.rootViewController = host
+            // ml826: a container, not a bare UIHostingController — the UIKit
+            // controls view sits under the SwiftUI chrome.
+            w.rootViewController = ControlsRootController()
             window = w
         }
         window?.frame = scene.coordinateSpace.bounds
+        window?.rootViewController?.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
         fputs("[controls] ml644 overlay attached frame=\(window?.frame ?? .zero) " +
               "controls=\(TouchControlsModel.shared.controls.count)\n", stderr)
+    }
+
+    /// ml826: called from MetalBackedView.layoutSubviews with the MAIN window's
+    /// bounds, which UIKit keeps current across rotation. This manually framed
+    /// window never updates itself, and the 0.25 s re-attach in
+    /// requestOrientation can fire before the rotation has finished — leaving
+    /// controls drawn and hit-tested against portrait bounds.
+    static func followScene(_ bounds: CGRect) {
+        guard let w = window, w.frame != bounds else { return }
+        w.frame = bounds
+        fputs("[controls] ml826 overlay reframed to \(bounds)\n", stderr)
     }
 }
 
@@ -4718,8 +5462,9 @@ struct TouchControlsOverlay: View {
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     @State private var pinchBase: Double?
     /// Auto-hiding toolbar: shown on entry, on a quick tap of the surface,
-    /// on a tap along the top edge, and while the layout editor is open;
-    /// fades a few seconds after the last interaction.
+    /// on a tap where the hidden toolbar sits (ml826: was the whole top
+    /// edge), and while the layout editor is open; fades a few seconds after
+    /// the last interaction.
     @State private var chromeVisible = true
     @State private var chromeHideWork: DispatchWorkItem?
     private var chromeShown: Bool { chromeVisible || m.editing }
@@ -4738,37 +5483,45 @@ struct TouchControlsOverlay: View {
         GeometryReader { geo in
             ZStack(alignment: .topTrailing) {
                 if m.fullScreen {
-                    if m.visible || m.editing {
+                    // ml826: SwiftUI draws the controls ONLY in the layout
+                    // editor. In play they are ControlsInputView (UIKit, per
+                    // finger), underneath this hosting view.
+                    if m.editing {
                         ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
                         }
                     }
-                    // Tap catcher along the top edge while the toolbar is
-                    // hidden (the band ControlsWindow.hitTest reserves), so
-                    // there is always an obvious way to bring it back.
-                    if !chromeShown {
-                        Color.clear
-                            .frame(height: 100)
-                            .contentShape(Rectangle())
-                            .frame(maxWidth: .infinity, alignment: .top)
-                            .onTapGesture { showChrome() }
-                    }
+                    // ml826: the full-width 100 pt tap catcher along the top
+                    // edge is gone — it ate camera swipes and sat above any
+                    // control placed up there. A hidden toolbar comes back on
+                    // a quick tap of the game, or a tap where it sits (below).
+                    //
                     // Performance HUD: this window is the only thing that
                     // draws above the window-level Metal host, so the full
-                    // screen readout has to live here. Kept inside the top
-                    // 100pt band that ControlsWindow.hitTest reserves for
-                    // the toolbar, so the pacing pill stays tappable.
+                    // screen readout has to live here. Its measured frame is
+                    // routed to SwiftUI by ControlsWindow.hitTest, so the
+                    // pacing pill stays tappable.
                     if perfOverlayEnabled {
                         FPSOverlay()
+                            .background { ChromeRectReporter(slot: "perf") }
                             .padding(.top, geo.safeAreaInsets.top + 10)
                             .padding(.leading, geo.safeAreaInsets.leading + 12)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
                     topBar
-                        .padding(.top, geo.safeAreaInsets.top + 10)
-                        .padding(.trailing, geo.safeAreaInsets.trailing + 12)
                         .opacity(chromeShown ? 1 : 0)
                         .allowsHitTesting(chromeShown)
+                        .background { ChromeRectReporter(slot: "toolbar") }
+                        .overlay {
+                            // Hidden toolbar: a tap where it was brings it back.
+                            if !chromeShown {
+                                Color.clear
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { showChrome() }
+                            }
+                        }
+                        .padding(.top, geo.safeAreaInsets.top + 10)
+                        .padding(.trailing, geo.safeAreaInsets.trailing + 12)
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
@@ -4777,7 +5530,14 @@ struct TouchControlsOverlay: View {
             .frame(width: geo.size.width, height: geo.size.height,
                    alignment: .topTrailing)
             .contentShape(Rectangle())
-            .gesture(scalePinch)
+            // ml826: the pinch only exists in the editor. In play it used to be
+            // installed over every touch the window took, and could win
+            // arbitration against the controls with two fingers down.
+            .gesture(scalePinch, including: m.editing ? GestureMask.all : GestureMask.subviews)
+            .onPreferenceChange(ControlsChromeRectsKey.self) { rects in
+                ControlsChrome.toolbar = rects["toolbar"] ?? .null
+                ControlsChrome.perf = rects["perf"] ?? .null
+            }
         }
         .ignoresSafeArea()
         .onAppear { showChrome() }
@@ -4884,51 +5644,45 @@ struct GlassShape: View {
     }
 }
 
+/// ml826: layout-editor rendering and dragging ONLY. Play-mode input and visuals
+/// are ControlsInputView (UIKit): the per-control DragGesture this used to carry
+/// never released its keys on cancel, measured the stick from wherever the thumb
+/// landed, re-rendered this whole body at touch rate, and drew Liquid Glass over
+/// the game.
 struct TouchControlButton: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
-    @State private var isDown = false
     @State private var dragBase: CGPoint?
-    @State private var stickDir: Int = -1
-    /// ml823: the knob follows the thumb (face points, clamped to the rim).
-    @State private var knob: CGSize = .zero
+    @State private var dragStart: CGPoint?
 
-    private var diameter: CGFloat { TouchControlsModel.baseDiameter * CGFloat(control.scale) }
+    private var diameter: CGFloat { ControlsGeometry.diameter(control) }
     private var isStick: Bool { control.action.stickKeys != nil }
     private var isSelected: Bool { m.editing && m.selected == control.id }
 
     var body: some View {
         ZStack {
-            if control.action.stickKeys != nil {
-                // Reuse the portrait pad's face so both look and animate the
-                // same; scale it to whatever size this control was pinched to.
-                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true, lightweight: true,
-                             freeKnob: knob)
+            if isStick {
+                // Same face the play-mode stick draws, at rest.
+                JoystickFace(held: false, dir: -1, alwaysExpanded: true, lightweight: true,
+                             freeKnob: .zero)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
             } else {
-                GlassShape(circle: true)
+                // ml826: plain translucent disc, as in play — no GlassShape.
+                Circle().fill(Color.black.opacity(0.28))
                 Text(control.action.label)
                     .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
                                   weight: .medium))
-                    .foregroundStyle(.white.opacity(control.action.isPad ? 0.45
-                                                    : (isDown ? 1.0 : 0.85)))
+                    .foregroundStyle(.white.opacity(control.action.isPad ? 0.45 : 0.85))
             }
         }
         .frame(width: diameter, height: diameter)
+        .contentShape(Circle())
         .overlay(Circle().stroke(.white.opacity(isSelected ? 0.95
                                                 : (isStick ? 0 : 0.28)),
                                  lineWidth: isSelected ? 2 : 1))
-        // A stick must not shrink under the thumb; only round buttons do that.
-        .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
-        .animation(.easeOut(duration: 0.08), value: isDown)
-        // ml646: the springy knob, same curve as the portrait pad overlay.
-        // ml822: not for the in-game stick — the knob snaps. A 0.22 s spring
-        // with overshoot ran on every direction change, i.e. about once a second
-        // while walking, and each one lined up with a late game frame.
-        .animation(isStick ? nil : Animation.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
         .overlay(alignment: .topTrailing) {
             if isSelected {
                 Button {
@@ -4946,115 +5700,31 @@ struct TouchControlButton: View {
                 .offset(x: 8, y: -8)
             }
         }
-        .position(x: CGFloat(control.nx) * screen.width,
-                  y: CGFloat(control.ny) * screen.height)
+        .position(ControlsGeometry.center(control, in: screen))
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
-                    if m.editing {
-                        m.selected = control.id
-                        guard let i = m.index(of: control.id) else { return }
-                        if dragBase == nil { dragBase = CGPoint(x: control.nx, y: control.ny) }
-                        let b = dragBase ?? .zero
-                        m.controls[i].nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
-                        m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
-                    } else if let q = control.action.stickKeys {
-                        isDown = true
-                        // ml823: the knob tracks the thumb continuously, clamped
-                        // to the rim; the keys below stay 8-way. The face is drawn
-                        // at padRadius*2 and scaled to `diameter`, so convert
-                        // screen points to face points. Sub-point moves are
-                        // skipped so a resting thumb does not re-render the face
-                        // every touch sample. No animation here: .animation(value:)
-                        // only fires when isDown/stickDir change, and those carry
-                        // none for a stick.
-                        let face = JoystickFace.padRadius * 2
-                        let s = face / max(diameter, 1)
-                        var k = CGSize(width: v.translation.width * s, height: v.translation.height * s)
-                        let maxT = face * JoystickFace.knobTravelRatio
-                        let len = (k.width * k.width + k.height * k.height).squareRoot()
-                        if len > maxT { k = CGSize(width: k.width * maxT / len, height: k.height * maxT / len) }
-                        if abs(k.width - knob.width) >= 0.75 || abs(k.height - knob.height) >= 0.75 { knob = k }
-                        applyStick(snap(v.translation), q)
-                    } else if !isDown {
-                        isDown = true
-                        press(true)
+                    guard m.editing else { return }
+                    if m.selected != control.id { m.selected = control.id }
+                    guard let i = m.index(of: control.id) else { return }
+                    // Re-base on a NEW gesture (its startLocation differs), so a
+                    // cancelled drag (no onEnded) cannot leave a stale base that
+                    // jumps the control. Not on translation == .zero: mid-drag
+                    // that would re-base onto the moved position and drift.
+                    // Read the live model, not the last-rendered `control`.
+                    if dragBase == nil || dragStart != v.startLocation {
+                        dragBase = CGPoint(x: m.controls[i].nx, y: m.controls[i].ny)
+                        dragStart = v.startLocation
                     }
+                    let b = dragBase ?? .zero
+                    var c = m.controls[i]
+                    c.nx = min(max(b.x + Double(v.translation.width  / screen.width),  0.03), 0.97)
+                    c.ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
+                    // One write (and one JSON save) per sample; it was two.
+                    if c != m.controls[i] { m.controls[i] = c }
                 }
-                .onEnded { _ in
-                    dragBase = nil
-                    if let q = control.action.stickKeys {
-                        applyStick(-1, q)          // release every held direction
-                        // ml823: a short, non-bouncy glide back to centre on release
-                        // only. The spring that caused late frames ran on every
-                        // direction change over a glass disc; this runs once per
-                        // release over a plain one.
-                        withAnimation(.easeOut(duration: 0.12)) {
-                            knob = .zero
-                            isDown = false
-                        }
-                    } else if isDown {
-                        isDown = false
-                        press(false)
-                    }
-                }
+                .onEnded { _ in dragBase = nil; dragStart = nil }
         )
-    }
-
-    /// 8-way snap. Screen y grows downward, so measure clockwise from "up".
-    private func snap(_ t: CGSize) -> Int {
-        let d = (t.width * t.width + t.height * t.height).squareRoot()
-        if d < diameter * 0.22 { return -1 }        // deadzone scales with the control
-        var a = atan2(t.width, -t.height) * 180 / .pi
-        if a < 0 { a += 360 }
-        return Int((a + 22.5) / 45.0) % 8
-    }
-
-    private func stickKeys(_ d: Int, _ q: [Int32]) -> [Int32] {
-        switch d {
-        case 0: return [q[0]]
-        case 1: return [q[0], q[1]]
-        case 2: return [q[1]]
-        case 3: return [q[2], q[1]]
-        case 4: return [q[2]]
-        case 5: return [q[2], q[3]]
-        case 6: return [q[3]]
-        case 7: return [q[0], q[3]]
-        default: return []
-        }
-    }
-
-    /// Release what is no longer held, press what newly is. A blanket
-    /// release/re-press would make a held direction stutter as the thumb
-    /// wanders inside one sector.
-    private func applyStick(_ next: Int, _ q: [Int32]) {
-        guard next != stickDir else { return }
-        let old = Set(stickKeys(stickDir, q)), new = Set(stickKeys(next, q))
-        for vk in old.subtracting(new) { winios_post_key(vk, 0) }
-        for vk in new.subtracting(old) { winios_post_key(vk, 1) }
-        // ml824: no haptic for the stick — the user asked for the vibration to
-        // go. Buttons keep their press tap.
-        stickDir = next
-    }
-
-    /// Haptic on the DOWN edge only — a held movement key would otherwise buzz
-    /// continuously for as long as you walk.
-    private func press(_ down: Bool) {
-        if down { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
-        switch control.action {
-        case .key(let vk):
-            winios_post_key(vk, down ? 1 : 0)
-        case .mouseLeft:
-            winios_pointer(0, 0, down ? 0x0002 : 0x0004, 0)   // LEFTDOWN / LEFTUP
-        case .mouseRight:
-            winios_pointer(0, 0, down ? 0x0008 : 0x0010, 0)   // RIGHTDOWN / RIGHTUP
-        case .keyboardToggle:
-            if down { MetalBackedView.toggleKeyboard() }
-        case .none, .joystickWASD, .joystickArrows:
-            break                                              // sticks drive themselves
-        case .pad:
-            break     // ml645: no XInput yet — deliberately inert, and labelled so
-        }
     }
 }
 
