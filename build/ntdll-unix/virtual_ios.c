@@ -12448,6 +12448,11 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
 }
 
 
+#ifdef WINE_IOS
+static int ios_keep_dead_stack_top( TEB *teb );   /* ml827, defined with the ml808 ledger */
+static void ios_dead_stack_describe( void *addr );
+#endif
+
 /***********************************************************************
  *           virtual_free_teb
  */
@@ -12461,8 +12466,13 @@ void virtual_free_teb( TEB *teb )
 
     if (teb->DeallocationStack)
     {
-        size = 0;
-        NtFreeVirtualMemory( GetCurrentProcess(), &teb->DeallocationStack, &size, MEM_RELEASE );
+#ifdef WINE_IOS
+        if (!ios_keep_dead_stack_top( teb ))
+#endif
+        {
+            size = 0;
+            NtFreeVirtualMemory( GetCurrentProcess(), &teb->DeallocationStack, &size, MEM_RELEASE );
+        }
     }
 #ifdef __aarch64__
     if (teb->ChpeV2CpuAreaInfo)
@@ -13028,6 +13038,9 @@ void ios_dump_fault_region( void *addr )
     else
         dprintf( 2, "[fault-rgn]   NO wine view — Wine doesn't own this addr (FEX/foreign mmap)\n" );
     mutex_unlock( &virtual_mutex );
+#ifdef WINE_IOS
+    ios_dead_stack_describe( addr );
+#endif
 }
 
 
@@ -14989,6 +15002,14 @@ static void ios_fexva_note( void *base, SIZE_T size, void *peb )
     pthread_mutex_unlock( &ios_fexva_lock );
 }
 
+/* ml827: kept tops of exited guest threads' stacks (ios_keep_dead_stack_top,
+ * see "Dead thread stack tops" below). Their OWN table, never ios_fexva: a game
+ * that churns threads must not be able to crowd the FEX arenas out of the ml808
+ * ledger. Same lock, same death list. base==1 is a slot reserved in flight. */
+#define IOS_DEADTOP_MAX 512
+static struct { uint64_t base; void *peb; } ios_deadtop[IOS_DEADTOP_MAX];
+static unsigned ios_deadtop_n;
+
 static void ios_fexva_release( void *base )      /* guard 2 */
 {
     uint64_t b = (uint64_t)(uintptr_t)base;
@@ -15002,6 +15023,13 @@ static void ios_fexva_release( void *base )      /* guard 2 */
         ios_fexva[i].base = 0;
         ios_fexva[i].size = 0;
         ios_fexva[i].peb  = NULL;
+        break;
+    }
+    for (i = 0; i < ios_deadtop_n; i++)   /* ml827: same guard for kept stack tops */
+    {
+        if (ios_deadtop[i].base != b) continue;
+        ios_deadtop[i].base = 0;
+        ios_deadtop[i].peb  = NULL;
         break;
     }
     pthread_mutex_unlock( &ios_fexva_lock );
@@ -15036,6 +15064,174 @@ void ios_fexva_note_dead( void *peb )
         }
     }
     pthread_mutex_unlock( &ios_fexva_lock );
+}
+
+/***********************************************************************
+ *           Dead thread stack tops  (ml827)
+ *
+ * THE GOOSE FIRST-LAUNCH CRASH. Untitled Goose Game's main thread faulted in
+ * Mono's GHashTable rehash (mono-2.0-bdwgc+0x1b90) reading 0x17cd9ffe0, the
+ * entry SP (StackBase-0x20) of sechost's device_notify_proc thread. That thread
+ * cannot reach \pipe\wine_plugplay in a game session, so it exits a few seconds
+ * into startup, and some guest table still links to its root frame. Nobody has
+ * established who writes that link; while the dead stack is mapped, walking it
+ * reads a harmless end-of-chain node (the second launch in the same log survived
+ * exactly that way).
+ *
+ * The page went away because exit_thread's prev_teb is ONE static for the whole
+ * Mach task: a dead thread's stacks are freed by the next thread exit ANYWHERE.
+ * On the first launch that was services.exe finishing its startup threads,
+ * 220 log lines before the rehash. On the second launch no thread exited in
+ * that window.
+ *
+ * So keep the top of an exited x64 guest thread's native stack mapped until its
+ * PROCESS dies, and release it with the ml808 reclaim (spawn / pressure,
+ * grace-delayed, same death records). The rest of the stack is released as
+ * before. Cost: 64KB of VA (one host page or so actually touched) per exited
+ * guest thread of a live game. Keyed on process death, never thread death, per
+ * the ml330/ml332 and multi-launch notes.
+ *
+ * Its OWN table, not ios_fexva[]: thread churn must never crowd FEX's arenas out
+ * of that ledger (an unrecorded arena is the 3rd-launch crash again). A slot is
+ * reserved BEFORE the partial free, so a full table means the old full free and
+ * nothing is ever kept untracked. Documents/madeira-keep-stack-top.txt holding
+ * "0" (MADEIRA_KEEP_STACK_TOP=0) restores the old full free.
+ */
+#define IOS_DEAD_STACK_KEEP 0x10000   /* the table itself (ios_deadtop) sits above ios_fexva_release */
+
+#define IOS_DEAD_STACK_RING 32
+static struct { uintptr_t lo, hi; unsigned tid, freer; void *peb; int kept; }
+    ios_dead_stacks[IOS_DEAD_STACK_RING];
+static unsigned ios_dead_stacks_pos;
+
+static void ios_dead_stack_note( uintptr_t lo, uintptr_t hi, unsigned tid, void *peb, int kept )
+{
+    unsigned i;
+    pthread_mutex_lock( &ios_fexva_lock );
+    i = ios_dead_stacks_pos++ % IOS_DEAD_STACK_RING;
+    ios_dead_stacks[i].lo = lo;
+    ios_dead_stacks[i].hi = hi;
+    ios_dead_stacks[i].tid = tid;
+    ios_dead_stacks[i].peb = peb;
+    ios_dead_stacks[i].kept = kept;
+    ios_dead_stacks[i].freer = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+    pthread_mutex_unlock( &ios_fexva_lock );
+}
+
+/* For the fault dumps: name the dead thread whose stack an address was in.
+ * Best-effort and lock-free on purpose (called from fault paths). */
+static void ios_dead_stack_describe( void *addr )
+{
+    uintptr_t a = (uintptr_t)addr;
+    unsigned i;
+    for (i = 0; i < IOS_DEAD_STACK_RING; i++)
+    {
+        if (!ios_dead_stacks[i].hi || a < ios_dead_stacks[i].lo || a >= ios_dead_stacks[i].hi) continue;
+        dprintf( 2, "[fault-rgn]   IN DEAD STACK of tid=%04x peb=%p [%p,%p) freed by tid=%04x top=%s "
+                    "(StackBase-0x%lx) rev=ml827\n",
+                 ios_dead_stacks[i].tid, ios_dead_stacks[i].peb, (void *)ios_dead_stacks[i].lo,
+                 (void *)ios_dead_stacks[i].hi, ios_dead_stacks[i].freer,
+                 ios_dead_stacks[i].kept ? "KEPT" : "released", (unsigned long)(ios_dead_stacks[i].hi - a) );
+    }
+}
+
+/* Returns 1 when it took care of teb->DeallocationStack (caller must not free
+ * it), 0 when the caller should release the whole stack as before. */
+static int ios_keep_dead_stack_top( TEB *teb )
+{
+    static int enabled = -1;
+    struct file_view *view;
+    sigset_t sigset;
+    char *base = teb->DeallocationStack, *top = NULL, *keep;
+    void *peb = teb->Peb, *addr;
+    unsigned tid = (unsigned)(ULONG_PTR)teb->ClientId.UniqueThread, d;
+    SIZE_T sz;
+    NTSTATUS st;
+    int dead = 0, slot = -1;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_KEEP_STACK_TOP" );
+        enabled = !(e && e[0] == '0');
+    }
+
+    /* The view, not Tib.StackBase: guest code (fibers) may have repointed the TIB. */
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    view = find_view( base, 0 );
+    if (view && view->base == base && is_view_valloc( view ))
+        top = (char *)view->base + view->size;
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (!top) return 0;
+
+    /* x64 guest threads only (the CHPE cpu area is set exactly for those):
+     * aarch64 session helpers never run the guest code this protects, and the
+     * session PEB never dies, so their tops would never be reclaimed. */
+    if (!enabled || !peb || !teb->ChpeV2CpuAreaInfo ||
+        (size_t)(top - base) <= IOS_DEAD_STACK_KEEP || ((uintptr_t)top & (IOS_DEAD_STACK_KEEP - 1)))
+    {
+        ios_dead_stack_note( (uintptr_t)base, (uintptr_t)top, tid, peb, 0 );
+        return 0;
+    }
+
+    /* Claim a ledger slot BEFORE touching the stack: once the bottom is
+     * released the caller can no longer free the view at `base`. The slot holds
+     * a placeholder base until the partial free has succeeded. Deliberately no
+     * "proof of life" clearing of death records here — this thread is dead and
+     * its process may be too (that would stop the dead game's FEX arenas being
+     * reclaimed, the 3rd-launch crash again). */
+    slot = -1;
+    pthread_mutex_lock( &ios_fexva_lock );
+    for (d = 0; d < ios_fexva_dead_n; d++)
+        if (ios_fexva_dead[d].peb == peb) { dead = 1; break; }
+    if (!dead)
+    {
+        for (d = 0; d < ios_deadtop_n; d++)
+            if (!ios_deadtop[d].base) { slot = (int)d; break; }
+        if (slot < 0 && ios_deadtop_n < IOS_DEADTOP_MAX) slot = (int)ios_deadtop_n++;
+        if (slot >= 0)
+        {
+            ios_deadtop[slot].base = 1;   /* placeholder: never a real base, never reclaimed */
+            ios_deadtop[slot].peb  = NULL;
+        }
+    }
+    pthread_mutex_unlock( &ios_fexva_lock );
+    if (dead || slot < 0)   /* game already gone, or table full: free it all as before */
+    {
+        if (slot < 0 && !dead)
+        {
+            static int warned;
+            if (!warned) { warned = 1; dprintf( 2, "[stack-keep] table FULL (%u) — freeing whole stacks rev=ml827\n",
+                                                (unsigned)IOS_DEADTOP_MAX ); }
+        }
+        ios_dead_stack_note( (uintptr_t)base, (uintptr_t)top, tid, peb, 0 );
+        return 0;
+    }
+
+    keep = top - IOS_DEAD_STACK_KEEP;
+    addr = base;
+    sz = keep - base;
+    st = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &sz, MEM_RELEASE );
+    pthread_mutex_lock( &ios_fexva_lock );
+    if (st) { ios_deadtop[slot].base = 0; ios_deadtop[slot].peb = NULL; }
+    else    { ios_deadtop[slot].base = (uint64_t)(uintptr_t)keep; ios_deadtop[slot].peb = peb; }
+    pthread_mutex_unlock( &ios_fexva_lock );
+    if (st)
+    {
+        dprintf( 2, "[stack-keep] partial release of %p..%p FAILED %08x — full free instead rev=ml827\n",
+                 base, keep, (unsigned)st );
+        ios_dead_stack_note( (uintptr_t)base, (uintptr_t)top, tid, peb, 0 );
+        return 0;
+    }
+    ios_dead_stack_note( (uintptr_t)base, (uintptr_t)top, tid, peb, 1 );
+    teb->DeallocationStack = NULL;
+    {
+        static unsigned long kept_n;
+        if (++kept_n <= 24 || (kept_n % 64) == 0)
+            dprintf( 2, "[stack-keep] #%lu tid=%04x peb=%p kept %p..%p until process death, "
+                        "released %p..%p rev=ml827\n",
+                     kept_n, tid, peb, keep, top, base, keep );
+    }
+    return 1;
 }
 
 /* Release every recorded range owned by a pseudo-process that has died and is
@@ -15101,6 +15297,40 @@ uint64_t ios_fexva_reclaim_dead( int min_grace_sec )
                     "(first base=%p status=%08x) grace=%ds rev=ml808\n",
                  last_peb, ranges, (unsigned long long)(freed_total >> 20),
                  refused, first_refused, first_status, grace );
+
+    /* ml827: the kept stack tops of dead games, same death and grace test. */
+    {
+        unsigned tops = 0, tops_refused = 0;
+        for (i = 0; i < ios_deadtop_n; i++)
+        {
+            uint64_t base;
+            void *peb, *addr;
+            SIZE_T sz = 0;
+            int dead = 0;
+
+            pthread_mutex_lock( &ios_fexva_lock );
+            base = ios_deadtop[i].base;
+            peb  = ios_deadtop[i].peb;
+            if (base > 1 && peb)
+                for (d = 0; d < ios_fexva_dead_n; d++)
+                    if (ios_fexva_dead[d].peb == peb &&
+                        now - ios_fexva_dead[d].died >= grace) { dead = 1; break; }
+            if (dead) { ios_deadtop[i].base = 0; ios_deadtop[i].peb = NULL; }
+            pthread_mutex_unlock( &ios_fexva_lock );
+            if (!dead) continue;
+
+            addr = (void *)(uintptr_t)base;
+            if (!NtFreeVirtualMemory( NtCurrentProcess(), &addr, &sz, MEM_RELEASE ))
+            {
+                freed_total += sz;
+                tops++;
+            }
+            else tops_refused++;
+        }
+        if (tops || tops_refused)
+            dprintf( 2, "[stack-keep] RECLAIM %u dead-thread stack tops freed, %u REFUSED grace=%ds rev=ml827\n",
+                     tops, tops_refused, grace );
+    }
     return freed_total;
 }
 

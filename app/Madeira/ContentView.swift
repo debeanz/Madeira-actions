@@ -1595,6 +1595,13 @@ struct ContentView: View {
             applySurfaceVisibility(tab: selectedTab)
             syncGamepadUIMode()
         }
+        // ml827: on-screen controls, toolbar and perf HUD only once the game has
+        // drawn — never over the loading or "Closing game…" panel. On the
+        // always-mounted body: on the ensureJIT path the panel state changes
+        // before fullScreenDesktop exists.
+        .onChange(of: showLaunchOverlay, initial: true) { _, up in
+            if touchControls.launchPanelUp != up { touchControls.launchPanelUp = up }
+        }
         .onReceive(NotificationCenter.default.publisher(
             for: Notification.Name("MadeiraExitFullScreen"))) { _ in
             desktopFullScreen = false
@@ -2469,6 +2476,27 @@ struct ContentView: View {
             }
             .padding(32)
         }
+        // ml827: the full-screen toolbar no longer shows over this panel, and its
+        // X was the only way back to the Games tab while a launch runs (Force
+        // close lives there). Same action as that X.
+        .overlay {
+            GeometryReader { geo in
+                Button {
+                    touchControls.editing = false
+                    NotificationCenter.default.post(
+                        name: Notification.Name("MadeiraExitFullScreen"), object: nil)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .frame(width: 44, height: 44)
+                        .background(Circle().fill(Color.white.opacity(0.10)))
+                }
+                .padding(.top, geo.safeAreaInsets.top + 10)
+                .padding(.trailing, geo.safeAreaInsets.trailing + 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
+        }
         // ml809: tick the elapsed counter while the loading screen is up.
         .onAppear { launchElapsed = 0 }
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
@@ -2544,6 +2572,7 @@ struct ContentView: View {
         .onAppear {
             MetalHostView.shared.isHidden = showLaunchOverlay
             winios_set_compositor_hidden(showLaunchOverlay ? 1 : 0)
+            touchControls.launchPanelUp = showLaunchOverlay   // ml827: before fullScreen, no flash
             touchControls.fullScreen = true
             if touchControls.visible { touchControls.ensureDefaultLayout() }
             TouchControlsHost.attach()
@@ -4038,9 +4067,13 @@ struct ContentView: View {
             //                          scanning every client pipe on every wake.
             //   madeira-unity-telemetry.txt (ml824) Unity cloud telemetry hosts resolve
             //                          normally instead of failing fast.
+            //   madeira-keep-stack-top.txt (ml827) an exited game thread's whole
+            //                          stack is released at once again, instead of
+            //                          its top 64KB living until the game exits.
             for (file, env, label) in [("madeira-bgjob-qos.txt", "MADEIRA_BGJOB_QOS", "Background job QoS"),
                                        ("madeira-srv-hint.txt", "MADEIRA_SRV_HINT", "Wineserver request hints"),
-                                       ("madeira-unity-telemetry.txt", "MADEIRA_UNITY_TELEMETRY_BLOCK", "Unity telemetry block")] {
+                                       ("madeira-unity-telemetry.txt", "MADEIRA_UNITY_TELEMETRY_BLOCK", "Unity telemetry block"),
+                                       ("madeira-keep-stack-top.txt", "MADEIRA_KEEP_STACK_TOP", "Dead thread stack tops")] {
                 if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
                    let txt = try? String(contentsOf: d.appendingPathComponent(file), encoding: .utf8) {
                     let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4731,6 +4764,9 @@ final class TouchControlsModel: ObservableObject {
     @Published var fullScreen = false           // transient; overlay belongs to the desktop
     @Published var editing = false              // transient, never persisted
     @Published var selected: UUID?              // transient
+    /// ml827: the loading / "Closing game…" panel is up (ContentView.showLaunchOverlay).
+    /// The controls, toolbar and performance HUD wait for the game's first frame.
+    @Published var launchPanelUp = false        // transient
 
     private var loading = false
     private static var url: URL {
@@ -4774,8 +4810,9 @@ final class TouchControlsModel: ObservableObject {
 
     /// ml826: the UIKit play-mode controls (ControlsInputView) own touches only
     /// in this state. Editing hands the controls to SwiftUI; outside full screen
-    /// nothing is live.
-    var playing: Bool { fullScreen && visible && !editing }
+    /// nothing is live. ml827: nor over the loading panel — this going false
+    /// releases every held key (ControlsInputView.syncFromModel).
+    var playing: Bool { fullScreen && visible && !editing && !launchPanelUp }
 }
 
 /// ml826: the ONE geometry for on-screen controls. Hit-testing (ControlsWindow),
@@ -4922,6 +4959,10 @@ final class ControlsWindow: UIWindow {
         // before the full-screen cover appears, and checking editing first let
         // the empty window swallow the whole app.
         guard m.fullScreen else { return nil }
+        // ml827: over the loading / closing panel this window owns nothing — not
+        // the editor, not the chrome, not a control — so the panel's own close
+        // button works. Before the editing check for the same reason as above.
+        guard !m.launchPanelUp else { return nil }
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
@@ -5527,6 +5568,12 @@ struct TouchControlsOverlay: View {
                     }
                 }
             }
+            // ml827: nothing of this (toolbar, perf HUD, editor) over the
+            // loading or "Closing game…" panel; it appears with the game. Hidden,
+            // not removed: a false "Closing game…" mid-game must not reset the
+            // perf HUD's collapsed state. ControlsWindow.hitTest refuses touches.
+            .opacity(m.launchPanelUp ? 0 : 1)
+            .allowsHitTesting(!m.launchPanelUp)
             .frame(width: geo.size.width, height: geo.size.height,
                    alignment: .topTrailing)
             .contentShape(Rectangle())
@@ -5542,6 +5589,9 @@ struct TouchControlsOverlay: View {
         .ignoresSafeArea()
         .onAppear { showChrome() }
         .onChange(of: m.fullScreen) { _, on in if on { showChrome() } }
+        // ml827: the 4 s auto-hide ran out during the load; show the toolbar
+        // when the game appears.
+        .onChange(of: m.launchPanelUp) { _, up in if !up { showChrome() } }
         .onReceive(NotificationCenter.default.publisher(for: .madeiraSurfaceTap)) { _ in
             showChrome()
         }
