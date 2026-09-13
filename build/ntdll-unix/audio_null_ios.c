@@ -331,6 +331,15 @@ static struct ios_stream *stream_from_handle(stream_handle h)
     return s;
 }
 
+/* ml818: tell the app how many render streams are live. A game that has had
+ * audio and drops to ZERO streams while it has also stopped presenting is
+ * tearing down, not loading: Unity closes its audio output inside the player's
+ * shutdown (Untitled Goose Game released its only stream ~0.2-1 s after
+ * WM_CLOSE, then hung before ever calling NtTerminateProcess), while a scene
+ * load keeps the output open. The app uses that to tell "Closing game…" apart
+ * from a long load. Weak: the app provides it (Winios.m), a volatile store. */
+extern void winios_audio_streams_note(int live) __attribute__((weak));
+
 static int stream_register(struct ios_stream *s)
 {
     int i, n = 0;
@@ -340,6 +349,7 @@ static int stream_register(struct ios_stream *s)
     pthread_mutex_unlock(&g_streams_lock);
     if (i == IOS_MAX_STREAMS) return -1;
     fprintf(stderr, "[ios-astream] ml739 CREATE stream=%p (%d now live)\n", (void *)s, n + 1);
+    if (winios_audio_streams_note) winios_audio_streams_note(n + 1);
     return 0;
 }
 
@@ -351,6 +361,7 @@ static void stream_unregister(struct ios_stream *s)
     for (i = 0; i < IOS_MAX_STREAMS; i++) if (g_streams[i]) n++;
     pthread_mutex_unlock(&g_streams_lock);
     fprintf(stderr, "[ios-astream] ml739 RELEASE stream=%p (%d still live)\n", (void *)s, n);
+    if (winios_audio_streams_note) winios_audio_streams_note(n);
 }
 
 /* ml738: this driver is a documented singleton -- see the comment on

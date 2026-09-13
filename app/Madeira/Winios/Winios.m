@@ -802,6 +802,19 @@ int winios_session_shutdown_stage(void) {
     return g_session_shutdown_stage;
 }
 
+/* ml818: see Winios.h. Written on whichever guest thread creates or releases
+ * a stream, read by ContentView's watchdog every 0.5 s. No stdio here: the
+ * caller already logs CREATE/RELEASE with the count. */
+static volatile int g_audio_streams_live = 0;
+
+void winios_audio_streams_note(int live) {
+    g_audio_streams_live = live;
+}
+
+int winios_audio_streams_live(void) {
+    return g_audio_streams_live;
+}
+
 /* ============================================================ *
  * S2-7: DXMT presentation into desktop windows
  * ============================================================

@@ -72,6 +72,13 @@ void winios_process_exited(void *peb);
 void winios_session_shutdown_note(int stage, int code);
 int  winios_session_shutdown_stage(void);
 
+/* ml818: live WASAPI render streams in this Mach process, reported by
+ * ntdll-unix (audio_null_ios.c) on every create and release. The Games tab's
+ * watchdog treats "had audio, now zero streams, and no new frames" as the game
+ * tearing down, which is what separates "Closing game…" from a long load. */
+void winios_audio_streams_note(int live);
+int  winios_audio_streams_live(void);
+
 /* S2 trackpad pointer. (x, y) are ABSOLUTE wine-desktop pixels (the
  * Swift trackpad engine owns the cursor position); flags are raw
  * MOUSEEVENTF_* combos; data carries the wheel delta for

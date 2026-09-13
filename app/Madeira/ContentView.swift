@@ -666,6 +666,9 @@ final class PassthroughWindow: UIWindow {
 /// watchdog never has to read @State off the main thread.
 final class WatchFlag {
     var done = false
+    /// ml818: the user pressed Force close for this game — a reason to call a
+    /// stall "closing" rather than "loading".
+    var quitRequested = false
 }
 
 /// ml810: an overlay window's root controller must follow the app's orientation
@@ -1265,6 +1268,12 @@ struct ContentView: View {
     /// quitting rather than busy. Shows the "Closing game…" panel over the
     /// frozen last frame so the wait reads as progress.
     @State private var closingGame = false
+    /// ml818: the watchdog of the game currently being played. Every way a
+    /// session can end marks it done, so an old game's watchdog can never
+    /// outlive its session and raise "Closing game…" over the NEXT launch —
+    /// the global present counter goes quiet during every game's pre-first-
+    /// frame load, which is exactly when a leftover watchdog would fire.
+    @State private var currentWatch: WatchFlag? = nil
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
     @State private var showRelaunchAlert = false
@@ -1484,6 +1493,7 @@ struct ContentView: View {
         guard case .playing(let title) = launcherSession, playingPid > 0 else { return }
         logStore.log("Force closing \(title) (pid \(playingPid))")
         let pid = playingPid
+        currentWatch?.quitRequested = true   // ml818: a stall now means "closing"
         SessionLauncher.shared.kill(pid: pid) { ok in
             logStore.log(ok ? "\(title): close requested" : "\(title): force close failed", level: ok ? .info : .error)
         }
@@ -1492,6 +1502,8 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
             if case .playing = launcherSession, playingPid == pid {
                 logStore.log("\(title) did not report its exit after force close — treating it as ended", level: .error)
+                currentWatch?.done = true        // ml818: end its watchdog with the session
+                closingGame = false
                 launcherSession = .idle
                 launchingGame = nil
                 desktopFullScreen = false
@@ -1529,6 +1541,8 @@ struct ContentView: View {
         launchingGame = game
         firstFrameSeen = false
         closingGame = false          // ml816: never carry a stale closing panel in
+        currentWatch?.done = true    // ml818: and never a previous game's watchdog
+        currentWatch = nil
         launcherSession = .launching(game.title)
         // ml804: set the logical screen size BEFORE going full screen. The
         // full-screen Metal host aspect-fits to MetalBackedView.logicalScreen()
@@ -1629,6 +1643,8 @@ struct ContentView: View {
     private func gameSessionDied(exitCode: Int) {
         logStore.log("Game session ended (agent exit code \(exitCode)) — the Wine runtime is stopped; relaunch Madeira to play again", level: .error)
         DispatchQueue.main.async {
+            self.currentWatch?.done = true       // ml818: end its watchdog with the session
+            self.closingGame = false
             if case .playing = self.launcherSession { self.launcherSession = .idle }
             if case .launching = self.launcherSession { self.launcherSession = .idle }
             self.launchingGame = nil
@@ -1644,6 +1660,7 @@ struct ContentView: View {
         // class box because the watchdog runs on a background thread and must
         // not touch @State to decide whether to keep looping.
         let done = WatchFlag()
+        currentWatch = done
         DispatchQueue.global(qos: .utility).async {
             // ml809: THE STUCK LOADING SCREEN. The present counter is per
             // swapchain and RESTARTS AT ZERO for each new game (the wine log
@@ -1712,35 +1729,84 @@ struct ContentView: View {
             // game…" panel up after 3 s so the remainder reads as progress
             // instead of a hang. 10 s is still ~600 missed frames: no running
             // game goes that quiet, and a loading screen keeps presenting.
+            // ml818: A STALL ALONE NO LONGER MEANS "CLOSING".
+            //
+            // ml816's premise — "no running game goes that quiet, a loading
+            // screen keeps presenting" — was an assumption, and the user saw
+            // "Closing game…" over a game that was playing. A synchronous load,
+            // a GC pause or a shader-compile burst can stop presents for seconds
+            // in a live game, and the 10 s rule could eject one outright.
+            //
+            // The panel now needs a REASON besides the stall:
+            //   - the user pressed Force close for this game, or
+            //   - the game had audio and now has zero live streams. Unity closes
+            //     its audio output inside the player's shutdown — Goose released
+            //     its only stream ~0.2-1 s after WM_CLOSE and then hung before
+            //     ever calling NtTerminateProcess — while a load keeps it open.
+            // With a reason: panel after 2 s without frames, Games tab after 6 s.
+            // Without one: never a panel; after 20 s with no frames at all (the
+            // ml814 value measured as right) return quietly and log it as hung.
+            // Frames resuming always takes the panel down and resets the wait.
+            //
+            // Pauses of 2 s or more are logged when frames resume, and panel
+            // changes are logged with their reason, because the 15 s samples
+            // could not show the report that led here.
             var lastCount = madeira_get_present_count()
             var stalled = 0.0
             var since = 0.0
             var announced = false
-            while stalled < 10 && !done.done {
+            var sawAudio = winios_audio_streams_live() > 0
+            var tripReason: String? = nil
+            while !done.done {
                 Thread.sleep(forTimeInterval: 0.5)
                 since += 0.5
                 let c = madeira_get_present_count()
-                if c != lastCount { lastCount = c; stalled = 0 } else { stalled += 0.5 }
-                if stalled >= 3 && !announced {
-                    announced = true
-                    DispatchQueue.main.async { self.closingGame = true }
-                } else if stalled == 0 && announced {
-                    announced = false                      // it came back to life
-                    DispatchQueue.main.async { self.closingGame = false }
+                let live = winios_audio_streams_live()
+                if live > 0 { sawAudio = true }
+                if c != lastCount {
+                    if stalled >= 2 {
+                        logStore.log("\(title): presents paused \(stalled) s, then resumed (audio streams \(live))")
+                    }
+                    lastCount = c
+                    stalled = 0
+                } else {
+                    stalled += 0.5
+                }
+                let audioGone = sawAudio && live == 0
+                let quitting = done.quitRequested || audioGone
+                let wantPanel = quitting && stalled >= 2
+                if wantPanel != announced {
+                    announced = wantPanel
+                    logStore.log("\(title): closing panel \(wantPanel ? "UP" : "DOWN") — no frames \(stalled) s, "
+                                 + "audio streams \(live) (had audio: \(sawAudio)), force close: \(done.quitRequested)")
+                    DispatchQueue.main.async {
+                        // Only ever for THIS game's live session.
+                        guard !done.done, case .playing(let t) = self.launcherSession, t == title,
+                              self.playingPid == pid else { return }
+                        self.closingGame = wantPanel
+                    }
+                }
+                if quitting && stalled >= 6 {
+                    tripReason = done.quitRequested
+                        ? "was force closed and stopped drawing"
+                        : "released its audio and stopped drawing — it is quitting"
+                    break
+                }
+                if stalled >= 20 {
+                    tripReason = "stopped drawing for 20 s with no sign of quitting — treating it as hung"
+                    break
                 }
                 if since.truncatingRemainder(dividingBy: 15) < 0.25 {
-                    logStore.log("\(title): presents=\(c) stalled=\(Int(stalled))s")
+                    logStore.log("\(title): presents=\(c) stalled=\(Int(stalled))s audio streams=\(live)")
                 }
             }
-            guard !done.done else {
-                DispatchQueue.main.async { self.closingGame = false }
-                return
-            }
+            guard !done.done, let reason = tripReason else { return }
             DispatchQueue.main.async {
+                guard !done.done, case .playing(let t) = self.launcherSession, t == title,
+                      self.playingPid == pid else { return }
+                done.done = true
                 self.closingGame = false
-                guard case .playing(let t) = self.launcherSession, t == title else { return }
-                logStore.log("\(title) stopped drawing for 10 s — it is quitting or hung, "
-                             + "returning to the Games tab", level: .error)
+                logStore.log("\(title) \(reason), returning to the Games tab", level: .error)
                 self.launcherSession = .idle
                 self.launchingGame = nil
                 self.desktopFullScreen = false
@@ -1749,7 +1815,6 @@ struct ContentView: View {
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
             done.done = true          // ml814: stop the stall watchdog
-            closingGame = false       // ml816: the real exit beat the watchdog
             logStore.log("\(title) ended (exit code \(code))")
             // ml812: a non-zero exit is a crash (a clean quit and our WM_CLOSE
             // force-close both report 0). Remember it: the threads it left
@@ -1759,6 +1824,11 @@ struct ContentView: View {
                 logStore.log("\(title) crashed — its leftover threads may block the next launch; "
                              + "reopen Madeira if games stop starting", level: .error)
             }
+            // ml818: this poll never cancels, so an OLDER game's exit report can
+            // land after the next game has started. It must not clear that
+            // game's panel or pull the user out of it.
+            guard playingPid == pid else { return }
+            closingGame = false       // ml816: the real exit beat the watchdog
             if case .playing = launcherSession {
                 launcherSession = .idle
                 launchingGame = nil
@@ -2253,7 +2323,9 @@ struct ContentView: View {
         // game…" for that long reads as frozen — which is exactly why the user
         // force-closed games that were starting normally.
         let tail = launchElapsed >= 5 ? "  \(launchElapsed)s" : ""
-        if closingGame { return "Closing game…" }
+        // ml818: only while playing — during a launch the panel must say
+        // "Launching game…" whatever a stale flag says.
+        if closingGame, case .playing = launcherSession { return "Closing game…" }
         switch launcherSession {
         case .enablingJIT: return "Enabling JIT…" + tail
         case .launching, .playing: return "Launching game…" + tail
