@@ -1078,6 +1078,102 @@ void ios_pump_sample(void)
     }
 }
 
+/* ml819 [thr-cpu]: per-thread CPU split, one line every >= 2 s, so an fps dip
+ * at the 60 lock can be pinned on a thread instead of guessed at. The user
+ * reports Untitled Goose Game dipping to 45-50 in its neighbourhood and Hollow
+ * Knight dipping too, and no log has ever covered either: every captured frame
+ * so far is menus with slack. The only per-thread CPU data lives in the
+ * desktop-only [thread-stacks] dump, which never fires in a game session.
+ * Called from the monitor thread (virtual_ios.c) right after ios_pump_sample.
+ * Read-only Mach queries (the same ones the existing dumps make), never stops a
+ * thread, no virtual_mutex or wineserver lock. Uses pthread_mach_thread_np-free
+ * naming so no port ref leaks every 2 s. */
+extern volatile int ios_srv_req_count;                                   /* server_ios.c */
+extern uint64_t madeira_get_present_count(void) __attribute__((weak));  /* DXMT unix */
+void ios_thread_cpu_sample(void)
+{
+    enum { TC_SLOTS = 256, TC_TOP = 10 };
+    struct tc_ent { unsigned port; unsigned long long us; };
+    struct tc_top { unsigned port; unsigned long long d; };
+    static struct tc_ent prev[TC_SLOTS];
+    static int nprev;
+    static unsigned long long last_ticks, last_presents;
+    static int last_srv;
+    struct tc_ent cur[TC_SLOTS];
+    struct tc_top top[TC_TOP];
+    /* mach_timebase_info_data_t is not visible in this TU's header set (see
+     * the ml680 block); the struct is two uint32s passed by pointer. */
+    struct { unsigned int numer, denom; } tb = { 0, 0 };
+    extern int mach_timebase_info(void *);
+    thread_act_array_t th;
+    mach_msg_type_number_t cnt = 0, i;
+    unsigned long long now = mach_absolute_time(), ns = 0, all = 0, presents;
+    int ncur = 0, ntop = 0, k, j, len = 0, srv = ios_srv_req_count;
+    char line[1024];
+
+    mach_timebase_info( &tb );
+    if (last_ticks && tb.denom) ns = (now - last_ticks) * tb.numer / tb.denom;
+    if (last_ticks && ns < 2000000000ull) return;
+    if (task_threads( mach_task_self(), &th, &cnt ) != KERN_SUCCESS) return;
+    presents = madeira_get_present_count ? madeira_get_present_count() : 0;
+
+    for (i = 0; i < cnt; i++)
+    {
+        struct thread_basic_info bi;
+        mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
+        unsigned long long us, d = 0;
+        if (ncur >= TC_SLOTS) break;
+        if (thread_info( th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &bc ) != KERN_SUCCESS) continue;
+        us = bi.user_time.seconds * 1000000ull + bi.user_time.microseconds
+           + bi.system_time.seconds * 1000000ull + bi.system_time.microseconds;
+        cur[ncur].port = th[i]; cur[ncur].us = us; ncur++;
+        for (k = 0; k < nprev; k++)
+            if (prev[k].port == th[i]) { if (us > prev[k].us) d = us - prev[k].us; break; }  /* reused name: clamp */
+        all += d;
+        if (!d || !last_ticks || (ntop == TC_TOP && top[TC_TOP - 1].d >= d)) continue;
+        k = ntop < TC_TOP ? ntop : TC_TOP - 1;
+        while (k > 0 && top[k - 1].d < d) { top[k] = top[k - 1]; k--; }
+        top[k].port = th[i]; top[k].d = d;
+        if (ntop < TC_TOP) ntop++;
+    }
+
+    if (last_ticks && ns)
+    {
+        double dt = ns / 1e9;
+        len = snprintf( line, sizeof(line), "[thr-cpu] ml819 dt=%.2f fps=%.1f srv/s=%.0f all=%.0f%% threads=%u |",
+                        dt, (double)(presents - last_presents) / dt, (double)(srv - last_srv) / dt,
+                        (double)all / (dt * 1e4), (unsigned)cnt );
+        for (j = 0; j < ntop && len > 0 && len < (int)sizeof(line) - 48; j++)   /* each entry < 48 bytes */
+        {
+            char nm[32] = "";
+            pthread_t pt = pthread_from_mach_thread_np( top[j].port );   /* ports still held */
+            if (pt) pthread_getname_np( pt, nm, sizeof(nm) );
+            if (!nm[0])
+            {
+                int r;
+                for (r = ios_thread_registry_count() - 1; r >= 0; r--)
+                    if (ios_thread_registry[r].mach_thread == top[j].port && ios_thread_registry[r].teb)
+                    {
+                        uint32_t tid = 0; mach_vm_size_t g = 0;
+                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ios_thread_registry[r].teb + 0x48), 4,
+                                                    (mach_vm_address_t)&tid, &g ) == KERN_SUCCESS && g == 4)
+                            snprintf( nm, sizeof(nm), "w%04x", tid );
+                        break;
+                    }
+            }
+            if (!nm[0]) snprintf( nm, sizeof(nm), "p%x", top[j].port );
+            len += snprintf( line + len, sizeof(line) - len, " %s %.0f |", nm, (double)top[j].d / (dt * 1e4) );
+        }
+        if (len > 0 && len < (int)sizeof(line) - 1) { line[len++] = '\n'; dprintf( 2, "%.*s", len, line ); }
+    }
+
+    for (i = 0; i < cnt; i++) mach_port_deallocate( mach_task_self(), th[i] );
+    vm_deallocate( mach_task_self(), (vm_address_t)th, cnt * sizeof(thread_t) );
+    for (k = 0; k < ncur; k++) prev[k] = cur[k];
+    nprev = ncur;
+    last_ticks = now; last_presents = presents; last_srv = srv;
+}
+
 /* Diagnostic: first .data fault captured by Mach handler */
 volatile uint64_t ios_exc_data_fault_pc = 0;
 volatile uint64_t ios_exc_data_fault_lr = 0;
@@ -5046,7 +5142,15 @@ skip_reclaim_band: ;
                      * slots to a file. Lets us disassemble FEX-emitted ARM64 offline
                      * to verify codegen correctness independently. */
                     static volatile int dumped = 0;
-                    if (cnt == 1 && __sync_bool_compare_and_swap(&dumped, 0, 1))
+                    /* ml819: Diagnostics only. Unconditionally, the first
+                     * unhandled fault of every app run — in a Mono Unity game an
+                     * ordinary C# NullReferenceException — wrote the whole
+                     * 939,524,096-byte JIT pool to Documents from inside THIS
+                     * thread, which serves every Mach fault in the app (~2,500/s):
+                     * a ~1.2 s whole-app freeze (0.1.72 Goose: present window #64
+                     * gap_max 1322 ms) plus a ~900 MB flash write. Diag first so
+                     * the CAS is not consumed while it is off. */
+                    if (madeira_diag_enabled && cnt == 1 && __sync_bool_compare_and_swap(&dumped, 0, 1))
                     {
                         extern void *ios_jit_rw_base_global;
                         extern size_t ios_jit_pool_size_global;
@@ -9293,7 +9397,7 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * fire for ILL since we deliver via setup_exception). One-shot. */
         {
             static volatile int ill_dumped = 0;
-            if (__sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {
+            if (madeira_diag_enabled && __sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {   /* ml819 */
                 extern void *ios_jit_rw_base_global;
                 extern size_t ios_jit_pool_size_global;
                 if (ios_jit_rw_base_global && ios_jit_pool_size_global) {

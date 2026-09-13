@@ -575,6 +575,17 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+/* ml819: Settings > Diagnostics (defined below, set from Swift). The periodic
+ * region/zone/slot probes in the monitor loop run only while it is on. They
+ * are read-only reporting, but with ios_fast_footprint set by every d3d11 load
+ * the loop cycles at 250 ms for the whole game, so a 120k-region walk ran every
+ * ~1.25 s and malloc_zone_check every cycle: the 0.1.72 Goose log measured
+ * ~300 ms cycles against a 250 ms sleep, ~50 ms of work per cycle, ~17% of one
+ * core, with Diagnostics OFF. The pool warmer (anti exec-loss), ios_pump_sample
+ * (orphan-lock reap) and the [footprint] line are functional or cheap and
+ * still always run at the same cadence. */
+extern volatile int madeira_diag_enabled;
+
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -638,7 +649,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * ios_jit_mappings already records text_offset/text_size per module,
              * so walk exactly those ranges: any .text page whose max_prot has
              * lost EXECUTE is real corruption, with no benign explanation. */
-            if ((cycle % 5) == 0 && rx)
+            if (madeira_diag_enabled && (cycle % 5) == 0 && rx)   /* ml819 */
             {
                 unsigned mi;
                 size_t bad = 0, checked = 0;
@@ -678,7 +689,7 @@ static void *ios_pool_warmer_thread( void *arg )
                     dprintf(2, "[pool-rot] clean: %lu .text pages sampled across %u mappings (cycle=%u)\n",
                             (unsigned long)checked, ios_jit_mapping_count, cycle);
             }
-            if (cycle == 1 || (cycle % 15) == 0)
+            if (cycle == 1 || (madeira_diag_enabled && (cycle % 15) == 0))   /* ml819 */
             {
                 /* ml469 (wall #79): one-shot proof of whether TCP loopback
                  * works at all under this port — the webhelper's transport
@@ -713,7 +724,9 @@ static void *ios_pool_warmer_thread( void *arg )
              * signal_arm64_ios.c. */
             {
                 extern void ios_pump_sample(void);
+                extern void ios_thread_cpu_sample(void);
                 ios_pump_sample();
+                ios_thread_cpu_sample();   /* ml819 [thr-cpu]: self-throttled to 2 s; keep ungated */
             }
             {
                 task_vm_info_data_t vmi;
@@ -756,7 +769,7 @@ static void *ios_pool_warmer_thread( void *arg )
             {
                 extern int malloc_zone_check( void *zone );
                 static int zone_bad, zone_announced;
-                if (!zone_bad)
+                if (!zone_bad && (cycle == 1 || madeira_diag_enabled))   /* ml819 */
                 {
                     struct timeval t0, t1;
                     int ok;
@@ -791,7 +804,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * addresses identify the owner offline (pool = RX base, FEX bands,
              * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
              * walk is tens of thousands of kernel calls. */
-            if (cycle == 2 || (cycle % 5) == 0)
+            if (cycle == 2 || (madeira_diag_enabled && (cycle % 5) == 0))   /* ml819 */
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
@@ -939,9 +952,10 @@ static void *ios_pool_warmer_thread( void *arg )
          * samples during texture upload, so every "peak" we quoted was a stale
          * lower bound -- ml664 reported 2733MB when loading was still climbing.
          * Once the footprint is within ~1.2GB of the 4096MB jetsam limit, drop
-         * to 250ms so the terminal burst is actually captured. The expensive
-         * region/band accounting above stays on the slow cycle; only the cheap
-         * task_info() footprint line runs at the fast rate. */
+         * to 250ms so the terminal burst is actually captured. ml819: the
+         * expensive region/zone/slot accounting above did NOT stay on the slow
+         * cycle (it counts cycles, not time); it is now gated on Diagnostics
+         * instead. The cadence itself is unchanged. */
         {
             extern unsigned long long ios_last_footprint_mb;
             extern int ios_fast_footprint;
