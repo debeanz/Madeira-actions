@@ -1283,9 +1283,8 @@ struct ContentView: View {
     @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
-    /// Present pacing default (FrameCap raw value) and the thermal throttle.
+    /// Present pacing default (FrameCap raw value).
     @AppStorage(FrameCap.key) private var frameCapSetting: Int = 1
-    @AppStorage(FrameCap.autoCoolKey) private var autoCoolDown = true
     /// FEX_TSOENABLED=0: skip x86 memory-ordering emulation. Big CPU saving,
     /// not safe for every title. Applied by runWineFullSequence.
     @AppStorage("madeira.fexNoTSO") private var fexNoTSO = false
@@ -2479,8 +2478,7 @@ struct ContentView: View {
                     .onChange(of: frameCapSetting) { _, v in
                         if let c = FrameCap(rawValue: Int32(v)) { FrameCap.apply(c, persist: true) }
                     }
-                    Toggle("Cool down automatically", isOn: $autoCoolDown)
-                    Text("A lower cap is the biggest heat saver: the game's frame loop waits on the display, so the CPU translation work per second falls with it. Auto cool-down drops to 30 fps while iOS reports the phone as hot and restores your cap once it is cool. The pill in the overlay changes the cap too.")
+                    Text("A lower cap runs cooler: the game's frame loop waits on the display, so the CPU translation work per second falls with it. The cap never changes on its own. The pill in the overlay changes it too.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -3810,6 +3808,40 @@ struct ContentView: View {
                 }
             }
 
+            // ml819: DXMT shader-cache A/B (flag file only; not default-on until a
+            // device log shows fewer 2nd-launch hitches). Every launch today logs
+            // "[CacheReader] Failed to resolve cache path": without a path, the unix
+            // side asks confstr(_CS_DARWIN_USER_CACHE_DIR), which fails on iOS, so
+            // every DXBC->AIR conversion reruns each launch. d3d11.dll honours
+            // DXMT_SHADER_CACHE_PATH ONLY if it starts with '/' (a Windows path is
+            // silently ignored) and appends "shaders_<metalver>.db". Namespaced by
+            // build: the table key (cache_15) is fixed in the prebuilt d3d11.dll and
+            // does not change when CI rebuilds airconv, so a stale converter's output
+            // must never be served to a newer build.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               FileManager.default.fileExists(atPath: d.appendingPathComponent("madeira-shadercache.txt").path),
+               let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                let fm = FileManager.default
+                let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+                let root = caches.appendingPathComponent("dxmt-shaders", isDirectory: true)
+                let dir = root.appendingPathComponent(build, isDirectory: true)
+                for old in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] where old != build {
+                    try? fm.removeItem(at: root.appendingPathComponent(old))
+                }
+                do {
+                    try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                    let p = dir.path   // absolute container path, begins with "/"
+                    setenv("DXMT_SHADER_CACHE_PATH", p, 1)
+                    let files = (try? fm.contentsOfDirectory(atPath: p)) ?? []
+                    let bytes = files.reduce(0) { acc, f in
+                        acc + (((try? fm.attributesOfItem(atPath: dir.appendingPathComponent(f).path))?[.size] as? NSNumber)?.intValue ?? 0)
+                    }
+                    logStore.log("DXMT shader cache: DXMT_SHADER_CACHE_PATH=\(p) (\(files.count) files, \(bytes / 1024) KB) via madeira-shadercache.txt")
+                } catch {
+                    logStore.log("DXMT shader cache: cannot create \(dir.path): \(error)", level: .error)
+                }
+            }
+
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
             // redirects libtheorafile's tf_* exports through wrappers in
             // tftrace-x64.dll that call the original and report the RETURN
@@ -4145,8 +4177,14 @@ struct ContentView: View {
                 if !loggingResumed && now - pollStart > 5 {
                     loggingResumed = true
                     DispatchQueue.main.async {
+                        // ml819: re-enable only the wineserver UI callback. The ml809
+                        // uiPaused lift did not restore app-side logging (handleRawLine
+                        // and appendToFile never read uiPaused; ml811-815 fixed the real
+                        // cause). All it did was flush the log list every 200 ms during
+                        // play, re-rendering the root view ~5x/s on the main thread,
+                        // which also carries touch input and the gamepad display link.
+                        // Keep the 1.5 s flush while the runtime is up.
                         ws_log_quiet = 0
-                        logStore.uiPaused = false
                     }
                 }
                 // Diagnostic heartbeat: 2026-07-03's detach-at-#1 run never
@@ -4186,7 +4224,10 @@ struct ContentView: View {
             // Step 5: Resume UI + os_log, give main thread time to recover before detach
             DispatchQueue.main.async {
                 ws_log_quiet = 0
-                logStore.uiPaused = false
+                // ml819: a game session outlives this loop (the agent root reaches
+                // the 1200 s cap), so only restore the fast log flush once Wine
+                // has actually stopped.
+                if wine_process_is_running() == 0 { logStore.uiPaused = false }
             }
             Thread.sleep(forTimeInterval: 2.0)
 

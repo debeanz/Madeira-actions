@@ -13,7 +13,6 @@ enum FrameCap: Int32, CaseIterable, Identifiable {
     case raw = 2
 
     static let key = "madeira.frameCap"
-    static let autoCoolKey = "madeira.autoCoolDown"
 
     var id: Int32 { rawValue }
 
@@ -62,8 +61,7 @@ enum FrameCap: Int32, CaseIterable, Identifiable {
         FrameCap(rawValue: madeira_get_vsync_locked()) ?? .locked60
     }
 
-    /// The user's chosen cap (Settings / pill), independent of any
-    /// temporary thermal throttle.
+    /// The user's chosen cap (Settings / pill).
     static var saved: FrameCap {
         let v = UserDefaults.standard.object(forKey: key) as? Int
         return v.flatMap { FrameCap(rawValue: Int32($0)) } ?? .locked60
@@ -75,9 +73,12 @@ enum FrameCap: Int32, CaseIterable, Identifiable {
         if persist { UserDefaults.standard.set(Int(cap.rawValue), forKey: key) }
     }
 
-    static var autoCoolDown: Bool {
-        UserDefaults.standard.object(forKey: autoCoolKey) as? Bool ?? true
-    }
+    // ml819: the automatic thermal cool-down is gone. At thermal .serious it
+    // forced ANY cap — the default locked 60 included — down to 30, and only
+    // gave it back at .nominal, which a phone under a game rarely reaches
+    // mid-session. The user wants 60 held at all times and explicitly rejected
+    // a heat cap. iOS still manages heat itself; the cap now only ever changes
+    // when the user changes it.
 }
 
 /// Process-wide performance sampler shared by every overlay variant.
@@ -96,7 +97,9 @@ final class PerfMonitor: ObservableObject {
 
     // MARK: Published readouts
 
-    @Published private(set) var presentCount: UInt64 = 0
+    // ml819: not @Published. No view reads it (FPSOverlay dropped it in
+    // ml798), yet publishing it redrew the overlay 10 times a second.
+    private(set) var presentCount: UInt64 = 0
     @Published private(set) var fps: Double = 0
     /// phys_footprint in MB — the SAME counter jetsam judges the process on.
     @Published private(set) var memMB: Int = 0
@@ -141,7 +144,7 @@ final class PerfMonitor: ObservableObject {
             case .thermal(.serious):
                 return "ProMotion is capped and the CPU is being throttled."
             case .thermal:
-                return "Performance may dip. Consider the 60 Hz pacing mode."
+                return "iOS may start throttling the CPU; frame rate can dip."
             }
         }
 
@@ -227,11 +230,6 @@ final class PerfMonitor: ObservableObject {
 
     private var lastMemoryTier: MemoryTier = .ok
     private var lastThermal: ProcessInfo.ThermalState = .nominal
-
-    /// Thermal throttle: cap dropped to 30 while the state is serious or
-    /// worse, and the user's cap restored once it is nominal again. The
-    /// gap between the two thresholds is the hysteresis.
-    @Published private(set) var thermalThrottled = false
 
     private init() {}
 
@@ -321,24 +319,6 @@ final class PerfMonitor: ObservableObject {
                 LogStore.shared.log("Thermal state back to nominal", level: .success)
             }
             lastThermal = thermal
-        }
-        applyThermalThrottle()
-    }
-
-    private func applyThermalThrottle() {
-        let hot = thermal.rawValue >= ProcessInfo.ThermalState.serious.rawValue
-        if hot && !thermalThrottled && FrameCap.autoCoolDown {
-            let current = FrameCap.current
-            // Nothing to gain below 30; leave RAW alone too, it is a benchmark.
-            guard current != .cap30, current != .raw else { return }
-            thermalThrottled = true
-            FrameCap.apply(.cap30, persist: false)
-            LogStore.shared.log("Auto cool-down: frame cap \(current.label) → 30 until the phone is cool")
-        } else if thermalThrottled && (thermal == .nominal || !FrameCap.autoCoolDown) {
-            thermalThrottled = false
-            let saved = FrameCap.saved
-            FrameCap.apply(saved, persist: false)
-            LogStore.shared.log("Auto cool-down over: frame cap back to \(saved.label)", level: .success)
         }
     }
 

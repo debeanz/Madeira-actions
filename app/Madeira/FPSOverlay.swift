@@ -51,8 +51,8 @@ struct FPSOverlay: View {
     @AppStorage(perfOverlayEnabledKey) private var enabled = true
     @State private var collapsed: Bool = false
     /// DXMT's g_madeira_vsync_mode, read fresh on every redraw (the perf
-    /// monitor publishes 4×/s) so a thermal throttle or a Settings change
-    /// shows here without a local copy going stale.
+    /// monitor publishes 4×/s) so a Settings change shows here without a
+    /// local copy going stale.
     private var cap: FrameCap { FrameCap.current }
 
     var body: some View {
@@ -140,13 +140,8 @@ struct FPSOverlay: View {
     ///     (120 = ProMotion; 60 = thermal/LPM capped).
     ///   RAW: game unthrottled (frame-skip mailbox) — FPS readout =
     ///     raw stack throughput.
-    /// A thermometer glyph is added while the auto cool-down holds the cap
-    /// at 30; tapping then still works and clears the throttle's choice.
     private var pacingPill: some View {
         HStack(spacing: 2) {
-            if perf.thermalThrottled {
-                Image(systemName: "thermometer.medium").font(.system(size: 9))
-            }
             Text(cap.label)
         }
         .foregroundColor(cap.color)
