@@ -946,13 +946,22 @@ struct JoystickFace: View {
     /// over a glass effect that must be recomposited on top of the live game
     /// layer; a late compositor hands DXMT its next drawable late.
     var lightweight = false
+    /// ml823: where the knob actually is, in face points, when the caller tracks
+    /// the thumb itself. The keys sent to the game stay 8-way, but the knob no
+    /// longer jumps between eight fixed spots: ml822 removed the spring that
+    /// used to hide those jumps, and the user called the result "linear" with
+    /// "predetermined spots". nil keeps the old direction-snapped knob.
+    var freeKnob: CGSize? = nil
     private var expanded: Bool { held || alwaysExpanded }
 
     static let idleDiameter: CGFloat = 22
     static let padRadius: CGFloat = 58
+    /// Knob travel as a fraction of the face diameter: the knob (0.42 of the
+    /// face) just reaches the rim at 0.29.
+    static let knobTravelRatio: CGFloat = 0.30
     private var idleDiameter: CGFloat { Self.idleDiameter }
     private var padRadius: CGFloat { Self.padRadius }
-    private let knobTravelRatio: CGFloat = 0.30
+    private var knobTravelRatio: CGFloat { Self.knobTravelRatio }
 
     @ViewBuilder private var interior: some View {
         if lightweight {
@@ -965,6 +974,7 @@ struct JoystickFace: View {
     }
 
     private func knobOffset(_ d: CGFloat) -> CGSize {
+        if let f = freeKnob { return expanded ? f : .zero }
         guard dir >= 0, expanded else { return .zero }
         let travel = d * knobTravelRatio
         let a = Double(dir) * 45.0 * .pi / 180.0
@@ -4871,6 +4881,8 @@ struct TouchControlButton: View {
     @State private var isDown = false
     @State private var dragBase: CGPoint?
     @State private var stickDir: Int = -1
+    /// ml823: the knob follows the thumb (face points, clamped to the rim).
+    @State private var knob: CGSize = .zero
 
     private var diameter: CGFloat { TouchControlsModel.baseDiameter * CGFloat(control.scale) }
     private var isStick: Bool { control.action.stickKeys != nil }
@@ -4881,7 +4893,8 @@ struct TouchControlButton: View {
             if control.action.stickKeys != nil {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
-                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true, lightweight: true)
+                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true, lightweight: true,
+                             freeKnob: knob)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
@@ -4937,6 +4950,21 @@ struct TouchControlButton: View {
                         m.controls[i].ny = min(max(b.y + Double(v.translation.height / screen.height), 0.03), 0.97)
                     } else if let q = control.action.stickKeys {
                         isDown = true
+                        // ml823: the knob tracks the thumb continuously, clamped
+                        // to the rim; the keys below stay 8-way. The face is drawn
+                        // at padRadius*2 and scaled to `diameter`, so convert
+                        // screen points to face points. Sub-point moves are
+                        // skipped so a resting thumb does not re-render the face
+                        // every touch sample. No animation here: .animation(value:)
+                        // only fires when isDown/stickDir change, and those carry
+                        // none for a stick.
+                        let face = JoystickFace.padRadius * 2
+                        let s = face / max(diameter, 1)
+                        var k = CGSize(width: v.translation.width * s, height: v.translation.height * s)
+                        let maxT = face * JoystickFace.knobTravelRatio
+                        let len = (k.width * k.width + k.height * k.height).squareRoot()
+                        if len > maxT { k = CGSize(width: k.width * maxT / len, height: k.height * maxT / len) }
+                        if abs(k.width - knob.width) >= 0.75 || abs(k.height - knob.height) >= 0.75 { knob = k }
                         applyStick(snap(v.translation), q)
                     } else if !isDown {
                         isDown = true
@@ -4947,7 +4975,14 @@ struct TouchControlButton: View {
                     dragBase = nil
                     if let q = control.action.stickKeys {
                         applyStick(-1, q)          // release every held direction
-                        isDown = false
+                        // ml823: a short, non-bouncy glide back to centre on release
+                        // only. The spring that caused late frames ran on every
+                        // direction change over a glass disc; this runs once per
+                        // release over a plain one.
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            knob = .zero
+                            isDown = false
+                        }
                     } else if isDown {
                         isDown = false
                         press(false)
