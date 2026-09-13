@@ -1204,11 +1204,28 @@ void ios_thread_cpu_sample(void)
     static unsigned long long l_it, l_hi, l_fu;
     unsigned long long s_it = madeira_srv_c_iter, s_hi = madeira_srv_c_hinted, s_fu = madeira_srv_c_full;
 
+    /* ml828: 0.1.82 printed [thr-cpu] for 24 s of play and then never again,
+     * while its caller kept running every cycle. Name the early return that
+     * repeats, once per streak of 30, so the next log says which. */
+    static unsigned skip_streak, skip_reason;
+    kern_return_t tkr;
+#define TC_SKIP(reason) do { \
+        if (skip_reason != (reason)) { skip_reason = (reason); skip_streak = 0; } \
+        if (++skip_streak % 30 == 0) \
+            dprintf( 2, "[thr-cpu] ml828 skipped %u calls in a row: reason=%u now=%llu last=%llu ns=%llu kr=%d tb=%u/%u\n", \
+                     skip_streak, (reason), now, last_ticks, ns, (int)tkr, tb.numer, tb.denom ); \
+        return; } while (0)
+
+    tkr = KERN_SUCCESS;
     mach_timebase_info( &tb );
-    if (last_ticks && now <= last_ticks) return;   /* ml820: 0.1.74 logged dt=6148914513 once */
+    if (last_ticks && now <= last_ticks) TC_SKIP(1);   /* ml820: 0.1.74 logged dt=6148914513 once */
     if (last_ticks && tb.denom) ns = (now - last_ticks) * tb.numer / tb.denom;
-    if (last_ticks && ns < 2000000000ull) return;
-    if (task_threads( mach_task_self(), &th, &cnt ) != KERN_SUCCESS) return;
+    /* The normal between-samples return (the caller runs a few times a second),
+     * so a streak of 30 here is already abnormal. */
+    if (last_ticks && ns < 2000000000ull) TC_SKIP(2);
+    if ((tkr = task_threads( mach_task_self(), &th, &cnt )) != KERN_SUCCESS) TC_SKIP(3);
+#undef TC_SKIP
+    skip_reason = 0; skip_streak = 0;
     presents = madeira_get_present_count ? madeira_get_present_count() : 0;
 
     for (i = 0; i < cnt; i++)
