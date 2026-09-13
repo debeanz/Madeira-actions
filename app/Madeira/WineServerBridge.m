@@ -72,6 +72,11 @@ static volatile int g_wineserver_running = 0;
 static char *g_prefix_path = NULL;
 
 static void *wineserver_thread_func(void *arg) {
+    // ml820: name it so [thr-cpu] shows "wineserver" instead of a bare Mach
+    // port (it appeared as "pb9c3" at 85-94% of a core in the Goose garden).
+    // pthread_setname_np only names the calling thread on iOS, so it must be
+    // the first thing this function does.
+    pthread_setname_np("wineserver");
     @autoreleasepool {
         // Set up file-based logging
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;

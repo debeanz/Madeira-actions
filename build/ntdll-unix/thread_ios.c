@@ -2422,6 +2422,40 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
     len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA) - 1, FALSE );
     nameA[len] = '\0';
     pthread_setname_np( nameA );
+#ifdef WINE_IOS
+    /* ml820: Unity creates its 'Background Job' queue at thread priority Low,
+     * i.e. SetThreadPriority(LOWEST) (UnityPlayer 0x7b9f37, then 0x7bede0(q,0)),
+     * but ThreadBasePriority only reaches the server on this port (upstream
+     * apply_thread_priority exits on trace_data==0), and every guest thread is
+     * forced to USER_INTERACTIVE (init_thread_stack above). In the 0.1.74 Goose
+     * garden log "Background Job.Worker 1" held 98-100% of a core for the whole
+     * session at the same QoS as the game main thread (62-72%) and the
+     * wineserver (85-94%): three threads wanting the A17 Pro's two P-cores, and
+     * frames collapsed exactly when main+server exceeded ~150% (27 of 49 such
+     * windows vs 1 of 74 below). At UTILITY every wake of main or server
+     * preempts it, and a spinning background job burns an E-core instead.
+     * This path only runs on the thread naming itself (checked above), and the
+     * name is checked BEFORE anything else: some threads rename themselves ~70
+     * times a second. Kill switch: MADEIRA_BGJOB_QOS=0
+     * (Documents/madeira-bgjob-qos.txt). */
+    if (len >= 15 && !memcmp( nameA, "Background Job.", 15 ))
+    {
+        static int enabled = -1, logged;
+        int rc = -1;
+        if (enabled < 0)
+        {
+            const char *e = getenv( "MADEIRA_BGJOB_QOS" );
+            enabled = !(e && e[0] == '0');
+        }
+        if (enabled) rc = pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+        if (logged < 20)
+        {
+            logged++;
+            ERR( "[qos] ml820 '%s' -> %s rc=%d\n", nameA,
+                 enabled ? "UTILITY" : "unchanged (MADEIRA_BGJOB_QOS=0)", rc );
+        }
+    }
+#endif
 #elif defined(__FreeBSD__)
     unsigned int status;
     char nameA[64];
