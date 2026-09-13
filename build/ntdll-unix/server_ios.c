@@ -558,12 +558,39 @@ uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_don
 /***********************************************************************
  *           server_call_unlocked
  */
+/* ml821 request census, read by [srv-req] in ios_thread_cpu_sample. The user
+ * reported Goose dropping frames only while walking with the on-screen stick
+ * (WASD keys) and not while walking with the game's own mouse movement; the
+ * stick sends a key only on a direction change, so whatever differs must show
+ * up as a change in WHICH requests are made and by WHOM. Counters only:
+ * relaxed atomic adds, no locks, no logging on this path.
+ *   madeira_req_type[code]      every request, by request code
+ *   madeira_req_tid[tid >> 2]   every request, by Wine thread id
+ *   madeira_req_focus[code]     requests from one thread, chosen by the sampler
+ *                               as the previous window's busiest requester */
+volatile unsigned int madeira_req_type[512];
+volatile unsigned int madeira_req_tid[1024];
+volatile unsigned int madeira_req_focus[512];
+volatile int madeira_req_focus_idx = -1;
+
 unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
 
     __atomic_add_fetch( &ios_srv_req_count, 1, __ATOMIC_RELAXED );
+    {
+        TEB *cteb = NtCurrentTeb();
+        unsigned int code = req->u.req.request_header.req;
+        unsigned int cidx = cteb ? HandleToULong( cteb->ClientId.UniqueThread ) >> 2 : 0;
+        if (code < 512)
+        {
+            __atomic_add_fetch( &madeira_req_type[code], 1, __ATOMIC_RELAXED );
+            if ((int)cidx == madeira_req_focus_idx)
+                __atomic_add_fetch( &madeira_req_focus[code], 1, __ATOMIC_RELAXED );
+        }
+        if (cidx < 1024) __atomic_add_fetch( &madeira_req_tid[cidx], 1, __ATOMIC_RELAXED );
+    }
     if ((ret = send_request( req ))) return ret;
     /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
      * tick sleep so the request is picked up in ~50us instead of waiting

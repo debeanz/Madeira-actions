@@ -515,8 +515,19 @@ void winios_post_touch_up(int x, int y) {
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
  * 0 for release. Queued like mouse events; drained in pProcessEvents. */
+/* ml821: input event counters for [srv-req] (ntdll-unix reads them through
+ * weak references), so a log can show exactly when the on-screen stick or
+ * the pointer was in use next to the per-2 s CPU and request numbers. */
+static volatile unsigned int g_winios_key_events, g_winios_ptr_events, g_winios_keys_held;
+unsigned int winios_input_key_events(void) { return g_winios_key_events; }
+unsigned int winios_input_ptr_events(void) { return g_winios_ptr_events; }
+unsigned int winios_input_keys_held(void)  { return g_winios_keys_held; }
+
 void winios_post_key(int vk, int down) {
     fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr);
+    __sync_fetch_and_add(&g_winios_key_events, 1);
+    if (down) __sync_fetch_and_add(&g_winios_keys_held, 1);
+    else if (g_winios_keys_held) __sync_fetch_and_sub(&g_winios_keys_held, 1);
     winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
 }
 
@@ -1410,6 +1421,7 @@ void winios_cursor_show(int show) {
 /* Swift trackpad engine → wine. Absolute desktop-pixel coords; the
  * engine owns the cursor position. */
 void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
+    __sync_fetch_and_add(&g_winios_ptr_events, 1);   /* ml821 */
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, flags, data);
     /* ml641: ONLY an ABSOLUTE move carries a position. A relative move carries a
      * DELTA, so handing it to the cursor layer would fling the drawn arrow to the

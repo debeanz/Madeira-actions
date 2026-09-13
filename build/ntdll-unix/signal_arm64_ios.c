@@ -1091,6 +1091,82 @@ void ios_pump_sample(void)
 extern volatile int ios_srv_req_count;                                   /* server_ios.c */
 extern uint64_t madeira_get_present_count(void) __attribute__((weak));  /* DXMT unix */
 void ios_dump_all_thread_stacks(void);                                    /* defined below */
+
+/* ml821 [srv-req]: request census per window (server_ios.c counters) plus input
+ * event counts from Winios.m, so a dip can be matched to stick/pointer use and
+ * to the request types and threads that changed. Codes are indices into the
+ * wine fork's enum request (include/wine/server_protocol.h at 7817e22). */
+extern volatile unsigned int madeira_req_type[512], madeira_req_tid[1024], madeira_req_focus[512];
+extern volatile int madeira_req_focus_idx;
+extern unsigned int winios_input_key_events(void) __attribute__((weak));
+extern unsigned int winios_input_ptr_events(void) __attribute__((weak));
+extern unsigned int winios_input_keys_held(void) __attribute__((weak));
+static void ios_srv_req_census( double dt )
+{
+    static unsigned int p_type[512], p_tid[1024], p_focus[512], p_key, p_ptr;
+    static int labelled_idx = -1;
+    unsigned int d_type[512], d_focus[512], d_tid[1024];
+    unsigned int key = winios_input_key_events ? winios_input_key_events() : 0;
+    unsigned int ptr = winios_input_ptr_events ? winios_input_ptr_events() : 0;
+    unsigned int held = winios_input_keys_held ? winios_input_keys_held() : 0;
+    int i, n, best_tid = -1, focus_was = labelled_idx;
+    unsigned int best_tid_n = 0;
+    char line[900];
+    int len;
+
+    for (i = 0; i < 512; i++)
+    {
+        unsigned int v = madeira_req_type[i], f = madeira_req_focus[i];
+        d_type[i] = v - p_type[i]; p_type[i] = v;
+        d_focus[i] = f - p_focus[i]; p_focus[i] = f;
+    }
+    for (i = 0; i < 1024; i++)
+    {
+        unsigned int v = madeira_req_tid[i];
+        d_tid[i] = v - p_tid[i]; p_tid[i] = v;
+        if (i && d_tid[i] > best_tid_n) { best_tid_n = d_tid[i]; best_tid = i; }
+    }
+    /* the focus histogram now switches to this window's busiest requester */
+    for (i = 0; i < 512; i++) { p_focus[i] = madeira_req_focus[i]; }
+    madeira_req_focus_idx = best_tid;
+    labelled_idx = best_tid;
+
+    if (dt <= 0) { p_key = key; p_ptr = ptr; return; }
+
+    len = snprintf( line, sizeof(line), "[srv-req] ml821 keys/s=%.1f held=%u ptr/s=%.0f | type:",
+                    (key - p_key) / dt, held, (ptr - p_ptr) / dt );
+    for (n = 0; n < 8 && len > 0 && len < (int)sizeof(line) - 24; n++)
+    {
+        int b = -1; unsigned int bv = 0;
+        for (i = 0; i < 512; i++) if (d_type[i] > bv) { bv = d_type[i]; b = i; }
+        if (b < 0) break;
+        len += snprintf( line + len, sizeof(line) - len, " %d:%.0f", b, bv / dt );
+        d_type[b] = 0;
+    }
+    len += snprintf( line + len, sizeof(line) - len, " | tid:" );
+    for (n = 0; n < 5 && len > 0 && len < (int)sizeof(line) - 24; n++)
+    {
+        int b = -1; unsigned int bv = 0;
+        for (i = 1; i < 1024; i++) if (d_tid[i] > bv) { bv = d_tid[i]; b = i; }
+        if (b < 0) break;
+        len += snprintf( line + len, sizeof(line) - len, " w%04x:%.0f", b << 2, bv / dt );
+        d_tid[b] = 0;
+    }
+    if (focus_was > 0)
+    {
+        len += snprintf( line + len, sizeof(line) - len, " | w%04x types:", focus_was << 2 );
+        for (n = 0; n < 6 && len > 0 && len < (int)sizeof(line) - 24; n++)
+        {
+            int b = -1; unsigned int bv = 0;
+            for (i = 0; i < 512; i++) if (d_focus[i] > bv) { bv = d_focus[i]; b = i; }
+            if (b < 0) break;
+            len += snprintf( line + len, sizeof(line) - len, " %d:%.0f", b, bv / dt );
+            d_focus[b] = 0;
+        }
+    }
+    if (len > 0 && len < (int)sizeof(line) - 1) { line[len++] = '\n'; dprintf( 2, "%.*s", len, line ); }
+    p_key = key; p_ptr = ptr;
+}
 /* ml820 wineserver request-hint counters (build/wineserver/fd_ios.c) */
 extern volatile unsigned long long madeira_srv_c_iter, madeira_srv_c_hinted, madeira_srv_c_full;
 extern volatile int madeira_srv_hint_on;
@@ -1189,7 +1265,10 @@ void ios_thread_cpu_sample(void)
                  madeira_srv_hint_on, (double)(s_it - l_it) / dt,
                  (double)(s_hi - l_hi) / dt, (double)(s_fu - l_fu) / dt );
 
-        if (ntop > 0 && (double)top[0].d >= dt * 0.95e6)
+        /* ml821: 80%, not 95%. At UTILITY QoS (ml820) the spinner shares an
+         * E-core and read 82-96% in 0.1.75, so the 95% streak never completed
+         * and the snapshot never fired. */
+        if (ntop > 0 && (double)top[0].d >= dt * 0.80e6)
         {
             if (top[0].port == spin_port) spin_streak++;
             else { spin_port = top[0].port; spin_streak = 1; }
@@ -1204,6 +1283,7 @@ void ios_thread_cpu_sample(void)
     vm_deallocate( mach_task_self(), (vm_address_t)th, cnt * sizeof(thread_t) );
     for (k = 0; k < ncur; k++) prev[k] = cur[k];
     nprev = ncur;
+    ios_srv_req_census( (last_ticks && ns) ? ns / 1e9 : 0.0 );   /* ml821 */
     last_ticks = now; last_presents = presents; last_srv = srv;
     l_it = s_it; l_hi = s_hi; l_fu = s_fu;
 
