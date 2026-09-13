@@ -171,7 +171,27 @@ static BOOL emulate_modeset;
 BOOL decorated_mode = TRUE;
 UINT64 thunk_lock_callback = 0;
 
-#define VIRTUAL_HMONITOR ((HMONITOR)(UINT_PTR)(0x10000 + 1))
+/* ml818: MUST equal the HMONITOR that DXMT's headless wsi hands out for its
+ * one output (kSyntheticMonitor = (HMONITOR)1 in research/dxmt
+ * src/util/wsi_monitor_headless.cpp, compiled into the committed
+ * app/Madeira/arm64ec-windows/dxgi.dll: getDefaultMonitor returns 1 and
+ * getDisplayMode refuses any other handle).
+ *
+ * Unity 2018.4-2022.3 builds Screen.resolutions ONLY from the DXGI output
+ * whose DXGI_OUTPUT_DESC.Monitor == MonitorFromWindow(game window). With
+ * upstream's 0x10001 nothing ever matched, so the DXGI mode list was never
+ * read; the GDI fallback (EnumDisplayMonitors on the desktop DC) finds nothing
+ * in a no-desktop game session, and Screen.resolutions came back EMPTY.
+ * Untitled Goose Game indexes resolutions[0] unguarded in its settings init,
+ * threw, left SettingsWardrobe half-built, and the NullReferenceException that
+ * followed on "load save" unwound SaveMenu.LoadGame before Loading.LoadWorld:
+ * the world never loaded and the loading screen spun forever at 60 fps.
+ *
+ * 1 cannot collide: is_service_process() is always TRUE on iOS, so the
+ * virtual-monitor branch of update_display_cache is the only one taken and
+ * UlongToHandle(++monitor_count) real handles are never minted. Monitor
+ * handles never reach the server (set_winstation_monitors sends rects). */
+#define VIRTUAL_HMONITOR ((HMONITOR)(UINT_PTR)1)
 static struct monitor virtual_monitor =
 {
     .handle = VIRTUAL_HMONITOR,
