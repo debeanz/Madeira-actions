@@ -64,6 +64,24 @@ static void agent_log( const char *fmt, ... );   /* defined below; reap_children
 #define CLOSE_GRACE_MS 8000
 static int g_close_posted;
 
+/* ml825: the hard kill below has NEVER fired on device: its deadline is
+ * GetTickCount()-based and the shared-data tick count was frozen until ml825
+ * turned the clock on. Turning the clock on must not silently arm a violent
+ * outside TerminateProcess (see the ml799 note above) in the force-close flow
+ * the app's quit watchdog (ml814-818) was built around, so it stays off unless
+ * MADEIRA_AGENT_HARDKILL=1. */
+static int hardkill_enabled( void )
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        char buf[8];
+        DWORD n = GetEnvironmentVariableA( "MADEIRA_AGENT_HARDKILL", buf, sizeof(buf) );
+        v = (n > 0 && n < sizeof(buf) && buf[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 static BOOL CALLBACK close_windows_proc( HWND hwnd, LPARAM lp )
 {
     DWORD pid = 0;
@@ -105,7 +123,7 @@ static void reap_children( void )
             g_child_kill_at[i] = g_child_kill_at[g_child_n];
             continue;
         }
-        if (g_child_kill_at[i] && (LONG)(GetTickCount() - g_child_kill_at[i]) >= 0)
+        if (g_child_kill_at[i] && hardkill_enabled() && (LONG)(GetTickCount() - g_child_kill_at[i]) >= 0)
         {
             agent_log( "pid=%lu ignored WM_CLOSE for %d ms -> TerminateProcess", (unsigned long)g_child_pid[i], CLOSE_GRACE_MS );
             TerminateProcess( g_child_handle[i], 1 );

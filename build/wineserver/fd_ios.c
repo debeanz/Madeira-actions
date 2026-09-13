@@ -448,8 +448,18 @@ int ios_usd_time_enabled(void)
     static int env = -1;
     if (env < 0)
     {
+        /* ml825: ON by default; MADEIRA_USD_TIME=0 (Documents/madeira-usd-time.txt
+         * containing "0") turns it off. It was opt-in "while it is new" after
+         * 259affd fixed the colliding-global wedge, which left GetTickCount64 /
+         * Environment.TickCount frozen for every game. That freeze is what
+         * keeps Unity 2018.4's libcurl job spinning a whole core: 0.1.79 made
+         * config.uca.cloud.unity3d.com fail to resolve (ml824) and the thread
+         * STILL sat at 90-95% at the same guest RIP (UnityPlayer+0x112e4e1,
+         * curl's timer splay tree) — with no socket to wait on, curl only
+         * leaves that loop when a timer expires, and on a stopped clock none
+         * ever does. Windows programs are entitled to a moving tick count. */
         const char *e = getenv( "MADEIRA_USD_TIME" );
-        env = (e && e[0] == '1') ? 1 : 0;
+        env = (e && e[0] == '0') ? 0 : 1;
     }
     return env;
 }

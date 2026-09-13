@@ -3885,8 +3885,8 @@ struct ContentView: View {
             // and TickCount again. Without it those stay frozen at their init values,
             // so GetTickCount/Environment.TickCount/DateTime.UtcNow never advance and
             // every time-gated transition in a managed game waits forever while the
-            // renderer keeps drawing. Opt-in only because the old code claimed the
-            // write faulted; this should become unconditional once proven.
+            // renderer keeps drawing. ml825: now ON by default (wineserver
+            // ios_usd_time_enabled); this file containing "0" turns it off.
             // ml820: two kill switches for this build's performance changes, read the
             // same way. Each file holding "0" restores the pre-ml820 behaviour:
             //   madeira-bgjob-qos.txt  Unity 'Background Job.*' workers stay USER_INTERACTIVE
