@@ -301,7 +301,13 @@ jobs:
           path: |
             build/wineserver/obj
             app/Madeira/libwineserver.a
-          key: wineserver-7817e22-${{ env.CACHE_V }}
+          # ml820: the key used to be only the wine commit + CACHE_V, which
+          # never changed, so every edit to build/wineserver/*_ios.c since this
+          # cache was created (ml803 [cw-fail] diagnostics, ml808's cursor clip
+          # at MADEIRA_SCREEN_W/H instead of 1024x768) was silently skipped and
+          # the device kept running the old server. Hash the sources, like the
+          # wineunix and DXMT caches do.
+          key: wineserver-7817e22-${{ hashFiles('build/wineserver/*.c', 'build/wineserver/*.h', 'build/wineserver/build.sh', 'build/wineserver/*.py') }}-${{ env.CACHE_V }}
 
       - name: Seed wineserver base archive
         if: steps.wsrv.outputs.cache-hit != 'true'
