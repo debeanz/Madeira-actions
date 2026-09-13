@@ -937,6 +937,15 @@ struct JoystickFace: View {
     /// than faked by passing held:true (which would also kill the knob travel
     /// and the press styling).
     var alwaysExpanded = false
+    /// ml822: the in-game overlay stick draws a plain translucent disc instead of
+    /// Liquid Glass / ultraThinMaterial. 0.1.75 Goose garden: with the stick held,
+    /// 87 of 122 one-second present windows had a frame over 20 ms (5.4% of frames
+    /// shown late) against 7 of 94 without it, while game CPU, wineserver CPU,
+    /// request rate and GPU time were unchanged — a stall per event, not more
+    /// work. Every direction change re-renders this face and springs the knob
+    /// over a glass effect that must be recomposited on top of the live game
+    /// layer; a late compositor hands DXMT its next drawable late.
+    var lightweight = false
     private var expanded: Bool { held || alwaysExpanded }
 
     static let idleDiameter: CGFloat = 22
@@ -946,7 +955,9 @@ struct JoystickFace: View {
     private let knobTravelRatio: CGFloat = 0.30
 
     @ViewBuilder private var interior: some View {
-        if #available(iOS 26.0, *) {
+        if lightweight {
+            Circle().fill(Color.black.opacity(0.28))
+        } else if #available(iOS 26.0, *) {
             Circle().fill(.clear).glassEffect(.regular, in: Circle())
         } else {
             Circle().fill(.ultraThinMaterial)
@@ -4870,7 +4881,7 @@ struct TouchControlButton: View {
             if control.action.stickKeys != nil {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
-                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true)
+                JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true, lightweight: true)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
@@ -4891,7 +4902,10 @@ struct TouchControlButton: View {
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
         .animation(.easeOut(duration: 0.08), value: isDown)
         // ml646: the springy knob, same curve as the portrait pad overlay.
-        .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
+        // ml822: not for the in-game stick — the knob snaps. A 0.22 s spring
+        // with overshoot ran on every direction change, i.e. about once a second
+        // while walking, and each one lined up with a late game frame.
+        .animation(isStick ? nil : Animation.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
         .overlay(alignment: .topTrailing) {
             if isSelected {
                 Button {
