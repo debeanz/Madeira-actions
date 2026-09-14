@@ -141,6 +141,24 @@ final class SteamCovers: ObservableObject {
         }
     }
 
+    /// ml830: Delete game / Remove from library. Drops the cover, backdrop,
+    /// state and negative cache for the id; a resolution still running for it
+    /// is ignored. The cached header file goes too unless another game still
+    /// uses its appid. GameLibrary calls this before it forgets the appid.
+    func forget(id: String) {
+        let library = GameLibrary.shared
+        let appid = library.game(withID: id)?.steamAppID ?? library.storedSteamAppID(for: id)
+        forgetNegative(id)
+        generation[id] = (generation[id] ?? 0) + 1
+        covers.removeValue(forKey: id)
+        backdrops.removeValue(forKey: id)
+        state.removeValue(forKey: id)
+        if let appid, appid > 0, !library.isSteamAppIDInUse(appid, excluding: id) {
+            let url = SteamCovers.cacheURL(appid: appid)
+            queue.addOperation { _ = try? FileManager.default.removeItem(at: url) }
+        }
+    }
+
     // MARK: - In-flight bookkeeping
 
     private func beginLoad(_ id: String) -> Bool {
@@ -174,7 +192,7 @@ final class SteamCovers: ObservableObject {
         // 2. An appid already stored on the game.
         if let appid = game.steamAppID, appid > 0 {
             if let image = coverImage(appid: appid) {
-                applySteamName(appid: appid, to: game)
+                applySteamName(appid: appid, to: game, generation: gen)
                 publish(id: id, generation: gen, image: image)
             } else {
                 LogStore.shared.log("Cover: \(title) -> Steam \(appid) has no header image", level: .error)
@@ -187,7 +205,7 @@ final class SteamCovers: ObservableObject {
         if let appid = steamAppIDFile(for: game) {
             if let image = coverImage(appid: appid) {
                 LogStore.shared.log("Cover: \(title) -> Steam \(appid) (steam_appid.txt)", level: .success)
-                applySteamName(appid: appid, to: game)
+                applySteamName(appid: appid, to: game, generation: gen)
                 publish(id: id, generation: gen, image: image)
             } else {
                 LogStore.shared.log("Cover: \(title) -> Steam \(appid) (steam_appid.txt) has no header image", level: .error)
@@ -215,6 +233,8 @@ final class SteamCovers: ObservableObject {
         }
         LogStore.shared.log("Cover: \(title) -> Steam \(found.id) (\(found.name))", level: .success)
         DispatchQueue.main.async {
+            // ml830: not for a game forgotten (deleted) or re-resolved meanwhile.
+            guard (self.generation[id] ?? 0) == gen else { return }
             GameLibrary.shared.setSteamAppID(found.id, for: game)
             GameLibrary.shared.setSteamTitle(found.name, for: game)
         }
@@ -224,7 +244,7 @@ final class SteamCovers: ObservableObject {
     /// ml796: name the game the way Steam does. Search results carry the
     /// name; appid-only resolutions (stored id, steam_appid.txt) ask the
     /// store once (appdetails, filters=basic) and remember it.
-    private func applySteamName(appid: Int, to game: LauncherGame) {
+    private func applySteamName(appid: Int, to game: LauncherGame, generation gen: Int) {
         if GameLibrary.shared.hasSteamTitle(for: game.id) { return }
         guard let url = URL(string: "https://store.steampowered.com/api/appdetails?appids=\(appid)&filters=basic") else { return }
         let (data, resp) = fetch(url)
@@ -235,6 +255,7 @@ final class SteamCovers: ObservableObject {
               let name = payload["name"] as? String, !name.isEmpty else { return }
         LogStore.shared.log("Cover: \(game.title) is \"\(name)\" on Steam")
         DispatchQueue.main.async {
+            guard (self.generation[game.id] ?? 0) == gen else { return }   // ml830
             GameLibrary.shared.setSteamTitle(name, for: game)
         }
     }
@@ -250,9 +271,11 @@ final class SteamCovers: ObservableObject {
     }
 
     private func fail(id: String, generation gen: Int, remember: Bool) {
-        if remember { rememberNegative(id) }
         DispatchQueue.main.async {
             guard (self.generation[id] ?? 0) == gen else { return }
+            // ml830: remembered only while current, so a resolution that ends
+            // after forget (Delete game) cannot write the negative entry back.
+            if remember { self.rememberNegative(id) }
             self.state[id] = .failed
         }
     }

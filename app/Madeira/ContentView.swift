@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import CryptoKit
 import QuartzCore
 import Combine
 import Metal
@@ -1411,6 +1412,21 @@ struct ContentView: View {
     @State private var launchingGame: LauncherGame? = nil
     @State private var firstFrameSeen = false
     @State private var launchBarPhase = false
+    /// ml830: "Loading shader cache" step before a game starts (0...1), nil when not loading.
+    @State private var shaderLoadProgress: Double? = nil
+    /// ml830: games started this run whose exit has not been reported yet. A game the
+    /// watchdog or force close returned from can still be tearing down with its cache
+    /// files open, so its Clear / Delete stay disabled until the agent reports the exit.
+    @State private var unexitedGames: [Int: String] = [:]   // pid -> game id, per instance
+    /// A launch the agent never answered can still start the game later, with no pid
+    /// to wait on; keep that game busy until the session ends.
+    @State private var unansweredGameIDs: Set<String> = []
+
+    private var busyGameIDs: Set<String> {
+        var s = Set(unexitedGames.values).union(unansweredGameIDs)
+        if let id = launchingGame?.id { s.insert(id) }
+        return s
+    }
     /// ml809: seconds the loading screen has been up, so a long first-frame
     /// wait visibly progresses instead of looking hung.
     @State private var launchElapsed = 0
@@ -1448,10 +1464,10 @@ struct ContentView: View {
     /// FEX_TSOENABLED=0: skip x86 memory-ordering emulation. Big CPU saving,
     /// not safe for every title. Applied by runWineFullSequence.
     @AppStorage("madeira.fexNoTSO") private var fexNoTSO = false
-    /// ml829: DXMT shader cache on/off (Settings → DXMT Renderer). Read by
-    /// runWineFullSequence; defaults to whether madeira-shadercache.txt exists.
-    @AppStorage(ShaderCache.key) private var shaderCacheEnabled = false
-    @State private var shaderCacheSizeText = ""
+    /// ml829/ml830: DXMT shader cache on/off for every game (Settings → DXMT Renderer).
+    /// ON by default; each game also has its own switch in its ⋯ menu.
+    @AppStorage(ShaderCache.key) private var shaderCacheEnabled = true
+    @State private var shaderCacheSizeText = "…"
     /// MADEIRA_DEBUG_VERBOSE=1: full WINEDEBUG trace (WineProcessBridge.m).
     @AppStorage("madeira.wineVerbose") private var wineVerbose = false
     /// Screen size of the Wine Virtual Desktop launcher, as "WxH". This is
@@ -1654,6 +1670,7 @@ struct ContentView: View {
     private var launcherScreen: some View {
         var v = LauncherView(session: launcherSession, onPlay: playGameHosted, onOpenDesktop: openDesktopFromGames, onQuitApp: quitApp)
         v.onForceClose = forceCloseGame
+        v.busyGameIDs = busyGameIDs   // ml830: no Clear / Delete for a game that is running
         return v
     }
 
@@ -1725,16 +1742,21 @@ struct ContentView: View {
         let (screenW0, screenH0) = desktopSize
         setenv("MADEIRA_SCREEN_W", String(screenW0), 1)
         setenv("MADEIRA_SCREEN_H", String(screenH0), 1)
-        let startInSession: () -> Void = {
-            logStore.log("Games: launching \(game.title) → \(exePath)")
-            SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath) { outcome in
+        let launchInSession: () -> Void = {
+            // ml830: this game's own shader cache (or "off") goes to the agent with
+            // the launch, because the runtime's environment was fixed when it started.
+            let cache = ShaderCache.launchValue(for: game)
+            logStore.log("Games: launching \(game.title) → \(exePath) (shader cache: "
+                         + (cache == "off" ? "off" : ShaderCache.dirName(forGameID: game.id)) + ")")
+            SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, shaderCache: cache) { outcome in
                 switch outcome {
                 case .started(let pid):
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)
                     GameLibrary.shared.markPlayed(game)
                     playingPid = pid
+                    unexitedGames[pid] = game.id
                     launcherSession = .playing(game.title)
-                    watchHostedGame(pid: pid, title: game.title)
+                    watchHostedGame(pid: pid, title: game.title, gameID: game.id)
                     return
                 case .failed(let code):
                     logStore.log("\(game.title) failed to start: Windows error \(code)", level: .error)
@@ -1742,6 +1764,9 @@ struct ContentView: View {
                     logStore.log("\(game.title): the desktop did not become ready in time", level: .error)
                 case .noAnswer:
                     logStore.log("\(game.title): no answer from the desktop agent (C:\\madeira\\agent.log)", level: .error)
+                    // ml830: the agent may still be inside a slow CreateProcessW and start
+                    // the game later. Keep its Clear / Delete disabled until the session ends.
+                    unansweredGameIDs.insert(game.id)
                 }
                 // ml812: if a game crashed earlier in this session, THAT is
                 // almost certainly why this one never started — its orphaned
@@ -1753,6 +1778,25 @@ struct ContentView: View {
                 launchingGame = nil
                 desktopFullScreen = false
                 selectedTab = .games
+            }
+        }
+        // ml830: "Loading shader cache" first — reads this game's cache files into
+        // memory with a real progress bar. On a cold start it runs alongside the
+        // runtime boot (the agent is not ready for seconds anyway); with nothing
+        // cached it is skipped at once.
+        let startInSession: () -> Void = {
+            ShaderCache.preload(for: game, progress: { p in
+                if case .launching(let t) = launcherSession, t == game.title { shaderLoadProgress = p }
+            }) { bytes, secs in
+                shaderLoadProgress = nil
+                if bytes > 0 {
+                    logStore.log("DXMT shader cache: loaded \(ShaderCache.text(bytes)) for \(game.title) in "
+                                 + String(format: "%.2f s", secs))
+                }
+                // The launch may have failed or been abandoned meanwhile.
+                guard case .launching(let t) = launcherSession, t == game.title,
+                      launchingGame?.id == game.id else { return }
+                launchInSession()
             }
         }
         // A desktop session started from the Desktop tab hosts the game
@@ -1815,6 +1859,8 @@ struct ContentView: View {
         DispatchQueue.main.async {
             self.currentWatch?.done = true       // ml818: end its watchdog with the session
             self.closingGame = false
+            self.unexitedGames.removeAll()       // ml830: the runtime is gone, and every game with it
+            self.unansweredGameIDs.removeAll()
             if case .playing = self.launcherSession { self.launcherSession = .idle }
             if case .launching = self.launcherSession { self.launcherSession = .idle }
             self.launchingGame = nil
@@ -1825,7 +1871,7 @@ struct ContentView: View {
 
     /// Loading screen until the game has presented, then wait for the
     /// agent's exit report so Play returns.
-    private func watchHostedGame(pid: Int, title: String) {
+    private func watchHostedGame(pid: Int, title: String, gameID: String) {
         // ml814: lets the exit report stop the stall watchdog below. A plain
         // class box because the watchdog runs on a background thread and must
         // not touch @State to decide whether to keep looping.
@@ -1985,6 +2031,7 @@ struct ContentView: View {
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
             done.done = true          // ml814: stop the stall watchdog
+            unexitedGames.removeValue(forKey: pid)   // ml830: THIS instance's files are closed now
             logStore.log("\(title) ended (exit code \(code))")
             // ml812: a non-zero exit is a crash (a clean quit and our WM_CLOSE
             // force-close both report 0). Remember it: the threads it left
@@ -2463,20 +2510,7 @@ struct ContentView: View {
                 Text(launchStatusText)
                     .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(.white)
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.12))
-                    Capsule().fill(Color(red: 0.10, green: 0.62, blue: 1.0))
-                        .frame(width: 110)
-                        .offset(x: launchBarPhase ? 150 : 0)
-                }
-                .frame(width: 260, height: 6)
-                .clipShape(Capsule())
-                .onAppear {
-                    launchBarPhase = false
-                    withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
-                        launchBarPhase = true
-                    }
-                }
+                launchProgressBar
             }
             .padding(32)
         }
@@ -2508,6 +2542,35 @@ struct ContentView: View {
         }
     }
 
+    /// ml830: determinate while the shader cache loads, the sliding bar otherwise.
+    @ViewBuilder private var launchProgressBar: some View {
+        if let p = shaderLoadProgress {
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.12))
+                Capsule().fill(Color(red: 0.10, green: 0.62, blue: 1.0))
+                    .frame(width: max(6, 260 * CGFloat(p)))
+                    .animation(.linear(duration: 0.1), value: p)
+            }
+            .frame(width: 260, height: 6)
+            .clipShape(Capsule())
+        } else {
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.12))
+                Capsule().fill(Color(red: 0.10, green: 0.62, blue: 1.0))
+                    .frame(width: 110)
+                    .offset(x: launchBarPhase ? 150 : 0)
+            }
+            .frame(width: 260, height: 6)
+            .clipShape(Capsule())
+            .onAppear {
+                launchBarPhase = false
+                withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                    launchBarPhase = true
+                }
+            }
+        }
+    }
+
     private var launchStatusText: String {
         // ml809: show the elapsed seconds once a load runs long. Hollow Knight
         // takes ~15 s to reach its first frame, and a motionless "Launching
@@ -2517,6 +2580,9 @@ struct ContentView: View {
         // ml818: only while playing — during a launch the panel must say
         // "Launching game…" whatever a stale flag says.
         if closingGame, case .playing = launcherSession { return "Closing game…" }
+        if let p = shaderLoadProgress, case .launching = launcherSession {
+            return "Loading shader cache… \(Int((p * 100).rounded()))%"   // ml830
+        }
         switch launcherSession {
         case .enablingJIT: return "Enabling JIT…" + tail
         case .launching, .playing: return "Launching game…" + tail
@@ -2718,16 +2784,26 @@ struct ContentView: View {
                     LabeledContent("Build", value: "Bundled")
                     Toggle("Shader cache", isOn: $shaderCacheEnabled)
                     Button(role: .destructive) {
-                        ShaderCache.clear()
-                        shaderCacheSizeText = ShaderCache.sizeText()
+                        shaderCacheSizeText = "…"
+                        DispatchQueue.global(qos: .utility).async {
+                            ShaderCache.clear()
+                            let t = ShaderCache.sizeText()
+                            DispatchQueue.main.async { shaderCacheSizeText = t }
+                        }
                     } label: {
-                        LabeledContent("Clear shader cache", value: shaderCacheSizeText)
+                        LabeledContent("Clear all shader caches", value: shaderCacheSizeText)
                     }
-                    Text("Saves converted shaders so a game doesn't rebuild them every launch, which means fewer stutters the second time you visit an area. Stored per Madeira build; an update starts a fresh cache. Takes effect the next time you open Madeira. Per-title DXMT overrides can be supplied through madeira-dxmt.txt in Files.")
+                    .disabled(!busyGameIDs.isEmpty)
+                    Text("Saves converted shaders so a game doesn't rebuild them every launch, which means fewer stutters the second time you visit an area. On for every game by default; each game keeps its own cache, and its ⋯ menu shows the size and can turn it off or clear it for that game. Applies the next time a game starts. Stored per Madeira build; an update starts fresh. Per-title DXMT overrides can be supplied through madeira-dxmt.txt in Files.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                .onAppear { shaderCacheSizeText = ShaderCache.sizeText() }
+                .onAppear {
+                    DispatchQueue.global(qos: .utility).async {
+                        let t = ShaderCache.sizeText()
+                        DispatchQueue.main.async { shaderCacheSizeText = t }
+                    }
+                }
 
                 Section("Screen") {
                     Picker("Resolution", selection: $desktopResolution) {
@@ -4013,39 +4089,63 @@ struct ContentView: View {
                 }
             }
 
-            // ml819: DXMT shader-cache A/B. ml829: now a Settings toggle
-            // (ShaderCache.key); madeira-shadercache.txt only decides its default
-            // until the user flips it. Without it every launch logs
-            // "[CacheReader] Failed to resolve cache path": without a path, the unix
-            // side asks confstr(_CS_DARWIN_USER_CACHE_DIR), which fails on iOS, so
-            // every DXBC->AIR conversion reruns each launch. d3d11.dll honours
-            // DXMT_SHADER_CACHE_PATH ONLY if it starts with '/' (a Windows path is
-            // silently ignored) and appends "shaders_<metalver>.db". Namespaced by
-            // build: the table key (cache_15) is fixed in the prebuilt d3d11.dll and
-            // does not change when CI rebuilds airconv, so a stale converter's output
-            // must never be served to a newer build.
-            if !ShaderCache.enabled {
-                unsetenv("DXMT_SHADER_CACHE_PATH")
-                logStore.log("DXMT shader cache: off (Settings)")
-            } else if let root = ShaderCache.root {
+            // ml819/ml829/ml830: DXMT shader cache. d3d11.dll reads its settings from
+            // the WINDOWS environment, which the runtime snapshots from here once at
+            // start; Games-tab launches then override it per game through the agent
+            // (ShaderCache.launchValue, "shadercache=" in launch.txt). What is set
+            // here is for everything else — programs started from the Wine desktop
+            // share <build>/desktop. Without a path, the unix side asks
+            // confstr(_CS_DARWIN_USER_CACHE_DIR), which fails on iOS ("[CacheReader]
+            // Failed to resolve cache path"), and every DXBC->AIR conversion reruns
+            // each launch. DXMT_SHADER_CACHE=0 is DXMT's own off switch; relying on
+            // that failure to mean "off" would silently turn the cache back on if
+            // the path resolution were ever fixed.
+            if let root = ShaderCache.root {
                 let fm = FileManager.default
-                let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
-                let dir = root.appendingPathComponent(build, isDirectory: true)
+                let build = ShaderCache.buildName
+                // Old builds' caches are never valid for this build's converter.
                 for old in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] where old != build {
                     try? fm.removeItem(at: root.appendingPathComponent(old))
                 }
-                do {
-                    try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-                    let p = dir.path   // absolute container path, begins with "/"
-                    setenv("DXMT_SHADER_CACHE_PATH", p, 1)
-                    let files = (try? fm.contentsOfDirectory(atPath: p)) ?? []
-                    let bytes = files.reduce(0) { acc, f in
-                        acc + (((try? fm.attributesOfItem(atPath: dir.appendingPathComponent(f).path))?[.size] as? NSNumber)?.intValue ?? 0)
+                // ml829 kept one shared database at the build folder's top level.
+                if let buildDir = ShaderCache.buildDir {
+                    for f in (try? fm.contentsOfDirectory(atPath: buildDir.path)) ?? [] where f.hasPrefix("shaders_") {
+                        try? fm.removeItem(at: buildDir.appendingPathComponent(f))
                     }
-                    logStore.log("DXMT shader cache: DXMT_SHADER_CACHE_PATH=\(p) (\(files.count) files, \(bytes / 1024) KB) via Settings")
+                }
+            }
+            if !ShaderCache.enabled {
+                setenv("DXMT_SHADER_CACHE", "0", 1)
+                unsetenv("DXMT_SHADER_CACHE_PATH")
+                logStore.log("DXMT shader cache: off for every game (Settings)")
+            } else if let dir = ShaderCache.desktopDir {
+                do {
+                    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    unsetenv("DXMT_SHADER_CACHE")
+                    setenv("DXMT_SHADER_CACHE_PATH", dir.path, 1)   // absolute, begins with "/"
+                    logStore.log("DXMT shader cache: on (per game from the Games tab; desktop programs share \(ShaderCache.buildName)/desktop)")
                 } catch {
+                    setenv("DXMT_SHADER_CACHE", "0", 1)
                     logStore.log("DXMT shader cache: cannot create \(dir.path): \(error)", level: .error)
                 }
+            }
+            // ml830: dxgi.dll otherwise points Metal's own compiled-pipeline cache at
+            // the relative "dxmt/<exe>/com.apple.metal", which resolves to nil on iOS
+            // (same confstr failure) and hands MTLSetShaderCachePath a nil path. Let
+            // Metal keep its normal per-app location instead, and log what is there
+            // so a device log shows whether that cache survives between launches.
+            setenv("DXMT_USE_DEFAULT_METAL_CACHE", "1", 1)
+            if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                var metalBytes: Int64 = 0
+                var metalDirs = 0
+                if let e = FileManager.default.enumerator(at: caches, includingPropertiesForKeys: [.isDirectoryKey]) {
+                    for case let u as URL in e where u.lastPathComponent == "com.apple.metal" {
+                        metalDirs += 1
+                        metalBytes += ShaderCache.sizeBytes(of: u)
+                        e.skipDescendants()
+                    }
+                }
+                logStore.log("Metal pipeline cache: \(metalDirs) com.apple.metal folder(s), \(ShaderCache.text(metalBytes)) in Library/Caches")
             }
 
             // ml734: Theorafile call tracer. Documents/madeira-tf-trace.txt == "1"
@@ -5974,20 +6074,23 @@ struct MappingPanel: View {
     }
 }
 
-/// ml829: the DXMT shader cache switch and its storage.
-/// Library/Caches/dxmt-shaders/<CFBundleVersion>/shaders_<metalver>.db, written by
-/// d3d11.dll when runWineFullSequence sets DXMT_SHADER_CACHE_PATH.
+/// ml829/ml830: the DXMT shader cache switches and their storage.
+///
+/// Layout: Library/Caches/dxmt-shaders/<CFBundleVersion>/<game key>/shaders_<metalver>.db
+/// (+ -wal/-shm/-lock), one directory per Games-tab game, plus "desktop" for programs
+/// started from the Wine desktop. d3d11.dll (prebuilt, reads the WINDOWS environment
+/// with a MAX_PATH buffer) takes DXMT_SHADER_CACHE_PATH only when it starts with "/";
+/// DXMT_SHADER_CACHE=0 turns the cache off outright. The runtime's environment is
+/// fixed when it starts, so per-game values go to madeira-agent in launch.txt
+/// ("shadercache=<dir>|off"), which sets them just for that CreateProcess.
+/// Namespaced by build: the table key (cache_15) is frozen in the prebuilt DLL while
+/// CI can change the converter, so a stale converter's output must never be served.
 enum ShaderCache {
+    /// Global switch, Settings > DXMT Renderer. ON by default (ml830).
     static let key = "madeira.shaderCache"
 
-    /// Until the user flips the switch, the old flag file decides (ml819), so a
-    /// cache someone already turned on stays on. Registered defaults are not
-    /// persisted; the first flip writes a real value.
     static func registerDefault() {
-        let flag = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("madeira-shadercache.txt").path
-        let on = flag.map { FileManager.default.fileExists(atPath: $0) } ?? false
-        UserDefaults.standard.register(defaults: [key: on])
+        UserDefaults.standard.register(defaults: [key: true])
     }
 
     static var enabled: Bool { UserDefaults.standard.bool(forKey: key) }
@@ -5997,23 +6100,162 @@ enum ShaderCache {
             .appendingPathComponent("dxmt-shaders", isDirectory: true)
     }
 
-    static func sizeBytes() -> Int {
-        guard let root, let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey])
-        else { return 0 }
-        var total = 0
-        for case let url as URL in e {
-            total += (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+    static var buildName: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+    }
+
+    static var buildDir: URL? { root?.appendingPathComponent(buildName, isDirectory: true) }
+
+    /// Readable, collision-free, stable folder name for a game id ("Games/Hollow Knight",
+    /// "manual:Games/X/x.exe"): slug of the folder name + 16 hex of SHA-256(id).
+    /// Never String.hashValue — that is seeded per process.
+    static func dirName(forGameID id: String) -> String {
+        let nfc = id.precomposedStringWithCanonicalMapping
+        let digest = SHA256.hash(data: Data(nfc.utf8))
+        let hex = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        var name = nfc
+        if name.hasPrefix("manual:") {
+            name = String(name.dropFirst("manual:".count))
+            name = (name as NSString).deletingLastPathComponent
+        }
+        name = (name as NSString).lastPathComponent
+        let folded = name.applyingTransform(.toLatin, reverse: false)?
+            .applyingTransform(.stripDiacritics, reverse: false) ?? name
+        var slug = ""
+        var dash = false
+        for ch in folded.lowercased().unicodeScalars {
+            if slug.count >= 32 { break }
+            if ch.isASCII, CharacterSet.alphanumerics.contains(ch) {
+                slug.unicodeScalars.append(ch)
+                dash = false
+            } else if !dash, !slug.isEmpty {
+                slug.append("-")
+                dash = true
+            }
+        }
+        while slug.hasSuffix("-") { slug.removeLast() }
+        return (slug.isEmpty ? "game" : slug) + "-" + hex
+    }
+
+    static func dir(forGameID id: String) -> URL? {
+        buildDir?.appendingPathComponent(dirName(forGameID: id), isDirectory: true)
+    }
+
+    /// Shared cache for programs started from the Wine desktop (not via the agent).
+    static var desktopDir: URL? { buildDir?.appendingPathComponent("desktop", isDirectory: true) }
+
+    /// What madeira-agent gets for this launch: an absolute directory, or "off".
+    /// Off when either switch is off, or when the path would not fit DXMT's
+    /// MAX_PATH environment buffer (it would silently read as empty).
+    static func launchValue(for game: LauncherGame) -> String {
+        guard enabled, GameLibrary.shared.isShaderCacheEnabled(for: game.id),
+              let dir = dir(forGameID: game.id) else { return "off" }
+        guard dir.path.utf16.count < 250 else {
+            LogStore.shared.log("DXMT shader cache: path too long for DXMT (\(dir.path.utf16.count)), off for \(game.title)",
+                                level: .error)
+            return "off"
+        }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? Data((game.id + "\n").utf8).write(to: dir.appendingPathComponent("game-id.txt"))
+        } catch {
+            LogStore.shared.log("DXMT shader cache: cannot create \(dir.path): \(error)", level: .error)
+            return "off"
+        }
+        return dir.path
+    }
+
+    // MARK: sizes (blocking: call off the main thread)
+
+    static func sizeBytes(of url: URL) -> Int64 {
+        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .fileSizeKey, .isRegularFileKey]
+        guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys) else { return 0 }
+        var total: Int64 = 0
+        for case let f as URL in e {
+            guard let v = try? f.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
+            total += Int64(v.totalFileAllocatedSize ?? v.fileSize ?? 0)
         }
         return total
     }
 
-    static func sizeText() -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(sizeBytes()), countStyle: .file)
+    /// This build's cache for one game (every file: .db, -wal, -shm, -lock).
+    static func sizeBytes(forGameID id: String) -> Int64 {
+        guard let d = dir(forGameID: id) else { return 0 }
+        return sizeBytes(of: d)
+    }
+
+    /// Everything under dxmt-shaders (Settings).
+    static func sizeBytes() -> Int64 {
+        guard let root else { return 0 }
+        return sizeBytes(of: root)
+    }
+
+    static func text(_ bytes: Int64) -> String {
+        bytes <= 0 ? "Empty" : ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    static func sizeText() -> String { text(sizeBytes()) }
+
+    // MARK: clearing
+
+    /// Remove one game's cache for this build. Callers must not do this while that
+    /// game runs: its d3d11.dll holds the sqlite files open.
+    static func clear(forGameID id: String) {
+        guard let d = dir(forGameID: id) else { return }
+        try? FileManager.default.removeItem(at: d)
+        LogStore.shared.log("DXMT shader cache: cleared for \(id)")
+    }
+
+    /// Remove a game's cache in every build folder (Delete game).
+    static func removeAll(forGameID id: String) {
+        guard let root else { return }
+        let name = dirName(forGameID: id)
+        for build in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent(build).appendingPathComponent(name))
+        }
     }
 
     static func clear() {
         guard let root else { return }
         try? FileManager.default.removeItem(at: root)
         LogStore.shared.log("DXMT shader cache: cleared from Settings")
+    }
+
+    // MARK: loading bar
+
+    /// The "Loading shader cache" step before a game starts: reads this game's cache
+    /// files so they are in memory when the game opens them. DXMT's cache holds
+    /// converted shader bytecode, and reading it ahead is the work that can honestly
+    /// be done before the game exists. progress (0...1) and done(bytes, seconds) are
+    /// called on the main queue; done(0, 0) at once when nothing is cached.
+    static func preload(for game: LauncherGame, progress: @escaping (Double) -> Void,
+                        done: @escaping (Int64, Double) -> Void) {
+        guard enabled, GameLibrary.shared.isShaderCacheEnabled(for: game.id),
+              let d = dir(forGameID: game.id) else { done(0, 0); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let files = ((try? FileManager.default.contentsOfDirectory(at: d, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix("shaders_") && !$0.lastPathComponent.hasSuffix("-lock") }
+            let sizes = files.map { Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+            let total = sizes.reduce(0, +)
+            guard total > 0 else { DispatchQueue.main.async { done(0, 0) }; return }
+            let t0 = Date()
+            var read: Int64 = 0
+            var lastReport = Date.distantPast
+            for f in files {
+                guard let h = try? FileHandle(forReadingFrom: f) else { continue }
+                while true {
+                    guard let data = try? h.read(upToCount: 1 << 20), !data.isEmpty else { break }
+                    read += Int64(data.count)
+                    if Date().timeIntervalSince(lastReport) > 0.05 {
+                        lastReport = Date()
+                        let p = min(1, Double(read) / Double(total))
+                        DispatchQueue.main.async { progress(p) }
+                    }
+                }
+                try? h.close()
+            }
+            let secs = Date().timeIntervalSince(t0)
+            DispatchQueue.main.async { progress(1); done(read, secs) }
+        }
     }
 }

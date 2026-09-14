@@ -14,12 +14,23 @@
  *     exe=C:\Games\Hollow Knight\hollow_knight.exe
  *     dir=C:\Games\Hollow Knight
  *     args=<optional>
+ *     shadercache=off  or  shadercache=/abs/unix/dir    (optional, ml830)
  *
  * The agent deletes the request, CreateProcess()es the game with its folder
  * as working directory, and answers in C:\madeira\launch.result:
  *
  *     id=<token>
  *     ok pid=<pid>          or          err code=<GetLastError>
+ *
+ * ml830: "shadercache=" gives this one game its own DXMT shader cache, or
+ * none. DXMT's d3d11.dll reads DXMT_SHADER_CACHE / DXMT_SHADER_CACHE_PATH
+ * from the game's Windows environment block, which CreateProcessW copies from
+ * ours. "off" sets DXMT_SHADER_CACHE=0 and removes DXMT_SHADER_CACHE_PATH; an
+ * absolute path removes DXMT_SHADER_CACHE and sets DXMT_SHADER_CACHE_PATH to
+ * it. Both are set around that CreateProcessW only: the agent's own values
+ * (imported from the unix environ at runtime start) are put back right after,
+ * so they never leak into the next launch. Without the line the game inherits
+ * the agent's environment unchanged, as before.
  *
  * Why a helper instead of the app calling into Wine: every Wine "process" is
  * a thread here, and NtCreateUserProcess needs a caller with a TEB, server
@@ -138,14 +149,21 @@ static void agent_log( const char *fmt, ... )
     char line[1024];
     va_list ap;
     DWORD written, len;
+    int n;
     HANDLE h;
     SYSTEMTIME st;
 
     GetLocalTime( &st );
     len = (DWORD)snprintf( line, sizeof(line), "[%02u:%02u:%02u] ", st.wHour, st.wMinute, st.wSecond );
     va_start( ap, fmt );
-    len += (DWORD)vsnprintf( line + len, sizeof(line) - len - 2, fmt, ap );
+    n = vsnprintf( line + len, sizeof(line) - len - 2, fmt, ap );
     va_end( ap );
+    /* ml830: vsnprintf returns the length it WOULD have written; clamp it to
+     * what fits, or a long line (2 KB args or cache path) wrote the '\n' and
+     * NUL past the end of line[]. */
+    if (n < 0) n = 0;
+    if ((DWORD)n > sizeof(line) - len - 3) n = (int)(sizeof(line) - len - 3);
+    len += (DWORD)n;
     line[len++] = '\n';
     line[len] = 0;
     /* Also to stderr: the app maps a child's stderr onto madeira-log.txt. */
@@ -219,6 +237,50 @@ static WCHAR *utf8_to_wide( const char *s )
     return w;
 }
 
+/* ml830: the two variables a "shadercache=" line overrides for one launch. */
+#define ENV_SHADER_CACHE      L"DXMT_SHADER_CACHE"
+#define ENV_SHADER_CACHE_PATH L"DXMT_SHADER_CACHE_PATH"
+
+struct saved_env
+{
+    const WCHAR *name;
+    WCHAR       *value;   /* NULL = the variable was not set */
+};
+
+/* Snapshot one variable of our environment so it can be put back exactly.
+ * FALSE only when it is set but could not be copied: the caller must then not
+ * override what it cannot restore. */
+static BOOL save_env( struct saved_env *s, const WCHAR *name )
+{
+    DWORD len, got;
+
+    s->name = name;
+    s->value = NULL;
+    SetLastError( ERROR_SUCCESS );
+    len = GetEnvironmentVariableW( name, NULL, 0 );
+    if (!len && GetLastError() == ERROR_ENVVAR_NOT_FOUND) return TRUE;
+    if (!len) len = 1;   /* set, to an empty value */
+    s->value = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) );
+    if (!s->value) return FALSE;
+    s->value[0] = 0;
+    got = GetEnvironmentVariableW( name, s->value, len );
+    if (got >= len)
+    {
+        HeapFree( GetProcessHeap(), 0, s->value );
+        s->value = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Put a snapshot back (a NULL value removes the variable) and free it. */
+static void restore_env( struct saved_env *s )
+{
+    SetEnvironmentVariableW( s->name, s->value );
+    if (s->value) HeapFree( GetProcessHeap(), 0, s->value );
+    s->value = NULL;
+}
+
 /* Start a program; returns the pid or 0 (GetLastError() set). */
 static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *dir )
 {
@@ -254,9 +316,11 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
 static void handle_request( void )
 {
     char *text = read_text_file( REQUEST_PATH );
-    char id[128], exe[1024], dir[1024], args[2048], result[256];
-    WCHAR *wexe, *wdir, *wargs;
+    char id[128], exe[1024], dir[1024], args[2048], cache[2048], result[256];
+    WCHAR *wexe, *wdir, *wargs, *wcache = NULL;
     DWORD pid, err = 0;
+    int cache_mode = 0;   /* ml830: 0 = leave the environment alone, 1 = off, 2 = cache dir */
+    struct saved_env saved[2];
 
     if (!text) return;
     /* Delete first so a failure cannot be retried forever. */
@@ -306,14 +370,77 @@ static void handle_request( void )
     }
     get_field( text, "dir", dir, sizeof(dir) );
     get_field( text, "args", args, sizeof(args) );
+    /* ml830: per-game DXMT shader cache. get_field returns the first line
+     * only, and an empty value counts as absent (so: no override). */
+    if (get_field( text, "shadercache", cache, sizeof(cache) ))
+    {
+        if (strlen( cache ) >= sizeof(cache) - 1)
+            agent_log( "shadercache ignored: value too long (%u+ bytes, may be truncated)", (unsigned)strlen( cache ) );
+        else if (!strcmp( cache, "off" )) cache_mode = 1;
+        else if (cache[0] == '/') cache_mode = 2;
+        else agent_log( "shadercache=%s ignored: neither \"off\" nor an absolute path", cache );
+    }
     HeapFree( GetProcessHeap(), 0, text );
 
     wexe = utf8_to_wide( exe );
     wdir = utf8_to_wide( dir );
     wargs = utf8_to_wide( args );
     agent_log( "launch id=%s exe=%s dir=%s args=%s", id, exe, dir, args );
+
+    /* ml830: override both variables for this CreateProcessW only. Snapshot
+     * first; if either cannot be saved (out of memory), change nothing. */
+    if (cache_mode)
+    {
+        BOOL ok_cache = save_env( &saved[0], ENV_SHADER_CACHE );
+        BOOL ok_path = save_env( &saved[1], ENV_SHADER_CACHE_PATH );
+
+        if (cache_mode == 2) wcache = utf8_to_wide( cache );
+        if (!ok_cache || !ok_path || (cache_mode == 2 && !wcache))
+        {
+            agent_log( "shadercache override skipped: could not save the agent's environment" );
+            if (saved[0].value) HeapFree( GetProcessHeap(), 0, saved[0].value );
+            if (saved[1].value) HeapFree( GetProcessHeap(), 0, saved[1].value );
+            cache_mode = 0;
+        }
+        else if (cache_mode == 1)
+        {
+            BOOL ok = SetEnvironmentVariableW( ENV_SHADER_CACHE, L"0" );
+            DWORD set_err = ok ? 0 : GetLastError();
+            SetEnvironmentVariableW( ENV_SHADER_CACHE_PATH, NULL );
+            agent_log( "shadercache off: DXMT_SHADER_CACHE=0%s (err %lu), DXMT_SHADER_CACHE_PATH removed "
+                       "(agent had DXMT_SHADER_CACHE=%ls DXMT_SHADER_CACHE_PATH=%ls)",
+                       ok ? "" : " FAILED", (unsigned long)set_err,
+                       saved[0].value ? saved[0].value : L"<unset>",
+                       saved[1].value ? saved[1].value : L"<unset>" );
+        }
+        else
+        {
+            BOOL ok;
+            DWORD set_err;
+            SetEnvironmentVariableW( ENV_SHADER_CACHE, NULL );
+            ok = SetEnvironmentVariableW( ENV_SHADER_CACHE_PATH, wcache );
+            set_err = ok ? 0 : GetLastError();
+            agent_log( "shadercache on: DXMT_SHADER_CACHE removed, DXMT_SHADER_CACHE_PATH=%s%s (err %lu) "
+                       "(agent had DXMT_SHADER_CACHE=%ls DXMT_SHADER_CACHE_PATH=%ls)",
+                       cache, ok ? "" : " FAILED", (unsigned long)set_err,
+                       saved[0].value ? saved[0].value : L"<unset>",
+                       saved[1].value ? saved[1].value : L"<unset>" );
+            /* DXMT reads the path into a MAX_PATH buffer (util_env.cpp) and
+             * silently drops anything longer. */
+            if (wcslen( wcache ) >= MAX_PATH)
+                agent_log( "shadercache WARNING: path is %u chars; DXMT ignores paths of %d or more",
+                           (unsigned)wcslen( wcache ), MAX_PATH );
+        }
+    }
+
     pid = start_process( wexe, wargs, wdir );
     if (!pid) err = GetLastError();
+    if (cache_mode)
+    {
+        /* Back to exactly what the agent had; a NULL snapshot removes. */
+        restore_env( &saved[0] );
+        restore_env( &saved[1] );
+    }
     if (pid) snprintf( result, sizeof(result), "id=%s\r\nok pid=%lu\r\n", id, (unsigned long)pid );
     else     snprintf( result, sizeof(result), "id=%s\r\nerr code=%lu\r\n", id, (unsigned long)err );
     agent_log( "%s", result );
@@ -321,6 +448,7 @@ static void handle_request( void )
     HeapFree( GetProcessHeap(), 0, wexe );
     HeapFree( GetProcessHeap(), 0, wdir );
     HeapFree( GetProcessHeap(), 0, wargs );
+    if (wcache) HeapFree( GetProcessHeap(), 0, wcache );
 }
 
 int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )

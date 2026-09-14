@@ -292,6 +292,10 @@ struct LauncherView: View {
     let onQuitApp: () -> Void
     /// ml798: "Force close" in the running game's options.
     var onForceClose: () -> Void = {}
+    /// ml830: ids launching, playing or still shutting down (set by
+    /// ContentView after init, like onForceClose). Their shader cache and
+    /// files are in use: the options sheet disables Clear / Delete for them.
+    var busyGameIDs: Set<String> = []
 
     @ObservedObject private var library = GameLibrary.shared
     @ObservedObject private var covers = SteamCovers.shared
@@ -454,8 +458,11 @@ struct LauncherView: View {
                              onChangeCover: { g in
                                  afterDismiss { coverSearchGame = g }
                              },
-                             dismiss: { optionsGame = nil })
+                             // ml830: only this game's sheet. A Delete that finishes after
+                             // Done was pressed must not close a sheet opened since.
+                             dismiss: { if optionsGame?.id == game.id { optionsGame = nil } })
         s.onForceClose = onForceClose
+        s.busyGameIDs = busyGameIDs
         return s
     }
 
@@ -504,6 +511,9 @@ struct LauncherView: View {
     private func play(_ game: LauncherGame) {
         guard game.exe != nil, !game.only32Bit else { return }
         guard !isEnded, !sessionBusy else { return }
+        // ml830: its folder is being deleted (the sheet's Done was pressed while
+        // "Deleting…"); the tile only goes once that finishes.
+        guard !library.isDeleting(game.id) else { return }
         onPlay(game)
     }
 
@@ -1142,6 +1152,10 @@ private struct OptionRow: Identifiable {
     let systemImage: String
     let destructive: Bool
     let checked: Bool
+    /// ml830: value on the right ("12.3 MB", "Off").
+    var trailing: String? = nil
+    /// ml830: dimmed, and neither a tap nor A runs the action.
+    var disabled: Bool = false
     let action: () -> Void
 }
 
@@ -1190,6 +1204,8 @@ private struct OptionsSheet: View {
     let game: LauncherGame
     let session: LauncherSession
     var onForceClose: () -> Void = {}
+    /// ml830: set after init (see LauncherView.optionsSheet).
+    var busyGameIDs: Set<String> = []
     let onPlay: (LauncherGame) -> Void
     let onRename: (LauncherGame) -> Void
     let onChangeCover: (LauncherGame) -> Void
@@ -1200,6 +1216,18 @@ private struct OptionsSheet: View {
     @ObservedObject private var pad = GamepadBridge.shared
     @StateObject private var model = SheetRowsModel()
     @State private var showingExecutables: Bool = false
+    /// ml830: this game's shader cache on disk; nil until measured off main.
+    @State private var cacheBytes: Int64? = nil
+    @State private var clearingCache: Bool = false
+    /// ml830: in-sheet Delete confirmation (an alert would leave the pad dead).
+    @State private var confirmingDelete: Bool = false
+    /// The plan the confirm screen showed. delete() refuses to remove files unless
+    /// its fresh plan is exactly this one (the library can change under the sheet).
+    @State private var confirmedPlan: GameLibrary.DeletePlan? = nil
+    @State private var deleting: Bool = false
+    @State private var deleteError: String? = nil
+    @State private var folderBytes: Int64? = nil
+    @State private var folderSizing: Bool = false
 
     init(game: LauncherGame, session: LauncherSession,
          onPlay: @escaping (LauncherGame) -> Void,
@@ -1231,19 +1259,30 @@ private struct OptionsSheet: View {
     private var rows: [OptionRow] {
         let g = current
         if showingExecutables {
-            return g.candidates.map { exe in
-                OptionRow(id: exe.path,
-                          title: relativeName(exe, in: g.folder),
-                          systemImage: "doc.badge.gearshape",
-                          destructive: false,
-                          checked: exe.standardizedFileURL.path == g.exe?.standardizedFileURL.path,
-                          action: {
-                              library.setExecutable(exe, for: g)
-                              showingExecutables = false
-                              model.highlight = 1
-                          })
-            }
+            return executableRows(g)
         }
+        if confirmingDelete {
+            return confirmRows(g)
+        }
+        return mainRows(g)
+    }
+
+    private func executableRows(_ g: LauncherGame) -> [OptionRow] {
+        return g.candidates.map { exe in
+            OptionRow(id: exe.path,
+                      title: relativeName(exe, in: g.folder),
+                      systemImage: "doc.badge.gearshape",
+                      destructive: false,
+                      checked: exe.standardizedFileURL.path == g.exe?.standardizedFileURL.path,
+                      action: {
+                          library.setExecutable(exe, for: g)
+                          showingExecutables = false
+                          model.highlight = 1
+                      })
+        }
+    }
+
+    private func mainRows(_ g: LauncherGame) -> [OptionRow] {
         var out: [OptionRow] = []
         let canPlay = !g.only32Bit && !isEnded
         out.append(OptionRow(id: "play", title: canPlay ? "Play" : (g.only32Bit ? "Play (32-bit, not supported)" : "Play (reopen Madeira first)"),
@@ -1281,6 +1320,7 @@ private struct OptionsSheet: View {
                                      dismiss()
                                  }))
         }
+        out.append(contentsOf: shaderCacheRows(g))
         if case .playing(let t) = session, t == g.title {
             out.append(OptionRow(id: "forceclose", title: "Force close", systemImage: "xmark.octagon",
                                  destructive: true, checked: false,
@@ -1289,18 +1329,209 @@ private struct OptionsSheet: View {
                                      dismiss()
                                  }))
         }
-        out.append(OptionRow(id: "hide", title: g.isManual ? "Remove" : "Hide",
-                             systemImage: g.isManual ? "trash" : "eye.slash",
-                             destructive: true, checked: false,
-                             action: {
-                                 library.hide(g)
-                                 dismiss()
-                             }))
+        out.append(deleteRow(g))
         return out
+    }
+
+    // MARK: Shader cache (ml830)
+
+    /// "Shader cache" (per-game switch + size) and, when there is something
+    /// on disk, "Clear shader cache". Both are disabled while the game runs
+    /// or is still shutting down: its d3d11.dll reads the switch at launch
+    /// and holds the cache files open.
+    private func shaderCacheRows(_ g: LauncherGame) -> [OptionRow] {
+        let busy: Bool = busyGameIDs.contains(g.id)
+        let globalOn: Bool = ShaderCache.enabled
+        let on: Bool = library.isShaderCacheEnabled(for: g.id)
+        let id: String = g.id
+        var trailing: String = "…"
+        if !globalOn {
+            trailing = "Off in Settings"
+        } else if !on {
+            trailing = "Off"
+        } else if let bytes = cacheBytes {
+            trailing = ShaderCache.text(bytes)
+        }
+        var out: [OptionRow] = []
+        out.append(OptionRow(id: "shadercache", title: "Shader cache",
+                             systemImage: "square.stack.3d.down.right",
+                             destructive: false, checked: globalOn && on,
+                             trailing: trailing,
+                             disabled: !globalOn || busy,
+                             action: {
+                                 // No dismiss: the row stays where it is, and so does the highlight.
+                                 GameLibrary.shared.setShaderCacheEnabled(!on, for: id)
+                             }))
+        if let bytes = cacheBytes, bytes > 0 {
+            out.append(OptionRow(id: "clearshadercache",
+                                 title: clearingCache ? "Clearing shader cache…" : "Clear shader cache",
+                                 systemImage: "xmark.bin",
+                                 destructive: true, checked: false,
+                                 disabled: busy || clearingCache,
+                                 action: { clearShaderCache(id: id) }))
+        }
+        return out
+    }
+
+    /// Measure this game's cache on a utility queue (the enumerator blocks).
+    private func loadCacheSize() {
+        let id: String = game.id
+        DispatchQueue.global(qos: .utility).async {
+            let bytes: Int64 = ShaderCache.sizeBytes(forGameID: id)
+            DispatchQueue.main.async {
+                cacheBytes = bytes
+            }
+        }
+    }
+
+    private func clearShaderCache(id: String) {
+        guard !clearingCache, !busyGameIDs.contains(id) else { return }
+        clearingCache = true
+        DispatchQueue.global(qos: .utility).async {
+            ShaderCache.clear(forGameID: id)
+            let bytes: Int64 = ShaderCache.sizeBytes(forGameID: id)
+            DispatchQueue.main.async {
+                // The Clear row is about to disappear: if the pad is on it,
+                // move the highlight up to "Shader cache" (right above it)
+                // instead of letting it land on the next destructive row.
+                let before: [OptionRow] = rows
+                let clearIndex: Int? = before.firstIndex(where: { $0.id == "clearshadercache" })
+                clearingCache = false
+                cacheBytes = bytes
+                if let c = clearIndex, c == model.highlight, bytes <= 0, c > 0 {
+                    model.highlight = c - 1
+                }
+            }
+        }
+    }
+
+    // MARK: Delete (ml830)
+
+    /// Last row of the main list. Opens the in-sheet confirmation.
+    private func deleteRow(_ g: LauncherGame) -> OptionRow {
+        let busy: Bool = busyGameIDs.contains(g.id)
+        var base: String = "Delete game"
+        if case .removeFromLibrary = library.deletePlan(for: g) {
+            base = "Remove from library"
+        }
+        return OptionRow(id: "delete", title: busy ? base + " (close it first)" : base,
+                         systemImage: "trash",
+                         destructive: true, checked: false,
+                         disabled: busy,
+                         action: { enterDeleteConfirm(g) })
+    }
+
+    /// Confirmation sub-mode (like the executable picker): the destructive
+    /// row, then Cancel. The path and the AppData note are in the header.
+    private func confirmRows(_ g: LauncherGame) -> [OptionRow] {
+        let busy: Bool = busyGameIDs.contains(g.id)
+        var out: [OptionRow] = []
+        switch confirmedPlan ?? library.deletePlan(for: g) {
+        case .deleteFolder:
+            var size: String = "…"
+            if let b = folderBytes { size = ShaderCache.text(b) }
+            out.append(OptionRow(id: "confirmdelete",
+                                 title: deleting ? "Deleting…" : "Delete \(g.title)",
+                                 systemImage: "trash",
+                                 destructive: true, checked: false,
+                                 trailing: deleting ? nil : size,
+                                 disabled: deleting || busy,
+                                 action: { performDelete(g) }))
+        case .removeFromLibrary:
+            out.append(OptionRow(id: "confirmremove",
+                                 title: deleting ? "Removing…" : "Remove from library",
+                                 systemImage: "trash",
+                                 destructive: true, checked: false,
+                                 disabled: deleting || busy,
+                                 action: { performDelete(g) }))
+        }
+        out.append(OptionRow(id: "confirmcancel", title: "Cancel", systemImage: "xmark",
+                             destructive: false, checked: false,
+                             disabled: deleting,
+                             action: { leaveSubMode() }))
+        return out
+    }
+
+    private func enterDeleteConfirm(_ g: LauncherGame) {
+        guard !busyGameIDs.contains(g.id), !confirmingDelete else { return }
+        deleteError = nil
+        let plan = library.deletePlan(for: g)
+        confirmedPlan = plan
+        confirmingDelete = true
+        // Start on Cancel: pressing A twice must never delete a game.
+        model.highlight = max(0, confirmRows(g).count - 1)
+        if case .deleteFolder(let url) = plan {
+            loadFolderSize(url)
+        }
+    }
+
+    private func loadFolderSize(_ url: URL) {
+        guard folderBytes == nil, !folderSizing else { return }
+        folderSizing = true
+        DispatchQueue.global(qos: .utility).async {
+            let bytes: Int64 = ShaderCache.sizeBytes(of: url)
+            DispatchQueue.main.async {
+                folderBytes = bytes
+                folderSizing = false
+            }
+        }
+    }
+
+    private func performDelete(_ g: LauncherGame) {
+        guard !deleting, !busyGameIDs.contains(g.id), let plan = confirmedPlan else { return }
+        deleting = true
+        library.delete(g, confirmed: plan) { err in
+            if let err {
+                deleting = false
+                deleteError = err
+                confirmingDelete = false
+                confirmedPlan = nil
+                model.highlight = deleteRowIndex(g)
+            } else {
+                // Stays "Deleting…" while the sheet slides away.
+                dismiss()
+            }
+        }
+    }
+
+    /// Where "Delete game" sits in the main list (it is the last row).
+    private func deleteRowIndex(_ g: LauncherGame) -> Int {
+        let main: [OptionRow] = mainRows(g)
+        return main.firstIndex(where: { $0.id == "delete" }) ?? max(0, main.count - 1)
+    }
+
+    private var inSubMode: Bool { showingExecutables || confirmingDelete }
+
+    /// Back chevron, B, and the confirmation's Cancel.
+    private func leaveSubMode() {
+        if confirmingDelete {
+            guard !deleting else { return }
+            confirmingDelete = false
+            confirmedPlan = nil
+            model.highlight = deleteRowIndex(current)
+        } else if showingExecutables {
+            showingExecutables = false
+            model.highlight = 1
+        }
+    }
+
+    private func rowButton(_ row: OptionRow, focused: Bool) -> some View {
+        let disabled: Bool = row.disabled
+        let action: () -> Void = row.action
+        return Button {
+            if !disabled { action() }
+        } label: {
+            SheetRow(title: row.title, systemImage: row.systemImage,
+                     destructive: row.destructive, checked: row.checked,
+                     focused: focused, subtitle: nil, thumbnail: nil,
+                     trailing: row.trailing, disabled: disabled)
+        }
+        .buttonStyle(SheetRowStyle())
     }
 
     var body: some View {
         let list: [OptionRow] = rows
+        let rowIDs: [String] = list.map { $0.id }
         let highlighted: Int? = pad.controllerName != nil ? model.highlight : nil
         VStack(spacing: 0) {
             header
@@ -1308,13 +1539,8 @@ private struct OptionsSheet: View {
                 ScrollView {
                     VStack(spacing: 8) {
                         ForEach(Array(list.enumerated()), id: \.element.id) { i, row in
-                            Button(action: row.action) {
-                                SheetRow(title: row.title, systemImage: row.systemImage,
-                                         destructive: row.destructive, checked: row.checked,
-                                         focused: highlighted == i, subtitle: nil, thumbnail: nil)
-                            }
-                            .buttonStyle(SheetRowStyle())
-                            .id(row.id)
+                            rowButton(row, focused: highlighted == i)
+                                .id(row.id)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -1330,7 +1556,7 @@ private struct OptionsSheet: View {
             if pad.controllerName != nil {
                 HStack(spacing: 14) {
                     hintChip("a.circle.fill", "Choose")
-                    hintChip("b.circle.fill", showingExecutables ? "Back" : "Close")
+                    hintChip("b.circle.fill", inSubMode ? "Back" : "Close")
                 }
                 .font(.caption)
                 .foregroundStyle(LauncherPalette.textSecondary)
@@ -1343,6 +1569,7 @@ private struct OptionsSheet: View {
         .environment(\.colorScheme, .dark)
         .onAppear {
             configure(list.count)
+            loadCacheSize()
             let m: SheetRowsModel = model
             GamesFocus.shared.overlayOwner = m
             GamesFocus.shared.overlayHandler = { [weak m] (action: GamepadNavAction) in
@@ -1356,12 +1583,31 @@ private struct OptionsSheet: View {
                 GamesFocus.shared.overlayOwner = nil
             }
         }
-        .onChange(of: list.count) { _, n in
-            configure(n)
+        .onChange(of: rowIDs) { old, new in
+            // ml830: rows can appear above the highlight (Clear shader cache
+            // once the size is known): keep the pad on the same row.
+            keepHighlight(old: old, new: new)
+            configure(new.count)
         }
         .onChange(of: showingExecutables) { _, _ in
             configure(rows.count)
         }
+        .onChange(of: confirmingDelete) { _, _ in
+            configure(rows.count)
+        }
+        .onChange(of: busyGameIDs.contains(game.id)) { _, busy in
+            // The captured onSelect must see the new disabled states.
+            configure(rows.count)
+            if !busy { loadCacheSize() }
+        }
+    }
+
+    /// Follow the highlighted row's id across a change of the row list.
+    /// Mode switches use disjoint ids and set the highlight themselves.
+    private func keepHighlight(old: [String], new: [String]) {
+        let h: Int = model.highlight
+        guard h >= 0, h < old.count, let j = new.firstIndex(of: old[h]), j != h else { return }
+        model.highlight = j
     }
 
     private func configure(_ count: Int) {
@@ -1369,26 +1615,43 @@ private struct OptionsSheet: View {
         model.clamp()
         model.onSelect = { i in
             let list: [OptionRow] = rows
-            guard i >= 0, i < list.count else { return }
+            guard i >= 0, i < list.count, !list[i].disabled else { return }
             list[i].action()
         }
         model.onBack = {
-            if showingExecutables {
-                showingExecutables = false
-                model.highlight = 1
+            if inSubMode {
+                leaveSubMode()
             } else {
                 dismiss()
             }
         }
     }
 
+    /// Header lines: title, monospaced subtitle, optional note (the delete
+    /// confirmation's AppData note / reason, or a failed delete's error).
+    private func headerTexts(_ g: LauncherGame) -> (title: String, subtitle: String, note: String?) {
+        if showingExecutables {
+            return ("Executable", g.title, nil)
+        }
+        if confirmingDelete {
+            switch confirmedPlan ?? library.deletePlan(for: g) {
+            case .deleteFolder(let url):
+                return ("Delete game", GameLibrary.windowsPath(url), "Save files in AppData are kept")
+            case .removeFromLibrary(let reason):
+                let path: String = g.exeWindowsPath.isEmpty ? g.dirWindowsPath : g.exeWindowsPath
+                return ("Remove from library", path, reason)
+            }
+        }
+        return (g.title, g.exeWindowsPath, deleteError)
+    }
+
     private var header: some View {
-        let g = current
+        let texts = headerTexts(current)
+        let noteIsError: Bool = !inSubMode && deleteError != nil
         return HStack(alignment: .center, spacing: 12) {
-            if showingExecutables {
+            if inSubMode {
                 Button {
-                    showingExecutables = false
-                    model.highlight = 1
+                    leaveSubMode()
                 } label: {
                     Image(systemName: "chevron.left")
                         .font(.headline)
@@ -1398,15 +1661,21 @@ private struct OptionsSheet: View {
                 .buttonStyle(.plain)
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(showingExecutables ? "Executable" : g.title)
+                Text(texts.title)
                     .font(.headline)
                     .foregroundStyle(.white)
                     .lineLimit(1)
-                Text(showingExecutables ? g.title : g.exeWindowsPath)
+                Text(texts.subtitle)
                     .font(.caption.monospaced())
                     .foregroundStyle(LauncherPalette.textSecondary)
                     .lineLimit(1)
                     .truncationMode(.head)
+                if let note = texts.note {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(noteIsError ? LauncherPalette.danger : LauncherPalette.textSecondary)
+                        .lineLimit(2)
+                }
             }
             Spacer(minLength: 8)
             Button("Done") { dismiss() }
@@ -1646,10 +1915,29 @@ private struct SheetRow: View {
     let focused: Bool
     let subtitle: String?
     let thumbnail: UIImage?
+    /// ml830: value text before the checkmark ("12.3 MB", "Off").
+    var trailing: String? = nil
+    /// ml830: drawn dimmed (the focus ring stays readable).
+    var disabled: Bool = false
 
     private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
     var body: some View {
+        content
+            .opacity(disabled ? 0.45 : 1.0)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(minHeight: 52)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(shape.fill(focused ? LauncherPalette.panelRaised : LauncherPalette.panel))
+            .overlay(shape.stroke(focused ? LauncherPalette.accent : Color.white.opacity(0.06),
+                                  lineWidth: focused ? 2 : 1))
+            .shadow(color: focused ? LauncherPalette.accent.opacity(0.3) : Color.clear, radius: 8)
+            .contentShape(shape)
+            .animation(.easeOut(duration: 0.12), value: focused)
+    }
+
+    private var content: some View {
         HStack(spacing: 12) {
             if let thumbnail {
                 Image(uiImage: thumbnail)
@@ -1681,22 +1969,19 @@ private struct SheetRow: View {
                 }
             }
             Spacer(minLength: 8)
+            if let trailing {
+                Text(trailing)
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(LauncherPalette.textSecondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
             if checked {
                 Image(systemName: "checkmark")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(LauncherPalette.accent)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(minHeight: 52)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(shape.fill(focused ? LauncherPalette.panelRaised : LauncherPalette.panel))
-        .overlay(shape.stroke(focused ? LauncherPalette.accent : Color.white.opacity(0.06),
-                              lineWidth: focused ? 2 : 1))
-        .shadow(color: focused ? LauncherPalette.accent.opacity(0.3) : Color.clear, radius: 8)
-        .contentShape(shape)
-        .animation(.easeOut(duration: 0.12), value: focused)
     }
 }
 

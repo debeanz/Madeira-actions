@@ -22,6 +22,13 @@ import UIKit
 // Cover art: cover/icon/header image files in the game folder win, else the
 // executable's own icon (PEResources). Drop a cover.jpg in the folder with
 // the Files app to customise. Horizontal Steam art is SteamCovers' job.
+//
+// Delete game (ml830): replaces Hide. deletePlan decides whether the game's
+// folder may really be removed from disk (only an exclusive, scanned-shaped
+// folder that no other entry touches and that is not part of Steam);
+// anything else is only taken out of the library. Either way the per-game
+// settings, covers and DXMT shader cache go with it. Each game can also turn
+// its shader cache off (shaderCacheOff).
 // ============================================================================
 
 struct LauncherGame: Identifiable, Equatable {
@@ -59,6 +66,24 @@ final class GameLibrary: ObservableObject {
     @Published private(set) var icons: [String: UIImage] = [:]
     @Published private(set) var scanning = false
     @Published private(set) var lastScan: Date? = nil
+    /// ml830: ids whose own shader cache switch is OFF (default is on).
+    /// Persisted in UserDefaults "madeira.launcher.shaderCacheOff".
+    @Published private(set) var shaderCacheOff: Set<String> = []
+
+    init() {
+        let defaults = UserDefaults.standard
+        // ml830: Hide is gone (Delete replaces it), so everything hidden by an
+        // earlier build comes back once and can be deleted properly.
+        if !defaults.bool(forKey: GameLibrary.hiddenMigratedKey) {
+            let count = defaults.stringArray(forKey: hiddenKey)?.count ?? 0
+            defaults.removeObject(forKey: hiddenKey)
+            defaults.set(true, forKey: GameLibrary.hiddenMigratedKey)
+            if count > 0 {
+                LogStore.shared.log("Games: \(count) hidden game(s) are shown again (Hide was replaced by Delete)")
+            }
+        }
+        shaderCacheOff = Set(defaults.stringArray(forKey: GameLibrary.shaderCacheOffKey) ?? [])
+    }
 
     /// Games with a lastPlayed date, newest first, at most 10.
     var recentlyPlayed: [LauncherGame] {
@@ -94,6 +119,10 @@ final class GameLibrary: ObservableObject {
     private let manualKey = "madeira.launcher.manual"
     private let lastPlayedKey = "madeira.launcher.lastPlayed"
     private let steamAppIDsKey = "madeira.launcher.steamAppIDs"
+    /// ml830: [String] of game ids with the per-game shader cache off.
+    private static let shaderCacheOffKey = "madeira.launcher.shaderCacheOff"
+    /// ml830: set once the old hidden list has been cleared.
+    private static let hiddenMigratedKey = "madeira.launcher.hiddenMigrated830"
 
     private var exeOverrides: [String: String] {
         get { UserDefaults.standard.dictionary(forKey: exeKey) as? [String: String] ?? [:] }
@@ -161,6 +190,9 @@ final class GameLibrary: ObservableObject {
     func setSteamTitle(_ title: String, for game: LauncherGame) {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
+        // ml830: a cover resolution that finishes after Delete must not bring
+        // the game's settings back.
+        guard deletedIDs[game.id] == nil else { return }
         var s = steamTitles
         s[game.id] = t
         steamTitles = s
@@ -208,6 +240,376 @@ final class GameLibrary: ObservableObject {
 
     var hiddenCount: Int { hidden.count }
 
+    // MARK: Shader cache (ml830)
+
+    /// This game's own shader cache switch (ShaderCache.enabled is the global
+    /// one). Reads UserDefaults rather than the @Published set, so it is safe
+    /// to call from a background queue.
+    func isShaderCacheEnabled(for id: String) -> Bool {
+        !(UserDefaults.standard.stringArray(forKey: GameLibrary.shaderCacheOffKey) ?? []).contains(id)
+    }
+
+    /// Main thread.
+    func setShaderCacheEnabled(_ on: Bool, for id: String) {
+        var off = shaderCacheOff
+        if on {
+            guard off.remove(id) != nil else { return }
+        } else {
+            guard off.insert(id).inserted else { return }
+        }
+        UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
+        shaderCacheOff = off
+        LogStore.shared.log("Games: shader cache \(on ? "on" : "off") for \(game(withID: id)?.title ?? id)")
+    }
+
+    // MARK: Delete (ml830)
+
+    enum DeletePlan: Equatable {
+        /// This folder is the game's alone and is removed from disk.
+        case deleteFolder(URL)
+        /// The game only leaves the library; its files stay where they are.
+        case removeFromLibrary(reason: String)
+    }
+
+    /// Ids whose folder is being removed right now (main thread).
+    private var deletingIDs: Set<String> = []
+
+    /// ml830: the game's folder is being removed right now (main thread). The
+    /// tile stays until that finishes, so Play must refuse it meanwhile.
+    func isDeleting(_ id: String) -> Bool { deletingIDs.contains(id) }
+    /// id -> scanSerial at the moment it was deleted or removed. A scan that
+    /// started at or before that serial may still carry the game, so its
+    /// result is filtered (main thread).
+    private var deletedIDs: [String: Int] = [:]
+    /// Bumped whenever a scan starts (main thread).
+    private var scanSerial = 0
+    /// A rescan was asked for while a scan was running (main thread).
+    private var rescanQueued = false
+
+    /// Standardized, symlink-resolved path.
+    private static func resolvedPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// a == b, or one lies inside the other.
+    private static func overlaps(_ a: String, _ b: String) -> Bool {
+        a == b || a.hasPrefix(b + "/") || b.hasPrefix(a + "/")
+    }
+
+    /// Components relative to drive_c that name a location the scan treats as
+    /// one game: a non-skipped top-level folder ("X") or a direct child of a
+    /// container root ("Games/X"), never a skipped Program Files entry.
+    private static func isGameShaped(_ comps: [String]) -> Bool {
+        guard !comps.isEmpty,
+              !comps.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else { return false }
+        let first = comps[0].lowercased()
+        let isContainer = containerRoots.contains { $0.lowercased() == first }
+        if comps.count == 1 {
+            // Never a top-level "Program Files (Arm)" or similar Windows folder the
+            // skip list does not name.
+            return !isContainer && !skipTopLevel.contains(first) && !first.hasPrefix("program files")
+        }
+        guard comps.count == 2, isContainer else { return false }
+        if first.hasPrefix("program files") && skipInProgramFiles.contains(comps[1].lowercased()) {
+            return false
+        }
+        return true
+    }
+
+    /// Why a path (components relative to drive_c) belongs to Steam, or nil.
+    /// Deleting a steamapps game folder would leave Steam's manifest behind.
+    private static func steamReason(_ comps: [String]) -> String? {
+        if comps.contains(where: { $0.lowercased() == "steamapps" }) {
+            return "Part of a Steam library; its files are left alone"
+        }
+        if comps.count >= 2, comps[0].lowercased().hasPrefix("program files"), comps[1].lowercased() == "steam" {
+            return "Part of Steam; its files are left alone"
+        }
+        return nil
+    }
+
+    private static func holdsSteamLibrary(_ path: String) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: path + "/steamapps") || fm.fileExists(atPath: path + "/SteamApps")
+    }
+
+    /// Why `path` (a folder that would be deleted for game `id`) is not that
+    /// game's alone, or nil. No other entry's folder or executable, no hidden
+    /// game's folder and no other manually added exe may lie inside it or
+    /// contain it. drive_c itself and the container roots hold everyone, so an
+    /// entry whose folder is one of those (an exe at C:\ or C:\Games\) does not
+    /// block it. `own`: resolved exe paths that belong to this game.
+    private func sharingReason(_ path: String, root: String, id: String, own: Set<String>) -> String? {
+        var sharedFolders: Set<String> = [root.lowercased()]
+        for container in GameLibrary.containerRoots {
+            sharedFolders.insert((root + "/" + container).lowercased())
+        }
+        for g in games where g.id != id {
+            let f = GameLibrary.resolvedPath(g.folder)
+            let isShared = sharedFolders.contains(f.lowercased())
+            if f == path || f.hasPrefix(path + "/") || (!isShared && path.hasPrefix(f + "/")) {
+                return "Shares its folder with \(g.title)"
+            }
+            if let exe = g.exe, GameLibrary.overlaps(path, GameLibrary.resolvedPath(exe)) {
+                return "Shares its folder with \(g.title)"
+            }
+        }
+        for h in hidden where h != id && !h.hasPrefix("manual:") {
+            if GameLibrary.overlaps(path, root + "/" + h) {
+                return "Shares its folder with a hidden game"
+            }
+        }
+        for raw in manualExes {
+            let p = GameLibrary.resolvedPath(URL(fileURLWithPath: raw))
+            if own.contains(p) { continue }
+            if GameLibrary.overlaps(path, p) {
+                return "Another game added by hand lives in its folder"
+            }
+        }
+        return nil
+    }
+
+    /// Last plan handed out (main thread). The options sheet asks several times
+    /// per redraw and every answer resolves the paths of the whole library, so
+    /// an answer is reused for 2 s while the library looks the same. delete()
+    /// always recomputes.
+    private var planMemo: (fingerprint: String, at: Date, plan: DeletePlan)? = nil
+
+    /// What Delete does for this game (main thread). Only an exclusive,
+    /// scanned-shaped folder strictly inside drive_c is ever removed from disk;
+    /// when in doubt the game only leaves the library.
+    func deletePlan(for game: LauncherGame) -> DeletePlan {
+        var parts: [String] = [game.id, game.folder.path, game.exe?.path ?? "", "\(game.isManual)"]
+        parts += game.candidates.map { $0.path }
+        parts += games.map { g -> String in "\(g.id)|\(g.folder.path)|\(g.exe?.path ?? "")" }
+        parts += manualExes
+        parts += hidden.sorted()
+        let fingerprint = parts.joined(separator: "\n")
+        if let memo = planMemo, memo.fingerprint == fingerprint, Date().timeIntervalSince(memo.at) < 2 {
+            return memo.plan
+        }
+        let plan = computeDeletePlan(for: game)
+        planMemo = (fingerprint: fingerprint, at: Date(), plan: plan)
+        return plan
+    }
+
+    private func computeDeletePlan(for game: LauncherGame) -> DeletePlan {
+        let driveC = GameLibrary.driveC
+        let rootPath = GameLibrary.resolvedPath(driveC)
+        let byHand = "Added by hand; its files are left alone"
+
+        if game.isManual {
+            guard let exe = game.exe else { return .removeFromLibrary(reason: byHand) }
+            let exePath = GameLibrary.resolvedPath(exe)
+            let rel = relative(exe, to: driveC)
+            // Strictly inside drive_c, and no symlink on the way: the resolved
+            // path must be the one the library shows.
+            guard exePath.hasPrefix(rootPath + "/"), exePath == rootPath + "/" + rel else {
+                return .removeFromLibrary(reason: byHand)
+            }
+            var comps = rel.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            if let steam = GameLibrary.steamReason(comps) { return .removeFromLibrary(reason: steam) }
+            comps.removeLast()   // the exe itself
+            guard let first = comps.first else { return .removeFromLibrary(reason: byHand) }
+            let inContainer = GameLibrary.containerRoots.contains { $0.lowercased() == first.lowercased() }
+            let wanted = inContainer ? 2 : 1
+            let folderComps = Array(comps.prefix(wanted))
+            // ml830 review: only when the exe sits directly in that folder. Anything
+            // deeper means the folder above it is one the scan never saw as a game,
+            // and it may hold other games the library does not know about.
+            guard comps.count == wanted, folderComps.count == wanted, GameLibrary.isGameShaped(folderComps) else {
+                return .removeFromLibrary(reason: byHand)
+            }
+            let folderPath = rootPath + "/" + folderComps.joined(separator: "/")
+            if GameLibrary.holdsSteamLibrary(folderPath) {
+                return .removeFromLibrary(reason: "Holds a Steam library; its files are left alone")
+            }
+            if sharingReason(folderPath, root: rootPath, id: game.id, own: [exePath]) != nil {
+                return .removeFromLibrary(reason: byHand)
+            }
+            return .deleteFolder(URL(fileURLWithPath: folderPath, isDirectory: true))
+        }
+
+        let comps = game.id.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        if let steam = GameLibrary.steamReason(comps) { return .removeFromLibrary(reason: steam) }
+        let folderPath = GameLibrary.resolvedPath(game.folder)
+        guard folderPath.hasPrefix(rootPath + "/"), folderPath == rootPath + "/" + game.id else {
+            return .removeFromLibrary(reason: "Its folder is not where the library found it")
+        }
+        guard GameLibrary.isGameShaped(comps) else {
+            return .removeFromLibrary(reason: "A shared folder, not the game's own")
+        }
+        if GameLibrary.holdsSteamLibrary(folderPath) {
+            return .removeFromLibrary(reason: "Holds a Steam library; its files are left alone")
+        }
+        var own = Set(game.candidates.map { GameLibrary.resolvedPath($0) })
+        if let exe = game.exe { own.insert(GameLibrary.resolvedPath(exe)) }
+        if let why = sharingReason(folderPath, root: rootPath, id: game.id, own: own) {
+            return .removeFromLibrary(reason: why)
+        }
+        return .deleteFolder(URL(fileURLWithPath: folderPath, isDirectory: true))
+    }
+
+    /// Delete game. Call on the main thread; completion runs on the main thread
+    /// with nil, or an error message when the folder could not be removed (then
+    /// nothing else is touched). Save data under users\ and the registry stay.
+    func delete(_ game: LauncherGame, confirmed: DeletePlan, completion: @escaping (String?) -> Void) {
+        let current = self.game(withID: game.id) ?? game
+        let id = current.id
+        let title = current.title
+        guard !deletingIDs.contains(id) else {
+            completion("\(title) is already being deleted")
+            return
+        }
+        planMemo = nil
+        let plan = computeDeletePlan(for: current)
+        // ml830 review: never remove files the user did not confirm removing. The
+        // library (or the disk) can change between the confirm screen and the tap.
+        if case .deleteFolder = plan, plan != confirmed {
+            completion("\(title) changed since you confirmed; check again")
+            return
+        }
+        switch plan {
+        case .removeFromLibrary(let reason):
+            removeFromLibrary(current, reason: reason)
+            completion(nil)
+        case .deleteFolder(let folder):
+            deletingIDs.insert(id)
+            let shown = GameLibrary.windowsPath(folder)
+            LogStore.shared.log("Games: deleting \(title) (\(shown))")
+            let started = Date()
+            DispatchQueue.global(qos: .userInitiated).async {
+                var failure: String? = nil
+                do {
+                    try FileManager.default.removeItem(at: folder)
+                } catch {
+                    // Already gone (removed with the Files app meanwhile) counts as deleted.
+                    if FileManager.default.fileExists(atPath: folder.path) {
+                        failure = error.localizedDescription
+                    }
+                }
+                let message = failure
+                let seconds = Date().timeIntervalSince(started)
+                DispatchQueue.main.async {
+                    self.deletingIDs.remove(id)
+                    if let message {
+                        LogStore.shared.log("Games: could not delete \(title) (\(shown)): \(message)", level: .error)
+                        self.requestRescan()   // show what is left of it
+                        completion(message)
+                        return
+                    }
+                    LogStore.shared.log("Games: deleted \(title) (\(shown)) in \(String(format: "%.1f", seconds)) s",
+                                        level: .success)
+                    self.purge(current, deletedFolder: folder)
+                    self.requestRescan()
+                    completion(nil)
+                }
+            }
+        }
+    }
+
+    /// The files stay. Manual entries (and scanned ones whose folder is already
+    /// gone) are forgotten entirely; a scanned folder still on disk goes on the
+    /// hidden list, or the next scan would bring it back.
+    private func removeFromLibrary(_ game: LauncherGame, reason: String) {
+        let id = game.id
+        if game.isManual || !FileManager.default.fileExists(atPath: game.folder.path) {
+            LogStore.shared.log("Games: removed \(game.title) from the library (\(reason))")
+            purge(game, deletedFolder: nil)
+            return
+        }
+        var h = hidden
+        h.insert(id)
+        hidden = h
+        // Manual exes merged into this tile would otherwise come back as tiles
+        // of their own on the next scan, now that their folder is hidden.
+        trimManualExes(own: [], inside: game.folder, matchResolved: false)
+        DispatchQueue.global(qos: .utility).async { ShaderCache.removeAll(forGameID: id) }
+        LogStore.shared.log("Games: removed \(game.title) from the library, files kept (\(reason))")
+        dropFromList(id)
+    }
+
+    /// Forgets everything kept for a game that is gone: per-game settings, its
+    /// manual exe paths (its own, and all inside `deletedFolder`), covers, its
+    /// shader cache in every build folder, and the tile.
+    private func purge(_ game: LauncherGame, deletedFolder: URL?) {
+        let id = game.id
+        // First, while the game and its appid are still known: SteamCovers keeps
+        // the cached header when another game uses the same appid.
+        SteamCovers.shared.forget(id: id)
+
+        var exes = exeOverrides
+        if exes.removeValue(forKey: id) != nil { exeOverrides = exes }
+        var titles = titleOverrides
+        if titles.removeValue(forKey: id) != nil { titleOverrides = titles }
+        var sTitles = steamTitles
+        if sTitles.removeValue(forKey: id) != nil { steamTitles = sTitles }
+        var played = lastPlayedTimes
+        if played.removeValue(forKey: id) != nil { lastPlayedTimes = played }
+        var appIDs = steamAppIDs
+        if appIDs.removeValue(forKey: id) != nil { steamAppIDs = appIDs }
+        var h = hidden
+        if h.remove(id) != nil { hidden = h }
+        var off = shaderCacheOff
+        if off.remove(id) != nil {
+            UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
+            shaderCacheOff = off
+        }
+
+        var ownExes: Set<String> = []
+        if game.isManual {
+            if let exe = game.exe { ownExes.insert(exe.standardizedFileURL.path) }
+            if let rel = GameLibrary.manualRelativePath(id) {
+                ownExes.insert(GameLibrary.driveC.appendingPathComponent(rel).standardizedFileURL.path)
+            }
+        }
+        trimManualExes(own: ownExes, inside: deletedFolder, matchResolved: true)
+
+        DispatchQueue.global(qos: .utility).async { ShaderCache.removeAll(forGameID: id) }
+        dropFromList(id)
+    }
+
+    /// Drops manually added exe paths that are in `own` or lie inside `folder`.
+    /// matchResolved: also compare the symlink-resolved spellings (a deleted,
+    /// exclusive folder whose files may be gone already). Without it only the
+    /// plain path counts, the way scan() merges exes into a folder, so a
+    /// symlinked folder never takes another game's exes with it.
+    private func trimManualExes(own ownExes: Set<String>, inside folder: URL?, matchResolved: Bool) {
+        var folderPaths: [String] = []
+        if let folder {
+            folderPaths.append(folder.standardizedFileURL.path)
+            if matchResolved { folderPaths.append(GameLibrary.resolvedPath(folder)) }
+        }
+        let manual = manualExes
+        let keptManual = manual.filter { raw in
+            let url = URL(fileURLWithPath: raw)
+            var spellings: [String] = [url.standardizedFileURL.path]
+            if matchResolved { spellings.append(GameLibrary.resolvedPath(url)) }
+            if spellings.contains(where: { ownExes.contains($0) }) { return false }
+            for f in folderPaths {
+                if spellings.contains(where: { $0 == f || $0.hasPrefix(f + "/") }) { return false }
+            }
+            return true
+        }
+        if keptManual.count != manual.count { manualExes = keptManual }
+    }
+
+    /// Takes the tile away and keeps an in-flight scan from bringing it back.
+    private func dropFromList(_ id: String) {
+        deletedIDs[id] = scanSerial
+        games.removeAll { $0.id == id }
+        icons.removeValue(forKey: id)
+    }
+
+    /// rescan() drops requests made while a scan runs; this one waits for it.
+    private func requestRescan() {
+        if scanning {
+            rescanQueued = true
+        } else {
+            rescan()
+        }
+    }
+
     // MARK: Manual games
 
     /// Adds an executable picked with the file browser. It must be under
@@ -252,6 +654,8 @@ final class GameLibrary: ObservableObject {
         }
 
         var m = manualExes
+        // ml830: added again after a Delete: it is a live entry once more.
+        deletedIDs.removeValue(forKey: "manual:" + relative(std, to: GameLibrary.driveC))
         let already = m.contains { URL(fileURLWithPath: $0).standardizedFileURL.path == std.path }
         if !already {
             m.append(std.path)
@@ -313,12 +717,24 @@ final class GameLibrary: ObservableObject {
 
     /// Persisted Steam appid for a game (nil clears it).
     func setSteamAppID(_ id: Int?, for game: LauncherGame) {
+        guard deletedIDs[game.id] == nil else { return }   // ml830: see setSteamTitle
         var m = steamAppIDs
         if let id, id > 0 { m[game.id] = id } else { m.removeValue(forKey: game.id) }
         steamAppIDs = m
         if let i = games.firstIndex(where: { $0.id == game.id }) {
             games[i].steamAppID = (id ?? 0) > 0 ? id : nil
         }
+    }
+
+    /// ml830: the persisted appid for an id (also for games not in `games`).
+    func storedSteamAppID(for id: String) -> Int? { steamAppIDs[id] }
+
+    /// ml830: whether any game other than `id` still uses this appid, in the
+    /// library or in the persisted appids (SteamCovers.forget keeps the
+    /// shared header file then).
+    func isSteamAppIDInUse(_ appid: Int, excluding id: String) -> Bool {
+        if games.contains(where: { $0.id != id && $0.steamAppID == appid }) { return true }
+        return steamAppIDs.contains { $0.key != id && $0.value == appid }
     }
 
     // MARK: Scanning
@@ -330,6 +746,8 @@ final class GameLibrary: ObservableObject {
     func rescan() {
         guard !scanning else { return }
         scanning = true
+        scanSerial += 1
+        let serial = scanSerial
         let exeOv = exeOverrides, titleOv = titleOverrides, hid = hidden
         let manual = manualExes, steamIDs = steamAppIDs, played = lastPlayedTimes
         DispatchQueue.global(qos: .userInitiated).async {
@@ -337,13 +755,31 @@ final class GameLibrary: ObservableObject {
                                    manual: manual, steamIDs: steamIDs, played: played)
             DispatchQueue.main.async {
                 if result.manualKept.count != manual.count {
-                    self.manualExes = result.manualKept
+                    // ml830: trim the live list, not the snapshot, so entries
+                    // added or removed during the scan are not undone.
+                    let before = Set(manual)
+                    let kept = Set(result.manualKept)
+                    var seen: Set<String> = []
+                    self.manualExes = self.manualExes.filter { p in
+                        (kept.contains(p) || !before.contains(p)) && seen.insert(p).inserted
+                    }
                 }
-                self.games = result.games
+                // ml830: games deleted or removed after this scan started stay gone.
+                let deleted = self.deletedIDs
+                let list = result.games.filter { g in
+                    guard let at = deleted[g.id] else { return true }
+                    return serial > at
+                }
+                self.deletedIDs = deleted.filter { $0.value >= serial }
+                self.games = list
                 self.scanning = false
                 self.lastScan = Date()
-                LogStore.shared.log("Games: \(result.games.count) game(s) on C:")
-                for g in result.games { self.loadIcon(for: g) }
+                LogStore.shared.log("Games: \(list.count) game(s) on C:")
+                for g in list { self.loadIcon(for: g) }
+                if self.rescanQueued {
+                    self.rescanQueued = false
+                    self.rescan()
+                }
             }
         }
     }
@@ -550,6 +986,8 @@ final class GameLibrary: ObservableObject {
             }
             if image == nil, let exe { image = PEResources.icon(of: exe) }
             DispatchQueue.main.async {
+                // ml830: the game may have been deleted while its icon loaded.
+                guard image == nil || self.games.contains(where: { $0.id == id }) else { return }
                 if let image { self.icons[id] = image } else { self.icons.removeValue(forKey: id) }
             }
         }

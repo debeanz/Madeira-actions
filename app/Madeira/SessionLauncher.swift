@@ -11,8 +11,15 @@ import Foundation
 // is the other end of that file protocol:
 //
 //   C:\madeira\agent.ready     written by the agent once services.exe is up
-//   C:\madeira\launch.txt      id= / exe= / dir= / args= lines, written here
+//   C:\madeira\launch.txt      id= / exe= / dir= / args= lines, written here,
+//                              plus an optional shadercache= line (ml830)
 //   C:\madeira\launch.result   id= then "ok pid=N" or "err code=N"
+//
+// ml830: "shadercache=off" or "shadercache=<absolute unix dir>" gives this one
+// launch its own DXMT shader cache (or none). The agent sets/removes
+// DXMT_SHADER_CACHE and DXMT_SHADER_CACHE_PATH around that CreateProcessW
+// only and then restores its own values; without the line the game inherits
+// the session's environment as before. An empty value counts as absent.
 //
 // The request is written to a temp name and renamed into place so the agent
 // never reads a half-written file.
@@ -99,7 +106,11 @@ final class SessionLauncher {
         }
     }
 
-    func launch(exe: String, dir: String, args: String = "", readyTimeout: TimeInterval = 120,
+    /// `shaderCache`: nil sends nothing (the game inherits the session's DXMT
+    /// cache variables); otherwise "off" or an absolute cache directory, sent
+    /// as the ml830 shadercache= line.
+    func launch(exe: String, dir: String, args: String = "", shaderCache: String? = nil,
+                readyTimeout: TimeInterval = 120,
                 completion: @escaping (Outcome) -> Void) {
         queue.async {
             let fm = FileManager.default
@@ -118,7 +129,14 @@ final class SessionLauncher {
             // 2. Write the request atomically.
             let id = UUID().uuidString
             try? fm.removeItem(at: self.resultURL)
-            let text = "id=\(id)\r\nexe=\(exe)\r\ndir=\(dir)\r\nargs=\(args)\r\n"
+            var text = "id=\(id)\r\nexe=\(exe)\r\ndir=\(dir)\r\nargs=\(args)\r\n"
+            if let shaderCache = shaderCache {
+                // ml830: one line per field; a CR/LF inside the value would end it early.
+                let value = shaderCache
+                    .replacingOccurrences(of: "\r", with: "")
+                    .replacingOccurrences(of: "\n", with: "")
+                text += "shadercache=\(value)\r\n"
+            }
             let tmp = self.agentDir.appendingPathComponent("launch.tmp")
             do {
                 try text.write(to: tmp, atomically: false, encoding: .utf8)
