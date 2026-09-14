@@ -41,15 +41,16 @@ let perfOverlayEnabledKey = "madeira.perfOverlayEnabled"
 ///     memory | thermal | present count | FPS | pacing pill.
 ///   - Compact variant (landscape pillarbox bar, ~120pt): the same
 ///     readouts stacked vertically, no present counter.
-///   - Tap the readout to collapse it to a dot; tap the dot to restore.
+///   - ml832: tapping the readout does nothing (it used to collapse it to a
+///     dot, which read as the overlay switching off). Only the pacing pill
+///     reacts to a tap: it cycles the frame cap.
 ///   - Settings → Performance overlay (or the gauge button in full screen)
-///     hides it entirely. Warnings keep flowing to the log and banner.
+///     is the only way to hide it. Warnings keep flowing to the log and banner.
 struct FPSOverlay: View {
     /// Compact = landscape side-bar variant.
     var compact: Bool = false
     @ObservedObject private var perf = PerfMonitor.shared
     @AppStorage(perfOverlayEnabledKey) private var enabled = true
-    @State private var collapsed: Bool = false
     /// DXMT's g_madeira_vsync_mode, read fresh on every redraw (the perf
     /// monitor publishes 4×/s) so a Settings change shows here without a
     /// local copy going stale.
@@ -59,12 +60,6 @@ struct FPSOverlay: View {
         Group {
             if !enabled {
                 EmptyView()
-            } else if collapsed {
-                Circle()
-                    .fill(Color(red: 0.12, green: 0.15, blue: 0.20).opacity(0.92))
-                    .frame(width: 12, height: 12)
-                    .contentShape(Circle().scale(2.5))
-                    .onTapGesture { collapsed = false }
             } else if compact {
                 VStack(spacing: 4) {
                     Text(String(format: "%.1f", perf.fps))
@@ -78,7 +73,6 @@ struct FPSOverlay: View {
                 .padding(6)
                 .background(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.92))
                 .cornerRadius(6)
-                .onTapGesture { collapsed = true }
             } else {
                 // ml798: "FPS: 42.7  MEM: 1088MB" — coloured labels, white
                 // values, one dark rounded panel. Present count dropped.
@@ -102,7 +96,6 @@ struct FPSOverlay: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .stroke(Color.white.opacity(0.12), lineWidth: 1))
-                .onTapGesture { collapsed = true }
             }
         }
         .onAppear {

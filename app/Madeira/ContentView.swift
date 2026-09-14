@@ -5240,6 +5240,96 @@ enum ControlsGeometry {
         return best
     }
 
+    // MARK: ml832 stick capture
+    //
+    // A thumb that slides off a stick and comes back down (contact lost on a
+    // fast slide or a flick, a re-grip, the thumb rolling flat) starts a NEW
+    // UITouch. A held stick tracks its finger anywhere, but a new touch was
+    // claimed only within rim + stickSlop of the fixed centre, and the knob
+    // stops at 0.6 r — so a thumb that had drifted out re-landed on the game as
+    // cursor / camera motion (a click, a long-press drag) and the stick let go.
+    // Same in Keyboard & mouse and Xbox mode.
+
+    /// A stick's capture zone reaches max(captureFactor·r, r + captureBand) from
+    /// its centre.
+    static let captureFactor: CGFloat = 2.2
+    static let captureBand: CGFloat = 70
+    /// The cross is tapped discretely in menus: a far miss must not step a selection.
+    static let dpadCaptureBand: CGFloat = 40
+    /// A new touch this close to where a stick's finger IS, or where it let go
+    /// less than `stickyWindow` ago, is that thumb coming back.
+    static let anchorReach: CGFloat = 64
+    static let stickyWindow: CFTimeInterval = 0.5
+    /// A stick further than this fraction of the width from the centre line
+    /// never captures on the other half: that half keeps the camera / cursor.
+    static let midlineBand: CGFloat = 0.08
+    /// A contact that landed in a HELD stick's zone takes the stick over when
+    /// the holding finger lifts, if it landed at most this long before the lift
+    /// and sits within anchorReach of the lift point (one contact split in two).
+    static let handoffWindow: CFTimeInterval = 0.35
+    /// A near-miss of a button inside a stick's zone is not that stick at full deflection.
+    static let buttonGuard: CGFloat = 25
+
+    struct StickAnchor {
+        let id: UUID
+        let point: CGPoint
+    }
+
+    enum Route {
+        /// On this free control's own rim + slop.
+        case control(TouchControl)
+        /// On a rim, but every control in reach is held (not a stick): claimed, ignored.
+        case busy
+        /// In a stick's capture zone or near its anchor. The stick may be held.
+        case capture(TouchControl)
+    }
+
+    static func captureRadius(_ c: TouchControl) -> CGFloat {
+        let r = diameter(c) / 2
+        if c.action.padInput == .dpad { return r + dpadCaptureBand }
+        return max(captureFactor * r, r + captureBand)
+    }
+
+    /// THE routing for a new touch. ControlsWindow.hitTest (via
+    /// ControlsInputView.claims, with no busy set) and ControlsInputView.touchesBegan
+    /// both call this, so what is claimed is exactly what is handled: the result
+    /// is non-nil for the same points whatever `busy` is.
+    static func route(_ p: CGPoint, in size: CGSize, among controls: [TouchControl],
+                      anchors: [StickAnchor], excluding busy: Set<UUID> = []) -> Route? {
+        guard size.width >= 1, size.height >= 1 else { return nil }
+        // 1. A control's own circle always wins: buttons beside a stick keep theirs.
+        if let c = control(at: p, in: size, among: controls, excluding: busy) { return .control(c) }
+        // 2. On a held control's circle: a held stick is its own capture, a held
+        //    button swallows (a second finger on a held A is never an RS flick).
+        if !busy.isEmpty, let held = control(at: p, in: size, among: controls) {
+            return held.action.isStick ? Route.capture(held) : Route.busy
+        }
+        // 3. Stick capture, lowest normalised distance wins.
+        let mid = size.width / 2
+        let nearButton = controls.contains { b in
+            guard !b.action.isStick else { return false }
+            let o = center(b, in: size)
+            return hypot(p.x - o.x, p.y - o.y) <= diameter(b) / 2 + buttonGuard
+        }
+        var best: TouchControl?
+        var bestScore = CGFloat.greatestFiniteMagnitude
+        for c in controls where c.action.isStick {
+            let o = center(c, in: size)
+            if abs(o.x - mid) > size.width * midlineBand, (p.x < mid) != (o.x < mid) { continue }
+            var score = nearButton ? CGFloat.greatestFiniteMagnitude
+                                   : hypot(p.x - o.x, p.y - o.y) / max(captureRadius(c), 1)
+            for a in anchors where a.id == c.id {
+                score = min(score, hypot(p.x - a.point.x, p.y - a.point.y) / anchorReach)
+            }
+            if score <= 1, score < bestScore {
+                bestScore = score
+                best = c
+            }
+        }
+        guard let hit = best else { return nil }
+        return .capture(hit)
+    }
+
     /// 8-way with radial and angular hysteresis. -1 = centre, 0 = up, clockwise
     /// (screen y grows downward).
     static func stickDirection(dx: CGFloat, dy: CGFloat, radius r: CGFloat, current: Int) -> Int {
@@ -5343,7 +5433,8 @@ final class ControlsWindow: UIWindow {
         // The input view is a sibling BELOW the hosting view. UIKit delivers a
         // touch to exactly the view this returns, and SwiftUI's recognizers
         // live on the hosting view, not on an ancestor of the input view, so
-        // they never see these touches.
+        // they never see these touches. ml832: claims includes each stick's
+        // capture zone, so a thumb re-landing off its stick is not cursor motion.
         return input.claims(convert(point, to: input)) ? input : nil
     }
 }
@@ -5543,6 +5634,25 @@ final class ControlsInputView: UIView {
 
     private var visuals: [UUID: Visual] = [:]
     private var grabs: [ObjectIdentifier: Grab] = [:]
+    /// ml832: where each stick's finger last really let go (lift, cancel, the
+    /// safety net), for the sticky re-grab (ControlsGeometry.route anchors).
+    /// releaseAll clears it: a resize, the editor or the loading panel must
+    /// never arm one.
+    private struct Lift {
+        let point: CGPoint
+        let at: CFTimeInterval
+    }
+    private var recentLifts: [UUID: Lift] = [:]
+    /// ml832: contacts that landed in a HELD stick's zone. Claimed (never the
+    /// game) and ignored, unless the holding finger lifts right after — then the
+    /// nearest takes the stick over (fingerGone).
+    private struct Standby {
+        let touch: UITouch                           // retained, as Grab
+        let id: UUID
+        let at: CFTimeInterval
+    }
+    private var standby: [ObjectIdentifier: Standby] = [:]
+    private var captureLogs = 0
     /// Press ledger: one down and one up edge per key however many controls
     /// hold it (a stick's W plus a W button), so Wine never sees a key released
     /// while another control still holds it.
@@ -5624,12 +5734,26 @@ final class ControlsInputView: UIView {
     }
 
     /// Called by ControlsWindow.hitTest for every new touch, with the same
-    /// geometry the controls are drawn and driven with.
+    /// geometry the controls are drawn and driven with. ml832: the same
+    /// ControlsGeometry.route touchesBegan uses, stick capture zones included.
     func claims(_ p: CGPoint) -> Bool {
         let m = TouchControlsModel.shared
         guard m.playing, window != nil else { return false }
         if syncPending || isHidden { syncFromModel() }
-        return ControlsGeometry.control(at: p, in: bounds.size, among: m.controls) != nil
+        return ControlsGeometry.route(p, in: bounds.size, among: m.controls,
+                                      anchors: stickAnchors(now: CACurrentMediaTime())) != nil
+    }
+
+    /// ml832: each held stick's finger where it is now, and each stick's recent lift.
+    private func stickAnchors(now: CFTimeInterval) -> [ControlsGeometry.StickAnchor] {
+        var out: [ControlsGeometry.StickAnchor] = []
+        for g in grabs.values where g.action.isStick {
+            out.append(ControlsGeometry.StickAnchor(id: g.id, point: g.touch.location(in: self)))
+        }
+        for (id, l) in recentLifts where now - l.at <= ControlsGeometry.stickyWindow {
+            out.append(ControlsGeometry.StickAnchor(id: id, point: l.point))
+        }
+        return out
     }
 
     /// Recognizers on our ANCESTORS (root view, window) still see these touches,
@@ -5713,31 +5837,118 @@ final class ControlsInputView: UIView {
         guard m.playing else { return }
         if syncPending || isHidden { syncFromModel() }
         // Safety net: a hold whose lift never arrived must not keep its
-        // control (and its keys) forever.
+        // control (and its keys) forever. ml832: it IS a lift, so it arms the
+        // sticky re-grab — the same-event re-grip (old contact ended, new one
+        // began, one UIEvent) lands here before the new touch is routed.
         for (key, g) in Array(grabs) where g.touch.phase == .ended || g.touch.phase == .cancelled {
-            release(key, animated: false)
+            fingerGone(key, animated: false)
         }
+        for (key, s) in Array(standby) where s.touch.phase == .ended || s.touch.phase == .cancelled {
+            standby[key] = nil
+        }
+        let now = CACurrentMediaTime()
+        recentLifts = recentLifts.filter { now - $0.value.at <= ControlsGeometry.stickyWindow }
         let size = bounds.size
         for t in touches {
             let busy = Set(grabs.values.map { $0.id })
+            let p = t.location(in: self)
+            let key = ObjectIdentifier(t)
             // A second finger on an already-held control goes to another
             // control in reach, or nowhere — it was claimed, so it never
             // falls through to the game either.
-            guard let c = ControlsGeometry.control(at: t.location(in: self), in: size,
-                                                   among: m.controls, excluding: busy) else { continue }
-            let key = ObjectIdentifier(t)
-            grabs[key] = Grab(touch: t, id: c.id, action: c.action, dir: -1,
-                              downAt: CACurrentMediaTime())
-            let v = visuals[c.id]
-            if c.action.isStick {
-                v?.knob.removeAllAnimations()          // cut a release glide still in flight
-                quietly { v?.setHeld(true) }
-                driveStick(key)                        // ml824: no haptic for the stick
-            } else {
-                quietly { v?.setHeld(true) }
-                press(c.action, down: true)
+            guard let route = ControlsGeometry.route(p, in: size, among: m.controls,
+                                                     anchors: stickAnchors(now: now),
+                                                     excluding: busy) else { continue }
+            switch route {
+            case .busy:
+                continue
+            case .control(let c):
+                beginGrab(key, touch: t, control: c)
+            case .capture(let c):
+                if busy.contains(c.id) {
+                    // ml832: in a HELD stick's zone (the thumb's base, a second
+                    // contact, one contact split in two): claimed and ignored.
+                    standby[key] = Standby(touch: t, id: c.id, at: now)
+                    logCapture("extra touch claimed for held stick", c, at: p)
+                } else {
+                    logCapture("captured touch for stick", c, at: p)
+                    beginGrab(key, touch: t, control: c)
+                }
             }
         }
+    }
+
+    private func beginGrab(_ key: ObjectIdentifier, touch t: UITouch, control c: TouchControl) {
+        grabs[key] = Grab(touch: t, id: c.id, action: c.action, dir: -1,
+                          downAt: CACurrentMediaTime())
+        let v = visuals[c.id]
+        if c.action.isStick {
+            recentLifts[c.id] = nil
+            v?.knob.removeAllAnimations()              // cut a release glide still in flight
+            quietly { v?.setHeld(true) }
+            driveStick(key)                            // ml824: no haptic for the stick
+        } else {
+            quietly { v?.setHeld(true) }
+            press(c.action, down: true)
+        }
+    }
+
+    /// ml832: first 20 only, so a device log proves the capture without a flood.
+    private func logCapture(_ what: String, _ c: TouchControl, at p: CGPoint) {
+        guard captureLogs < 20 else { return }
+        captureLogs += 1
+        let o = ControlsGeometry.center(c, in: bounds.size)
+        let dist = Int(hypot(p.x - o.x, p.y - o.y))
+        let r = Int(ControlsGeometry.diameter(c) / 2)
+        let zone = Int(ControlsGeometry.captureRadius(c))
+        fputs("[controls] ml832 \(what) \(c.action.label) at dist=\(dist) r=\(r) zone=\(zone)\n", stderr)
+    }
+
+    /// ml832: a finger really went away (lift, cancel, the safety net) — never
+    /// releaseAll. A stick's finger either hands the stick to a contact that
+    /// re-landed in its zone just before (one contact split in two: without
+    /// this the stick died while the thumb kept pushing), or lets go and arms
+    /// the sticky re-grab at the point it lifted.
+    private func fingerGone(_ key: ObjectIdentifier, animated: Bool) {
+        standby[key] = nil
+        guard let g = grabs[key] else { return }
+        guard g.action.isStick else {
+            release(key, animated: animated)
+            return
+        }
+        let lift = g.touch.location(in: self)
+        let now = CACurrentMediaTime()
+        var heirKey: ObjectIdentifier?
+        var heirTouch: UITouch?
+        var heirDist = ControlsGeometry.anchorReach
+        for (k, s) in standby where s.id == g.id {
+            guard now - s.at <= ControlsGeometry.handoffWindow,
+                  s.touch.phase != .ended, s.touch.phase != .cancelled else { continue }
+            let q = s.touch.location(in: self)
+            let d = hypot(q.x - lift.x, q.y - lift.y)
+            if d <= heirDist {
+                heirDist = d
+                heirKey = k
+                heirTouch = s.touch
+            }
+        }
+        if let hk = heirKey, let ht = heirTouch {
+            // Transfer, not release + grab: no key up/down edges, no knob glide,
+            // the direction's hysteresis carries on.
+            standby[hk] = nil
+            grabs[key] = nil
+            grabs[hk] = Grab(touch: ht, id: g.id, action: g.action, dir: g.dir, downAt: g.downAt)
+            if leftStickOwner == key { leftStickOwner = hk }
+            if rightStickOwner == key { rightStickOwner = hk }
+            driveStick(hk)
+            if captureLogs < 20 {
+                captureLogs += 1
+                fputs("[controls] ml832 stick \(g.action.label) handed to re-landed contact d=\(Int(heirDist))\n", stderr)
+            }
+            return
+        }
+        recentLifts[g.id] = Lift(point: lift, at: now)
+        release(key, animated: animated)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -5748,13 +5959,13 @@ final class ControlsInputView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches { release(ObjectIdentifier(t), animated: true) }
+        for t in touches { fingerGone(ObjectIdentifier(t), animated: true) }
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         var held = 0
         for t in touches where grabs[ObjectIdentifier(t)] != nil { held += 1 }
-        for t in touches { release(ObjectIdentifier(t), animated: false) }
+        for t in touches { fingerGone(ObjectIdentifier(t), animated: false) }
         if held > 0 { fputs("[controls] ml826 touches cancelled held=\(held)\n", stderr) }
     }
 
@@ -5967,6 +6178,9 @@ final class ControlsInputView: UIView {
         releaseEpoch += 1          // drop deferred button ups; the flush below posts them
         let held = grabs.count
         for key in Array(grabs.keys) { release(key, animated: animated) }
+        // ml832: not a lift — no sticky re-grab, no hand-off after this.
+        recentLifts.removeAll()
+        standby.removeAll()
         // Safety net; posts nothing while the ledger is balanced.
         for vk in Array(keyRefs.keys) { winios_post_key(vk, 0) }
         keyRefs.removeAll()
@@ -6106,8 +6320,8 @@ struct TouchControlsOverlay: View {
             }
             // ml827: nothing of this (toolbar, perf HUD, editor) over the
             // loading or "Closing game…" panel; it appears with the game. Hidden,
-            // not removed: a false "Closing game…" mid-game must not reset the
-            // perf HUD's collapsed state. ControlsWindow.hitTest refuses touches.
+            // not removed: a false "Closing game…" mid-game must not rebuild the
+            // perf HUD (and restart its monitor). ControlsWindow.hitTest refuses touches.
             .opacity(m.launchPanelUp ? 0 : 1)
             .allowsHitTesting(!m.launchPanelUp)
             .frame(width: geo.size.width, height: geo.size.height,
