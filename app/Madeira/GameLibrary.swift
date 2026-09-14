@@ -29,6 +29,10 @@ import UIKit
 // anything else is only taken out of the library. Either way the per-game
 // settings, covers and DXMT shader cache go with it. Each game can also turn
 // its shader cache off (shaderCacheOff).
+//
+// Resolution (ml837): Unity games start at the Settings resolution until they
+// have saved one of their own; resolutionReset asks for it once more
+// (GameResolutionDefault at the end of this file).
 // ============================================================================
 
 struct LauncherGame: Identifiable, Equatable {
@@ -69,6 +73,9 @@ final class GameLibrary: ObservableObject {
     /// ml830: ids whose own shader cache switch is OFF (default is on).
     /// Persisted in UserDefaults "madeira.launcher.shaderCacheOff".
     @Published private(set) var shaderCacheOff: Set<String> = []
+    /// ml837: ids whose next launch passes the Madeira resolution to Unity again
+    /// (one time). Persisted in UserDefaults "madeira.launcher.resetResolution".
+    @Published private(set) var resolutionReset: Set<String> = []
 
     init() {
         let defaults = UserDefaults.standard
@@ -83,6 +90,7 @@ final class GameLibrary: ObservableObject {
             }
         }
         shaderCacheOff = Set(defaults.stringArray(forKey: GameLibrary.shaderCacheOffKey) ?? [])
+        resolutionReset = Set(defaults.stringArray(forKey: GameLibrary.resolutionResetKey) ?? [])
     }
 
     /// Games with a lastPlayed date, newest first, at most 10.
@@ -121,6 +129,8 @@ final class GameLibrary: ObservableObject {
     private let steamAppIDsKey = "madeira.launcher.steamAppIDs"
     /// ml830: [String] of game ids with the per-game shader cache off.
     private static let shaderCacheOffKey = "madeira.launcher.shaderCacheOff"
+    /// ml837: [String] of game ids that start at the Madeira resolution next launch.
+    private static let resolutionResetKey = "madeira.launcher.resetResolution"
     /// ml830: set once the old hidden list has been cleared.
     private static let hiddenMigratedKey = "madeira.launcher.hiddenMigrated830"
 
@@ -260,6 +270,48 @@ final class GameLibrary: ObservableObject {
         UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
         shaderCacheOff = off
         LogStore.shared.log("Games: shader cache \(on ? "on" : "off") for \(game(withID: id)?.title ?? id)")
+    }
+
+    // MARK: Resolution reset (ml837)
+
+    /// ml837: ids started in THIS app process. Not persisted: the wineserver
+    /// saves the registry to user.reg only every ~30 s (and on shutdown), so
+    /// once a game has run in this runtime its Unity Screen_* values may live
+    /// only in memory. Any thread.
+    private var startedThisRunIDs: Set<String> = []
+    private let startedThisRunLock = NSLock()
+
+    func noteStartedThisRun(_ id: String) {
+        startedThisRunLock.lock(); startedThisRunIDs.insert(id); startedThisRunLock.unlock()
+    }
+
+    func startedThisRun(_ id: String) -> Bool {
+        startedThisRunLock.lock(); defer { startedThisRunLock.unlock() }
+        return startedThisRunIDs.contains(id)
+    }
+
+    /// The game's next launch passes the Madeira resolution to Unity even though
+    /// the game saved one of its own. Reads UserDefaults, so it is safe to call
+    /// from a background queue.
+    func wantsResolutionReset(_ id: String) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: GameLibrary.resolutionResetKey) ?? []).contains(id)
+    }
+
+    /// Main thread.
+    func requestResolutionReset(for id: String) {
+        var s = resolutionReset
+        guard s.insert(id).inserted else { return }
+        UserDefaults.standard.set(s.sorted(), forKey: GameLibrary.resolutionResetKey)
+        resolutionReset = s
+        LogStore.shared.log("Games: \(game(withID: id)?.title ?? id) starts at the Madeira resolution next launch")
+    }
+
+    /// Main thread.
+    func clearResolutionReset(for id: String) {
+        var s = resolutionReset
+        guard s.remove(id) != nil else { return }
+        UserDefaults.standard.set(s.sorted(), forKey: GameLibrary.resolutionResetKey)
+        resolutionReset = s
     }
 
     // MARK: Delete (ml830)
@@ -555,6 +607,7 @@ final class GameLibrary: ObservableObject {
             UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
             shaderCacheOff = off
         }
+        clearResolutionReset(for: id)   // ml837
 
         var ownExes: Set<String> = []
         if game.isManual {
@@ -991,5 +1044,169 @@ final class GameLibrary: ObservableObject {
                 if let image { self.icons[id] = image } else { self.icons.removeValue(forKey: id) }
             }
         }
+    }
+}
+
+// ============================================================================
+// First-launch resolution for Unity games (ml837).
+//
+// A Unity player with no saved PlayerPrefs starts at the game's PlayerSettings
+// default (SIGNALIS: 640x480), not at the screen size Madeira reports. After
+// the first run it saves Screen_Width_h* / Screen_Height_h* under
+// HKCU\Software\<company>\<product> and reuses them. So until that key holds a
+// saved width (or when the user asked for it once from the game's ⋯ menu),
+// the launch passes the Settings resolution on the command line:
+//   -screen-width W -screen-height H -screen-fullscreen 1 -window-mode borderless
+// Players older than 2019.3 ignore -window-mode. madeira-agent appends the
+// string after the quoted exe, so each option is its own argv word.
+// ============================================================================
+
+enum GameResolutionDefault {
+    /// Same key and default as ContentView's desktopResolution (Settings > Screen).
+    static let settingKey = "madeira.desktopResolution"
+    static let settingDefault = "960x540"
+
+    /// "WxH" -> size, with ContentView.desktopSize's fallback.
+    static func size(fromSetting setting: String) -> (w: Int, h: Int) {
+        let parts = setting.split(separator: "x").compactMap { Int($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (960, 540) }
+        return (parts[0], parts[1])
+    }
+
+    /// "1280x720" -> "1280×720".
+    static func displayText(fromSetting setting: String) -> String {
+        let s = size(fromSetting: setting)
+        return "\(s.w)×\(s.h)"
+    }
+
+    static func arguments(width: Int, height: Int) -> String {
+        "-screen-width \(width) -screen-height \(height) -screen-fullscreen 1 -window-mode borderless"
+    }
+
+    /// "<exe base>_Data" next to the exe.
+    static func dataFolder(of exe: URL) -> URL {
+        exe.deletingLastPathComponent()
+            .appendingPathComponent(exe.deletingPathExtension().lastPathComponent + "_Data", isDirectory: true)
+    }
+
+    /// UnityPlayer.dll beside the exe, or its _Data folder. Blocking (filesystem).
+    static func isUnity(exe: URL) -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: exe.deletingLastPathComponent().appendingPathComponent("UnityPlayer.dll").path) {
+            return true
+        }
+        var isDir: ObjCBool = false
+        return fm.fileExists(atPath: dataFolder(of: exe).path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    /// Company and product from "<exe base>_Data/app.info" (first two lines), or nil.
+    static func unityNames(exe: URL) -> (company: String, product: String)? {
+        guard let data = try? Data(contentsOf: dataFolder(of: exe).appendingPathComponent("app.info")) else {
+            return nil
+        }
+        var text = String(decoding: data, as: UTF8.self)
+        if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard lines.count >= 2, !lines[0].isEmpty, !lines[1].isEmpty else { return nil }
+        return (company: lines[0], product: lines[1])
+    }
+
+    /// Whether HKCU\Software\<company>\<product> in the prefix's user.reg holds a
+    /// saved screen width. Blocking: user.reg can be several MB, scanned once,
+    /// line by line, tracking the current section.
+    static func hasSavedResolution(company: String, product: String) -> Bool {
+        let url = GameLibrary.driveC.deletingLastPathComponent().appendingPathComponent("user.reg")
+        guard let data = try? Data(contentsOf: url) else { return false }
+        let target = ("Software\\" + company + "\\" + product).lowercased()
+        let bytes = [UInt8](data)
+        let n = bytes.count
+        var i = 0
+        var inTarget = false
+        while i < n {
+            var j = i
+            while j < n && bytes[j] != 0x0A { j += 1 }
+            var end = j
+            if end > i && bytes[end - 1] == 0x0D { end -= 1 }
+            if end > i {
+                if bytes[i] == 0x5B {          // "[Software\\Company\\Product] 1712345678"
+                    let raw = String(decoding: bytes[(i + 1)..<end], as: UTF8.self)
+                    inTarget = sectionPath(raw).lowercased() == target
+                } else if inTarget && bytes[i] == 0x22 {   // "\"Screen_Width_h182942802\"=dword:..."
+                    let name = String(decoding: bytes[i..<min(end, i + 48)], as: UTF8.self).lowercased()
+                    // Unity 2019.1+ writes Screen_Width_h*; older players
+                    // "Screen Manager Resolution Width_h*".
+                    if name.hasPrefix("\"screen_width") || name.hasPrefix("\"screen manager resolution width") {
+                        return true
+                    }
+                }
+            }
+            i = j + 1
+        }
+        return false
+    }
+
+    /// A user.reg section path up to its closing "]", unescaped: "\\" -> "\",
+    /// "\]" -> "]", "\x4e2d" -> that character.
+    static func sectionPath(_ raw: String) -> String {
+        let scalars = Array(raw.unicodeScalars)
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < scalars.count {
+            let c = scalars[i]
+            if c == "]" { break }
+            if c == "\\" && i + 1 < scalars.count {
+                let next = scalars[i + 1]
+                if next == "x" {
+                    var j = i + 2
+                    var value: UInt32 = 0
+                    var digits = 0
+                    while j < scalars.count, digits < 4, let d = hexValue(scalars[j]) {
+                        value = value * 16 + d
+                        j += 1
+                        digits += 1
+                    }
+                    if digits > 0, let s = Unicode.Scalar(value) {
+                        out.append(s)
+                        i = j
+                        continue
+                    }
+                }
+                out.append(next)
+                i += 2
+                continue
+            }
+            out.append(c)
+            i += 1
+        }
+        return String(out)
+    }
+
+    private static func hexValue(_ s: Unicode.Scalar) -> UInt32? {
+        switch s.value {
+        case 48...57: return s.value - 48      // 0-9
+        case 65...70: return s.value - 55      // A-F
+        case 97...102: return s.value - 87     // a-f
+        default: return nil
+        }
+    }
+
+    /// The launch arguments for this game, or "". Blocking (reads app.info and
+    /// user.reg): call off the main thread.
+    static func launchArgs(for game: LauncherGame, width: Int, height: Int) -> String {
+        guard let exe = game.exe, isUnity(exe: exe) else { return "" }
+        if !GameLibrary.shared.wantsResolutionReset(game.id) {
+            // Already ran in this runtime: its saved size may not be on disk yet.
+            if GameLibrary.shared.startedThisRun(game.id) { return "" }
+            let saved: Bool
+            if let names = unityNames(exe: exe) {
+                saved = hasSavedResolution(company: names.company, product: names.product)
+            } else {
+                // Unknown key: only a game that never ran is surely unsaved.
+                saved = game.lastPlayed != nil
+            }
+            if saved { return "" }
+        }
+        return arguments(width: width, height: height)
     }
 }

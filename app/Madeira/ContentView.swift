@@ -1747,17 +1747,24 @@ struct ContentView: View {
         let (screenW0, screenH0) = desktopSize
         setenv("MADEIRA_SCREEN_W", String(screenW0), 1)
         setenv("MADEIRA_SCREEN_H", String(screenH0), 1)
-        let launchInSession: () -> Void = {
+        let launchInSession: (String) -> Void = { args in
             // ml830: this game's own shader cache (or "off") goes to the agent with
             // the launch, because the runtime's environment was fixed when it started.
             let cache = ShaderCache.launchValue(for: game)
             logStore.log("Games: launching \(game.title) → \(exePath) (shader cache: "
                          + (cache == "off" ? "off" : ShaderCache.dirName(forGameID: game.id)) + ")")
-            SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, shaderCache: cache) { outcome in
+            if !args.isEmpty {
+                let why = GameLibrary.shared.wantsResolutionReset(game.id) ? "Madeira resolution (from its menu)" : "first launch"
+                logStore.log("Games: \(game.title) — \(why) at \(screenW0)x\(screenH0) (Unity: \(args))")
+            }
+            // ml837: args = GameResolutionDefault's Unity screen options, or "".
+            SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, args: args, shaderCache: cache) { outcome in
                 switch outcome {
                 case .started(let pid):
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)
                     GameLibrary.shared.markPlayed(game)
+                    GameLibrary.shared.noteStartedThisRun(game.id)   // ml837: user.reg lags the live registry
+                    GameLibrary.shared.clearResolutionReset(for: game.id)   // ml837: one time only
                     playingPid = pid
                     unexitedGames[pid] = game.id
                     launcherSession = .playing(game.title)
@@ -1801,7 +1808,19 @@ struct ContentView: View {
                 // The launch may have failed or been abandoned meanwhile.
                 guard case .launching(let t) = launcherSession, t == game.title,
                       launchingGame?.id == game.id else { return }
-                launchInSession()
+                // ml837: a Unity game with no saved resolution starts at the Settings
+                // size. Decided off main: it reads app.info and the prefix's user.reg.
+                let lastPlayed = GameLibrary.shared.game(withID: game.id)?.lastPlayed ?? game.lastPlayed
+                DispatchQueue.global(qos: .userInitiated).async {
+                    var probe = game
+                    probe.lastPlayed = lastPlayed
+                    let args = GameResolutionDefault.launchArgs(for: probe, width: screenW0, height: screenH0)
+                    DispatchQueue.main.async {
+                        guard case .launching(let t2) = launcherSession, t2 == game.title,
+                              launchingGame?.id == game.id else { return }
+                        launchInSession(args)
+                    }
+                }
             }
         }
         // A desktop session started from the Desktop tab hosts the game
@@ -2825,7 +2844,7 @@ struct ContentView: View {
                             Text(r).tag(r)
                         }
                     }
-                    Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch.")
+                    Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch. Unity games start at this size on their first launch; after that they keep their own setting, and the game's ⋯ menu can switch it back to this size for the next launch.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
