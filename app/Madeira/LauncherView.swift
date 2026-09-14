@@ -1223,10 +1223,6 @@ private struct OptionsSheet: View {
     @State private var deleteError: String? = nil
     @State private var folderBytes: Int64? = nil
     @State private var folderSizing: Bool = false
-    /// ml837: the chosen exe is a Unity player (checked off main on appear).
-    @State private var isUnityGame: Bool = false
-    /// ml837: Settings > Screen resolution, shown on the resolution row.
-    @AppStorage(GameResolutionDefault.settingKey) private var desktopResolution: String = GameResolutionDefault.settingDefault
 
     init(game: LauncherGame, session: LauncherSession,
          onPlay: @escaping (LauncherGame) -> Void,
@@ -1320,7 +1316,6 @@ private struct OptionsSheet: View {
                                  }))
         }
         out.append(contentsOf: shaderCacheRows(g))
-        out.append(contentsOf: resolutionRows(g))
         if case .playing(let t) = session, t == g.title {
             out.append(OptionRow(id: "forceclose", title: "Force close", systemImage: "xmark.octagon",
                                  destructive: true, checked: false,
@@ -1401,45 +1396,6 @@ private struct OptionsSheet: View {
                 if let c = clearIndex, c == model.highlight, bytes <= 0, c > 0 {
                     model.highlight = c - 1
                 }
-            }
-        }
-    }
-
-    // MARK: Resolution (ml837)
-
-    /// Unity games only: pass the Settings resolution again on the next launch,
-    /// even though the game saved its own. Disabled while the game is busy.
-    private func resolutionRows(_ g: LauncherGame) -> [OptionRow] {
-        guard isUnityGame else { return [] }
-        let busy: Bool = busyGameIDs.contains(g.id)
-        let id: String = g.id
-        let on: Bool = library.wantsResolutionReset(id)
-        let row = OptionRow(id: "resolutionreset", title: "Use Madeira resolution next launch",
-                            systemImage: "arrow.up.left.and.arrow.down.right",
-                            destructive: false, checked: on,
-                            trailing: GameResolutionDefault.displayText(fromSetting: desktopResolution),
-                            disabled: busy,
-                            action: {
-                                // No dismiss, like the shader cache switch.
-                                if on {
-                                    GameLibrary.shared.clearResolutionReset(for: id)
-                                } else {
-                                    GameLibrary.shared.requestResolutionReset(for: id)
-                                }
-                            })
-        return [row]
-    }
-
-    /// Cheap filesystem check (UnityPlayer.dll / <exe>_Data) on a utility queue.
-    private func loadUnityFlag() {
-        guard let exe = current.exe else {
-            isUnityGame = false
-            return
-        }
-        DispatchQueue.global(qos: .utility).async {
-            let unity: Bool = GameResolutionDefault.isUnity(exe: exe)
-            DispatchQueue.main.async {
-                if current.exe == exe { isUnityGame = unity }
             }
         }
     }
@@ -1609,7 +1565,6 @@ private struct OptionsSheet: View {
         .onAppear {
             configure(list.count)
             loadCacheSize()
-            loadUnityFlag()
             let m: SheetRowsModel = model
             GamesFocus.shared.overlayOwner = m
             GamesFocus.shared.overlayHandler = { [weak m] (action: GamepadNavAction) in
@@ -1634,9 +1589,6 @@ private struct OptionsSheet: View {
         }
         .onChange(of: confirmingDelete) { _, _ in
             configure(rows.count)
-        }
-        .onChange(of: current.exe) { _, _ in
-            loadUnityFlag()   // ml837: Change executable
         }
         .onChange(of: busyGameIDs.contains(game.id)) { _, busy in
             // The captured onSelect must see the new disabled states.

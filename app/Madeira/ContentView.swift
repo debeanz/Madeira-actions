@@ -1754,8 +1754,7 @@ struct ContentView: View {
             logStore.log("Games: launching \(game.title) → \(exePath) (shader cache: "
                          + (cache == "off" ? "off" : ShaderCache.dirName(forGameID: game.id)) + ")")
             if !args.isEmpty {
-                let why = GameLibrary.shared.wantsResolutionReset(game.id) ? "Madeira resolution (from its menu)" : "first launch"
-                logStore.log("Games: \(game.title) — \(why) at \(screenW0)x\(screenH0) (Unity: \(args))")
+                logStore.log("Games: \(game.title) — first launch at \(screenW0)x\(screenH0) (Unity: \(args))")
             }
             // ml837: args = GameResolutionDefault's Unity screen options, or "".
             SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, args: args, shaderCache: cache) { outcome in
@@ -1764,7 +1763,6 @@ struct ContentView: View {
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)
                     GameLibrary.shared.markPlayed(game)
                     GameLibrary.shared.noteStartedThisRun(game.id)   // ml837: user.reg lags the live registry
-                    GameLibrary.shared.clearResolutionReset(for: game.id)   // ml837: one time only
                     playingPid = pid
                     unexitedGames[pid] = game.id
                     launcherSession = .playing(game.title)
@@ -2844,7 +2842,7 @@ struct ContentView: View {
                             Text(r).tag(r)
                         }
                     }
-                    Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch. Unity games start at this size on their first launch; after that they keep their own setting, and the game's ⋯ menu can switch it back to this size for the next launch.")
+                    Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch. Games start at this size on their first launch; after that they keep their own setting.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

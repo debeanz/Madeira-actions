@@ -31,8 +31,7 @@ import UIKit
 // its shader cache off (shaderCacheOff).
 //
 // Resolution (ml837): Unity games start at the Settings resolution until they
-// have saved one of their own; resolutionReset asks for it once more
-// (GameResolutionDefault at the end of this file).
+// have saved one of their own (GameResolutionDefault at the end of this file).
 // ============================================================================
 
 struct LauncherGame: Identifiable, Equatable {
@@ -73,9 +72,6 @@ final class GameLibrary: ObservableObject {
     /// ml830: ids whose own shader cache switch is OFF (default is on).
     /// Persisted in UserDefaults "madeira.launcher.shaderCacheOff".
     @Published private(set) var shaderCacheOff: Set<String> = []
-    /// ml837: ids whose next launch passes the Madeira resolution to Unity again
-    /// (one time). Persisted in UserDefaults "madeira.launcher.resetResolution".
-    @Published private(set) var resolutionReset: Set<String> = []
 
     init() {
         let defaults = UserDefaults.standard
@@ -90,7 +86,6 @@ final class GameLibrary: ObservableObject {
             }
         }
         shaderCacheOff = Set(defaults.stringArray(forKey: GameLibrary.shaderCacheOffKey) ?? [])
-        resolutionReset = Set(defaults.stringArray(forKey: GameLibrary.resolutionResetKey) ?? [])
     }
 
     /// Games with a lastPlayed date, newest first, at most 10.
@@ -129,8 +124,6 @@ final class GameLibrary: ObservableObject {
     private let steamAppIDsKey = "madeira.launcher.steamAppIDs"
     /// ml830: [String] of game ids with the per-game shader cache off.
     private static let shaderCacheOffKey = "madeira.launcher.shaderCacheOff"
-    /// ml837: [String] of game ids that start at the Madeira resolution next launch.
-    private static let resolutionResetKey = "madeira.launcher.resetResolution"
     /// ml830: set once the old hidden list has been cleared.
     private static let hiddenMigratedKey = "madeira.launcher.hiddenMigrated830"
 
@@ -288,30 +281,6 @@ final class GameLibrary: ObservableObject {
     func startedThisRun(_ id: String) -> Bool {
         startedThisRunLock.lock(); defer { startedThisRunLock.unlock() }
         return startedThisRunIDs.contains(id)
-    }
-
-    /// The game's next launch passes the Madeira resolution to Unity even though
-    /// the game saved one of its own. Reads UserDefaults, so it is safe to call
-    /// from a background queue.
-    func wantsResolutionReset(_ id: String) -> Bool {
-        (UserDefaults.standard.stringArray(forKey: GameLibrary.resolutionResetKey) ?? []).contains(id)
-    }
-
-    /// Main thread.
-    func requestResolutionReset(for id: String) {
-        var s = resolutionReset
-        guard s.insert(id).inserted else { return }
-        UserDefaults.standard.set(s.sorted(), forKey: GameLibrary.resolutionResetKey)
-        resolutionReset = s
-        LogStore.shared.log("Games: \(game(withID: id)?.title ?? id) starts at the Madeira resolution next launch")
-    }
-
-    /// Main thread.
-    func clearResolutionReset(for id: String) {
-        var s = resolutionReset
-        guard s.remove(id) != nil else { return }
-        UserDefaults.standard.set(s.sorted(), forKey: GameLibrary.resolutionResetKey)
-        resolutionReset = s
     }
 
     // MARK: Delete (ml830)
@@ -607,7 +576,6 @@ final class GameLibrary: ObservableObject {
             UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
             shaderCacheOff = off
         }
-        clearResolutionReset(for: id)   // ml837
 
         var ownExes: Set<String> = []
         if game.isManual {
@@ -1195,18 +1163,15 @@ enum GameResolutionDefault {
     /// user.reg): call off the main thread.
     static func launchArgs(for game: LauncherGame, width: Int, height: Int) -> String {
         guard let exe = game.exe, isUnity(exe: exe) else { return "" }
-        if !GameLibrary.shared.wantsResolutionReset(game.id) {
-            // Already ran in this runtime: its saved size may not be on disk yet.
-            if GameLibrary.shared.startedThisRun(game.id) { return "" }
-            let saved: Bool
-            if let names = unityNames(exe: exe) {
-                saved = hasSavedResolution(company: names.company, product: names.product)
-            } else {
-                // Unknown key: only a game that never ran is surely unsaved.
-                saved = game.lastPlayed != nil
-            }
-            if saved { return "" }
+        // Already ran in this runtime: its saved size may not be on disk yet.
+        if GameLibrary.shared.startedThisRun(game.id) { return "" }
+        let saved: Bool
+        if let names = unityNames(exe: exe) {
+            saved = hasSavedResolution(company: names.company, product: names.product)
+        } else {
+            // Unknown key: only a game that never ran is surely unsaved.
+            saved = game.lastPlayed != nil
         }
-        return arguments(width: width, height: height)
+        return saved ? "" : arguments(width: width, height: height)
     }
 }
