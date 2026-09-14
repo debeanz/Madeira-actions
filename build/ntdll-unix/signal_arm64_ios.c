@@ -1400,6 +1400,145 @@ static int ios_mach_deliver_guest_exception( thread_t thread, arm_thread_state64
                                              int exception, uintptr_t fault_addr,
                                              uintptr_t thread_teb );
 
+/* ml836: Wine TID of a registered TEB, read with mach_vm_read_overwrite so the
+ * exception-server thread can never fault on it (a fault on that thread goes
+ * to its OWN task exception port and freezes every thread in the app). */
+static unsigned ios_exc_tid_of_teb( uintptr_t teb )
+{
+    uint64_t tid = 0;
+    mach_vm_size_t got = 0;
+    if (!teb) return 0;
+    if (mach_vm_read_overwrite( mach_task_self(),
+                                (mach_vm_address_t)(teb + offsetof(TEB, ClientId.UniqueThread)),
+                                sizeof(tid), (mach_vm_address_t)&tid, &got ) != KERN_SUCCESS
+        || got != sizeof(tid))
+        return 0;
+    return (unsigned)tid;
+}
+
+/* ml836: x0..x30 of a Mach thread state. __x[] has 29 slots; x29/x30 are the
+ * separate __fp/__lr fields. r == 31 is the caller's business (SP or ZR
+ * depending on the instruction field). */
+static inline uint64_t ios_exc_xreg( const arm_thread_state64_t *st, unsigned r )
+{
+    if (r == 29) return st->__fp;
+    if (r == 30) return st->__lr;
+    return st->__x[r];
+}
+
+static inline void ios_exc_set_xreg( arm_thread_state64_t *st, unsigned r, uint64_t v )
+{
+    if (r == 29) st->__fp = v;
+    else if (r == 30) st->__lr = v;
+    else if (r < 29) st->__x[r] = v;
+}
+
+/* ml836: emulate ONE plain, no-writeback, general-purpose AArch64 load/store
+ * exactly, on behalf of a thread suspended at `insn`, using mach_vm_read/write
+ * (never a raw dereference -- see ios_exc_tid_of_teb). Used by section 3.5 for
+ * an EXC_ARM_DA_ALIGN whose instruction is no longer (or never was) an
+ * alignment-strict atomic. Accepted encodings (V = bit 26 = 0 only):
+ *
+ *   unsigned offset   size 111 0 01 opc imm12              Rn Rt   (insn & 0x3F000000) == 0x39000000
+ *   register offset   size 111 0 00 opc 1 Rm option S 10   Rn Rt   (insn & 0x3F200C00) == 0x38200800
+ *   unscaled (xxUR)   size 111 0 00 opc 0 imm9 00          Rn Rt   (insn & 0x3F200C00) == 0x38000000
+ *
+ *   size (31:30): access width 1 << size bytes (8/16/32/64 bits)
+ *   opc  (23:22): 00 store; 01 load, zero-extend;
+ *                 10 load, sign-extend to 64 (size 3: PRFM/PRFUM -> refused);
+ *                 11 load, sign-extend to 32 then zero the upper half
+ *                    (size 2/3: unallocated -> refused)
+ *   Rn   (9:5)  : base, 31 = SP
+ *   Rt   (4:0)  : 31 = WZR/XZR (store 0, load discarded)
+ *   register offset only:
+ *     Rm (20:16): 31 = XZR (offset 0)
+ *     option (15:13): 010 UXTW, 011 UXTX/LSL, 110 SXTW, 111 SXTX; bit 14 clear
+ *                     is unallocated -> refused
+ *     S (12): offset <<= size when set, else no shift
+ *   unsigned offset: EA = base + (imm12 << size)
+ *   unscaled:        EA = base + SignExtend(imm9 (20:12))
+ *
+ * The effective address is recomputed from the suspended register state and
+ * must equal the kernel's fault address -- if it does not, the instruction at
+ * pc is not the one that faulted and nothing is touched. Only the low
+ * (1 << size) bytes are ever written. Does NOT move pc.
+ *
+ * Returns 1 emulated (store written or Rt updated), 0 not a decodable plain
+ * form, -1 EA != fault address, -2 mach_vm_read/write refused the access (not
+ * mapped / not writable: the caller must leave it to the page machinery / AV). */
+static int ios_exc_emulate_plain_gpr_access( arm_thread_state64_t *st, uint32_t insn,
+                                             uint64_t fault_addr, uint64_t *ea_out,
+                                             uint64_t *val_out )
+{
+    const unsigned size = (insn >> 30) & 3;
+    const unsigned opc  = (insn >> 22) & 3;
+    const unsigned rn   = (insn >> 5) & 0x1F;
+    const unsigned rt   = insn & 0x1F;
+    const unsigned nbytes = 1u << size;
+    uint64_t base, ea, val = 0;
+    mach_vm_size_t got = 0;
+
+    if ((insn & 0x3F000000u) != 0x39000000u &&
+        (insn & 0x3F200C00u) != 0x38200800u &&
+        (insn & 0x3F200C00u) != 0x38000000u)
+        return 0;
+    if (size == 3 && opc >= 2) return 0;   /* PRFM / PRFUM / unallocated */
+    if (size == 2 && opc == 3) return 0;   /* unallocated */
+
+    base = (rn == 31) ? (uint64_t)__darwin_arm_thread_state64_get_sp( *st ) : ios_exc_xreg( st, rn );
+
+    if ((insn & 0x3F000000u) == 0x39000000u)
+    {
+        ea = base + ((uint64_t)((insn >> 10) & 0xFFF) << size);
+    }
+    else if ((insn & 0x3F200C00u) == 0x38200800u)
+    {
+        const unsigned rm = (insn >> 16) & 0x1F;
+        const unsigned option = (insn >> 13) & 7;
+        const unsigned s = (insn >> 12) & 1;
+        uint64_t off = (rm == 31) ? 0 : ios_exc_xreg( st, rm );
+        if (!(option & 2)) return 0;       /* unallocated extend */
+        switch (option)
+        {
+        case 2: off = (uint64_t)(uint32_t)off; break;                   /* UXTW */
+        case 3: break;                                                  /* UXTX / LSL */
+        case 6: off = (uint64_t)(int64_t)(int32_t)(uint32_t)off; break; /* SXTW */
+        case 7: break;                                                  /* SXTX */
+        }
+        ea = base + (s ? (off << size) : off);
+    }
+    else
+    {
+        int64_t imm9 = (int64_t)((uint64_t)((insn >> 12) & 0x1FF) << 55) >> 55; /* 9-bit sign extend */
+        ea = base + (uint64_t)imm9;
+    }
+    if (ea_out) *ea_out = ea;
+    if (ea != fault_addr) return -1;
+
+    if (opc == 0)
+    {
+        val = (rt == 31) ? 0 : ios_exc_xreg( st, rt );   /* low nbytes only, little-endian */
+        if (val_out) *val_out = (size == 3) ? val : (val & ((1ULL << (8 * nbytes)) - 1));
+        if (mach_vm_write( mach_task_self(), (mach_vm_address_t)ea,
+                           (vm_offset_t)(uintptr_t)&val, nbytes ) != KERN_SUCCESS)
+            return -2;
+        return 1;
+    }
+
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)ea, nbytes,
+                                (mach_vm_address_t)&val, &got ) != KERN_SUCCESS || got != nbytes)
+        return -2;
+    if (opc >= 2)
+    {
+        const int sh = 64 - 8 * (int)nbytes;
+        int64_t sv = (int64_t)(val << sh) >> sh;
+        val = (opc == 3) ? (uint64_t)(uint32_t)sv : (uint64_t)sv;
+    }
+    if (rt != 31) ios_exc_set_xreg( st, rt, val );
+    if (val_out) *val_out = val;
+    return 1;
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -2793,6 +2932,145 @@ static void *ios_mach_exception_thread( void *arg )
                             handled = 1;
                         }
                     }
+                    /* iOS-Madeira ml836: an ALIGNMENT fault on a PLAIN load/store --
+                     * above all the handler's OWN backpatch output.
+                     *
+                     * Untitled Goose Game (0.1.88) died on
+                     *     [store-noalias] #1 addr=0x1263ed0bc insn=0xf83f68c8 pc=0x336bff978
+                     *     [fault_rip] kr=257(other)          <- 0x101 = EXC_ARM_DA_ALIGN
+                     *     insn_stream: c89ffcc8 91043006 d5033bbf [f83f68c8] 9100c006 d503201f 889ffcc8
+                     * 0xf83f68c8 = STR x8, [x6, xzr] is EXACTLY what the STLR branch above
+                     * writes for c89ffcc8-style `stlr x8,[x6]`:
+                     *     STR_INST 0x383F6800 | 3<<30 | 6<<5 | 8 = 0xF83F68C8
+                     * and pc-4 holds our DMB (0xd5033bbf). A plain STR has no alignment
+                     * check, so the CPU trapped on the ORIGINAL STLR; by the time this
+                     * single exception-server thread got to that message, an earlier fault
+                     * at the same site (FEX's code buffer is shared by every thread) had
+                     * already rewritten it. Nothing above decodes a plain STR, so the fault
+                     * fell to the alias emulator ("no alias"), was delivered to the game as
+                     * a WRITE AV on ordinary RW heap, and the main thread never recovered.
+                     *
+                     * FEX's own HandleUnalignedAccess (Arm64.cpp) ends with exactly this
+                     * case -- "another thread backpatched an atomic access to be a
+                     * non-atomic access" -- and our replica dropped it:
+                     *   STR [Rn,xzr] / STUR with DMB    at pc-4 -> resume at pc-4
+                     *   LDR [Rn,xzr] / LDUR with DMB_LD at pc+4 -> resume at pc
+                     * Nothing is rewritten; the thread re-runs the (now non-atomic) access.
+                     *
+                     * Gated on code[0] == EXC_ARM_DA_ALIGN: a real protection / unmapped
+                     * fault (kr 1/2) on a patched site at an odd address must still reach
+                     * the page machinery / AV path, not loop here.
+                     *
+                     * Loop breaker: if the SAME thread comes back with an alignment fault
+                     * at the SAME pc (re-running did not help -- a stale instruction), or
+                     * the plain access is not our output at all, emulate that ONE
+                     * instruction exactly with mach_vm_read/write
+                     * (ios_exc_emulate_plain_gpr_access: size, opc sign/zero-extend, Rm
+                     * extend + S shift, EA must equal the fault address) and step pc+4.
+                     * If it cannot be emulated, fall through untouched (loud
+                     * UNALIGNED-UNDECODED before delivery).
+                     *
+                     * Family (V=0) is disjoint from every decoder above: LDAPR 0x38BFC000
+                     * has bits 11:10 = 00 with bit 21 set, and LDAR/STLR/LDAPUR/STLUR/
+                     * exclusives/CAS all have bits 29:27 != 111. */
+                    else if (fault_kr == 0x101 /* EXC_ARM_DA_ALIGN */ &&
+                             req->exception == EXC_BAD_ACCESS &&
+                             ((insn & 0x3F000000u) == 0x39000000u ||   /* unsigned offset */
+                              (insn & 0x3F200C00u) == 0x38200800u ||   /* register offset */
+                              (insn & 0x3F200C00u) == 0x38000000u))    /* unscaled STUR/LDUR */
+                    {
+                        enum { IOS_UA_RACE_SLOTS = 64 };
+                        static struct { mach_port_t thr; uint64_t pc; } ios_ua_race[IOS_UA_RACE_SLOTS];
+                        static unsigned ios_ua_race_next;
+                        const int own_store = ((insn & LDAXR_MASK) == STR_INST ||
+                                               (insn & RCPC2_MASK) == STUR_INST);
+                        const int own_load  = ((insn & LDAXR_MASK) == LDR_INST ||
+                                               (insn & RCPC2_MASK) == LDUR_INST);
+                        uint32_t nb_insn = 0;
+                        mach_vm_size_t nb_got = 0;
+                        int own = 0, repeat = 0, ri;
+
+                        if (own_store && fault_pc - 4 >= rx &&
+                            mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(fault_pc - 4), 4,
+                                                    (mach_vm_address_t)&nb_insn, &nb_got ) == KERN_SUCCESS &&
+                            nb_got == 4 && nb_insn == DMB)
+                            own = 1;
+                        else if (own_load && fault_pc + 8 <= rx + sz &&
+                                 mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(fault_pc + 4), 4,
+                                                         (mach_vm_address_t)&nb_insn, &nb_got ) == KERN_SUCCESS &&
+                                 nb_got == 4 && nb_insn == DMB_LD)
+                            own = 1;
+
+                        for (ri = 0; ri < IOS_UA_RACE_SLOTS; ri++)
+                            if (ios_ua_race[ri].thr == thread) break;
+                        if (ri < IOS_UA_RACE_SLOTS && ios_ua_race[ri].pc == fault_pc)
+                            repeat = 1;
+
+                        if (own && !repeat)
+                        {
+                            const int64_t race_adj = own_store ? -4 : 0;
+                            if (ri == IOS_UA_RACE_SLOTS)
+                            {
+                                ri = (int)(ios_ua_race_next++ % IOS_UA_RACE_SLOTS);
+                                ios_ua_race[ri].thr = thread;
+                            }
+                            ios_ua_race[ri].pc = fault_pc;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + race_adj));
+                            static volatile int race_count;
+                            int n = __sync_add_and_fetch(&race_count, 1);
+                            if (n <= 8 || (n % 256) == 0)
+                                dprintf(STDERR_FILENO,
+                                        "[mach_exc] UNALIGNED-BACKPATCH-RACE rev=ml836 #%d pc=0x%llx insn=0x%08x "
+                                        "addr=0x%llx kind=%s thr=0x%x tid=%04x -> site already backpatched "
+                                        "(stale trap on the old atomic), resume pc%+lld\n",
+                                        n, (unsigned long long)fault_pc, insn,
+                                        (unsigned long long)fault_addr,
+                                        own_store ? "STR/STUR" : "LDR/LDUR",
+                                        (unsigned)thread, ios_exc_tid_of_teb( thread_teb ),
+                                        (long long)race_adj);
+                            handled = 1;
+                        }
+                        else
+                        {
+                            uint64_t ea = 0, val = 0;
+                            const int er = ios_exc_emulate_plain_gpr_access( &state, insn,
+                                                                             (uint64_t)fault_addr,
+                                                                             &ea, &val );
+                            static volatile int emul_count, refused_count;
+                            int n, log_it;
+                            if (er == 1)
+                            {
+                                __darwin_arm_thread_state64_set_pc_fptr(
+                                    state, (void *)(uintptr_t)(fault_pc + 4));
+                                handled = 1;
+                                n = __sync_add_and_fetch(&emul_count, 1);
+                                log_it = (n <= 8 || (n % 256) == 0);
+                            }
+                            else
+                            {
+                                /* refused: fall through to the later stages untouched */
+                                n = __sync_add_and_fetch(&refused_count, 1);
+                                log_it = (n <= 16);
+                            }
+                            if (log_it)
+                                dprintf(STDERR_FILENO,
+                                        "[mach_exc] UNALIGNED-EMUL rev=ml836 #%d pc=0x%llx insn=0x%08x "
+                                        "addr=0x%llx ea=0x%llx size=%u %s=0x%llx why=%s thr=0x%x tid=%04x "
+                                        "result=%s\n",
+                                        n, (unsigned long long)fault_pc, insn,
+                                        (unsigned long long)fault_addr, (unsigned long long)ea,
+                                        1u << ((insn >> 30) & 3),
+                                        ((insn >> 22) & 3) ? "loaded" : "stored",
+                                        (unsigned long long)val,
+                                        own ? "repeat-on-backpatched-site" : "plain-access",
+                                        (unsigned)thread, ios_exc_tid_of_teb( thread_teb ),
+                                        er == 1  ? "emulated, pc+4" :
+                                        er == -1 ? "REFUSED ea!=fault addr (insn at pc is not what faulted)" :
+                                        er == -2 ? "REFUSED mach_vm_read/write failed (unmapped/not writable)" :
+                                                   "REFUSED unallocated encoding");
+                        }
+                    }
 
                     if (patched)
                     {
@@ -2802,10 +3080,12 @@ static void *ios_mach_exception_thread( void *arg )
                         int n = __sync_add_and_fetch(&ub_count, 1);
                         if (n <= 5 || (n % 100) == 0)
                             dprintf(STDERR_FILENO,
-                                    "[mach_exc] UNALIGNED-BACKPATCH #%d pc=0x%llx insn=0x%08x addr=0x%llx kind=%s\n",
+                                    "[mach_exc] UNALIGNED-BACKPATCH #%d pc=0x%llx insn=0x%08x addr=0x%llx kind=%s "
+                                    "thr=0x%x tid=%04x\n",
                                     n, (unsigned long long)fault_pc, insn,
                                     (unsigned long long)fault_addr,
-                                    adjust_pc ? "STLR/STLUR" : "LDAR/LDAPR/LDAPUR");
+                                    adjust_pc ? "STLR/STLUR" : "LDAR/LDAPR/LDAPUR",
+                                    (unsigned)thread, ios_exc_tid_of_teb( thread_teb ));
                         handled = 1;
                     }
                 skip_unaligned_backpatch: ;
@@ -2867,12 +3147,16 @@ static void *ios_mach_exception_thread( void *arg )
                                            (vm_region_info_t)&ni, &nc, &no) == KERN_SUCCESS)
                             dprintf(STDERR_FILENO,
                                 "[store-noalias] #%d rev=ml348 addr=0x%llx insn=0x%08x pc=0x%llx "
-                                "NO pool/anon alias | region 0x%llx+0x%llx prot=%d max=%d "
-                                "(prot without W = exec-downgraded page that never got dual-mapped)\n",
+                                "NO pool/anon alias | region 0x%llx+0x%llx prot=%d max=%d kr=0x%llx "
+                                "%s\n",
                                 noalias_n, (unsigned long long)fault_addr, ninsn,
                                 (unsigned long long)fault_pc,
                                 (unsigned long long)na, (unsigned long long)ns,
-                                ni.protection, ni.max_protection);
+                                ni.protection, ni.max_protection, fault_kr,
+                                /* ml836: kr 0x101 is EXC_ARM_DA_ALIGN, not a protection fault */
+                                fault_kr == 0x101
+                                    ? "(ALIGNMENT fault, not a missing alias -- see UNALIGNED-* lines)"
+                                    : "(prot without W = exec-downgraded page that never got dual-mapped)");
                         else
                             dprintf(STDERR_FILENO,
                                 "[store-noalias] #%d rev=ml348 addr=0x%llx insn=0x%08x pc=0x%llx "
@@ -4265,6 +4549,47 @@ wx_done: ;
 skip_reclaim_band: ;
             }
 
+            /* ml836: an ALIGNMENT fault (code[0] == EXC_ARM_DA_ALIGN) that no stage
+             * above recovered. Until ml836 this was indistinguishable from a wild write
+             * (the 0.1.88 Untitled Goose Game run printed "[store-noalias] ... exec-downgraded page" for
+             * a perfectly ordinary RW heap page). There is no safe generic recovery for
+             * an access we cannot decode, so delivery below stays as it was -- but name
+             * the encoding once per distinct instruction word, [store-undecoded] style,
+             * so the next gap is a one-line decode instead of a device run. */
+            if (!handled && fault_kr == 0x101 /* EXC_ARM_DA_ALIGN */ &&
+                req->exception == EXC_BAD_ACCESS)
+            {
+                extern void *ios_jit_rx_base_global;
+                extern size_t ios_jit_pool_size_global;
+                static uint32_t ua_undec_seen[16];
+                static int ua_undec_n;
+                const uint64_t upc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                const uint64_t urx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+                const int u_in_pool = urx && upc >= urx && upc < urx + ios_jit_pool_size_global;
+                uint32_t uinsn = 0;
+                mach_vm_size_t ugot = 0;
+                const int uok = mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)upc, 4,
+                                                        (mach_vm_address_t)&uinsn, &ugot ) == KERN_SUCCESS
+                                && ugot == 4;
+                int ui, udup = 0;
+                for (ui = 0; ui < ua_undec_n; ui++)
+                    if (ua_undec_seen[ui] == uinsn) { udup = 1; break; }
+                if (!udup && ua_undec_n < 16)
+                {
+                    ua_undec_seen[ua_undec_n++] = uinsn;
+                    dprintf(STDERR_FILENO,
+                            "[mach_exc] UNALIGNED-UNDECODED rev=ml836 #%d insn=%s0x%08x pc=0x%llx addr=0x%llx "
+                            "size-field=%u in_pool=%d thr=0x%x tid=%04x -- EXC_ARM_DA_ALIGN that no stage "
+                            "recovered; unless an UNALIGNED-EMUL REFUSED line for this pc names why, "
+                            "ADD THIS ENCODING to section 3.5 (unaligned backpatch / "
+                            "ios_exc_emulate_plain_gpr_access). Delivering as before.\n",
+                            ua_undec_n, uok ? "" : "<unreadable>", uinsn,
+                            (unsigned long long)upc, (unsigned long long)fault_addr,
+                            1u << ((uinsn >> 30) & 3), u_in_pool,
+                            (unsigned)thread, ios_exc_tid_of_teb( thread_teb ));
+                }
+            }
+
             /* ml369 (#63): last-resort in-process guest exception delivery.
              * Nothing above claimed the fault; declining it is a death
              * sentence under StikDebug (the stub cannot inject signals, so
@@ -4860,9 +5185,17 @@ skip_reclaim_band: ;
                     /* Read instruction at LR-4 to identify the BL/BLR */
                     if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
                     {
+                        /* ml836: safe read. A raw deref of a garbage lr faults the
+                         * exception thread itself, which deadlocks every thread. */
                         uint32_t *lr_p = (uint32_t*)(uintptr_t)(state.__lr - 4);
-                        dprintf(STDERR_FILENO, "[mach_exc] caller_insn @lr-4=0x%p: 0x%08x\n",
-                            (void*)lr_p, *lr_p);
+                        uint32_t lr_insn = 0;
+                        mach_vm_size_t lr_got = 0;
+                        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)lr_p, 4,
+                                                   (mach_vm_address_t)(uintptr_t)&lr_insn, &lr_got) == KERN_SUCCESS && lr_got == 4)
+                            dprintf(STDERR_FILENO, "[mach_exc] caller_insn @lr-4=0x%p: 0x%08x\n",
+                                (void*)lr_p, lr_insn);
+                        else
+                            dprintf(STDERR_FILENO, "[mach_exc] caller_insn @lr-4=0x%p: <unreadable>\n", (void*)lr_p);
                     }
                     /* Which pool COPY is pc in, and who owns it? Names the
                      * session-vs-child copy — the PE attribution below can't
@@ -4885,9 +5218,13 @@ skip_reclaim_band: ;
                         if (cnt <= 2 && copy_pe && (uintptr_t)copy_pe >= 0x100000000ULL)
                         {
                             uint64_t x16v = (uint64_t)state.__x[16];
-                            uint64_t pool_v = (x16v >= 0x100000000ULL)
-                                ? *(volatile uint64_t *)(uintptr_t)(x16v + 0x4e0) : 0xdead1;
-                            uint64_t pe_v = *(volatile uint64_t *)((uintptr_t)copy_pe + 0xc04e0);
+                            uint64_t pool_v = 0xdead1, pe_v = 0xdead2;   /* ml836: safe reads */
+                            mach_vm_size_t nls_got = 0;
+                            if (x16v >= 0x100000000ULL)
+                                mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(x16v + 0x4e0), 8,
+                                                       (mach_vm_address_t)(uintptr_t)&pool_v, &nls_got);
+                            mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)((uintptr_t)copy_pe + 0xc04e0), 8,
+                                                   (mach_vm_address_t)(uintptr_t)&pe_v, &nls_got);
                             dprintf(STDERR_FILENO,
                                 "[nls-probe] upcase ptr: pool[x16+0x4e0]=0x%llx  PE[pe+0xc04e0]=0x%llx  (x16=0x%llx pe=%p rva_pc=0x%llx)\n",
                                 (unsigned long long)pool_v, (unsigned long long)pe_v,
@@ -4897,9 +5234,15 @@ skip_reclaim_band: ;
                     }
                     if ((uintptr_t)fault_pc >= 0x100000000ULL)
                     {
-                        uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
-                        dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
-                            p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                        /* ml836: safe read (see caller_insn above). */
+                        uint32_t p[7] = { 0 };
+                        mach_vm_size_t p_got = 0;
+                        if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)((uintptr_t)fault_pc - 12), sizeof(p),
+                                                   (mach_vm_address_t)(uintptr_t)p, &p_got) == KERN_SUCCESS && p_got == sizeof(p))
+                            dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
+                                p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
+                        else
+                            dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: <unreadable>\n");
                     }
                     /* iOS-Madeira: symbolize pc/lr via dladdr — works for
                      * dyld-cache addresses in-process. Names the native
@@ -4908,7 +5251,14 @@ skip_reclaim_band: ;
                      * 0x18521c0d0 was unattributable offline: DeviceSupport
                      * symbol tree only has lazily-extracted dylibs). */
                     {
-                        Dl_info di_pc, di_lr;
+                        /* ml836: zero-initialised. dladdr() leaves the struct UNTOUCHED
+                         * when it fails -- which it does for every JIT-pool pc -- and the
+                         * one-shot prologue dump below used to dereference the stack
+                         * garbage in dli_saddr. That faulted THIS (exception-server)
+                         * thread, whose fault goes to its own task exception port: a
+                         * permanent self-deadlock that froze every thread in the app
+                         * (0.1.88 Untitled Goose Game: output stopped after bt[0]). */
+                        Dl_info di_pc = {0}, di_lr = {0};
                         const char *pc_img = "?", *pc_sym = "?"; uint64_t pc_off = 0;
                         const char *lr_img = "?", *lr_sym = "?"; uint64_t lr_off = 0;
                         if (dladdr((void*)(uintptr_t)fault_pc, &di_pc))
@@ -5175,13 +5525,27 @@ skip_reclaim_band: ;
                         if (di_pc.dli_saddr && fault_pc >= 0x180000000ULL &&
                             __sync_bool_compare_and_swap(&proto_dumped, 0, 1))
                         {
-                            uint32_t *fp = (uint32_t*)di_pc.dli_saddr;
+                            /* ml836: copied with mach_vm_read_overwrite, never a raw
+                             * dereference -- see the Dl_info note above. */
+                            uint32_t fp[40];
+                            mach_vm_size_t fp_got = 0;
                             int w;
-                            for (w = 0; w < 40; w += 8)
+                            if (mach_vm_read_overwrite( mach_task_self(),
+                                                        (mach_vm_address_t)(uintptr_t)di_pc.dli_saddr,
+                                                        sizeof(fp), (mach_vm_address_t)fp,
+                                                        &fp_got ) == KERN_SUCCESS
+                                && fp_got == sizeof(fp))
+                            {
+                                for (w = 0; w < 40; w += 8)
+                                    dprintf(STDERR_FILENO,
+                                        "[mach_exc] fn+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                        w * 4, fp[w], fp[w+1], fp[w+2], fp[w+3],
+                                        fp[w+4], fp[w+5], fp[w+6], fp[w+7]);
+                            }
+                            else
                                 dprintf(STDERR_FILENO,
-                                    "[mach_exc] fn+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                                    w * 4, fp[w], fp[w+1], fp[w+2], fp[w+3],
-                                    fp[w+4], fp[w+5], fp[w+6], fp[w+7]);
+                                    "[mach_exc] fn+000: <unreadable> saddr=%p (ml836)\n",
+                                    di_pc.dli_saddr);
                         }
                     }
                     /* Thing B one-shot: a zero-page pc crawl means a thread
