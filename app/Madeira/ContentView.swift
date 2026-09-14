@@ -5108,6 +5108,25 @@ final class TouchControlsModel: ObservableObject {
         let s = Saved(controls: pad ? stashed : controls, visible: visible,
                       mode: mode.rawValue, padControls: pad ? controls : stashed)
         guard let d = try? JSONEncoder().encode(s) else { return }
+        // ml835: coalesce. A drag or resize in the editor changes `controls` on
+        // every touch sample, and an atomic file write per sample made the editor
+        // stutter. The newest snapshot is written 0.25 s after the last change.
+        pendingSave = d
+        guard !saveScheduled else { return }
+        saveScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.flushSave()
+        }
+    }
+
+    private var pendingSave: Data?
+    private var saveScheduled = false
+
+    /// Writes the newest pending snapshot now (also on resign-active).
+    func flushSave() {
+        saveScheduled = false
+        guard let d = pendingSave else { return }
+        pendingSave = nil
         try? d.write(to: Self.url, options: .atomic)
     }
 
@@ -5718,6 +5737,7 @@ final class ControlsInputView: UIView {
 
     @objc private func appLeftForeground() {
         releaseAll(reason: "resign-active", animated: false)
+        TouchControlsModel.shared.flushSave()   // ml835: never lose a coalesced layout save
     }
 
     override func didMoveToWindow() {
@@ -6600,11 +6620,16 @@ struct TouchControlButton: View {
                         lastTapEnd = nil
                     }
                     if let base = resizeBase {
-                        // Up or right = bigger, down or left = smaller; the larger
-                        // component decides. 1% scale per 2 pt, 0.5–3.0.
-                        let right = v.translation.width, up = -v.translation.height
-                        let d = abs(right) >= abs(up) ? right : up
-                        let s = min(max(base + Double(d) * 0.005, 0.5), 3.0)
+                        // Up or right = bigger, down or left = smaller, 1% scale per
+                        // 2 pt, 0.5–3.0. ml835: the drag is PROJECTED onto the
+                        // up-right diagonal. ml833 used whichever component was
+                        // larger, so a finger wobbling on a diagonal with mixed
+                        // signs (up and a little left) flipped between the two and
+                        // the size jumped back and forth — "skipping sizes".
+                        let right = Double(v.translation.width), up = Double(-v.translation.height)
+                        let d = (right + up) * 0.7071
+                        let raw = min(max(base + d * 0.005, 0.5), 3.0)
+                        let s = (raw * 100).rounded() / 100      // steady 0.01 steps, fewer writes
                         if s != m.controls[i].scale { m.controls[i].scale = s }
                         return
                     }
