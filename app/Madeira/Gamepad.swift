@@ -23,7 +23,9 @@ import UIKit
 //   to the table in build/ntdll-unix/xinput_ios.c, which Madeira's
 //   replacement xinput1_x.dll (build/xinput) serves to the game. The game
 //   sees a wired Xbox 360 controller; rumble requests come back through
-//   the same table and drive the pad's haptics.
+//   the same table and drive the pad's haptics. The on-screen touch
+//   controls in Xbox mode feed the same slot 0 through setTouchPad; this
+//   bridge merges both and is the slot's only writer (ml831).
 //
 //   Keyboard & mouse — for games without pad support. Buttons map to a
 //   ControlAction (the touch overlay's vocabulary: a VK code, a mouse
@@ -72,6 +74,29 @@ enum GamepadElement: String, CaseIterable, Codable, Identifiable {
 
     var isStick: Bool { self == .leftStick || self == .rightStick }
     static var buttons: [GamepadElement] { allCases.filter { !$0.isStick } }
+
+    /// ml831: the XINPUT_GAMEPAD_* button bit, or 0 for the analog inputs
+    /// (triggers and sticks). Same table publishNative uses.
+    var xinputBit: UInt16 {
+        switch self {
+        case .dpadUp: return 0x0001
+        case .dpadDown: return 0x0002
+        case .dpadLeft: return 0x0004
+        case .dpadRight: return 0x0008
+        case .menu: return 0x0010        // START
+        case .view: return 0x0020        // BACK
+        case .l3: return 0x0040
+        case .r3: return 0x0080
+        case .lb: return 0x0100
+        case .rb: return 0x0200
+        case .guide: return 0x0400       // GUIDE (XInputGetStateEx only)
+        case .a: return 0x1000
+        case .b: return 0x2000
+        case .x: return 0x4000
+        case .y: return 0x8000
+        case .lt, .rt, .leftStick, .rightStick: return 0
+        }
+    }
 }
 
 /// What an analog stick drives.
@@ -164,7 +189,7 @@ final class GamepadBridge: ObservableObject {
         didSet {
             save()
             if !enabled { releaseAll(using: mapping) }
-            madeira_xinput_set_connected(0, (enabled && native && controller != nil) ? 1 : 0)
+            syncPhysicalPresence()
         }
     }
     /// true = XInput (game sees an Xbox pad); false = keyboard & mouse mapping.
@@ -172,7 +197,7 @@ final class GamepadBridge: ObservableObject {
         didSet {
             save()
             releaseAll(using: mapping)
-            madeira_xinput_set_connected(0, (enabled && native && controller != nil) ? 1 : 0)
+            syncPhysicalPresence()
         }
     }
     /// Release with the OLD mapping: a held button rebound mid-press must
@@ -189,7 +214,10 @@ final class GamepadBridge: ObservableObject {
             releaseAll(using: mapping)
             navStickDir = nil
             heldNav = nil
-            if uiMode && native && enabled { publishNeutral() }
+            // ml831: publishNeutral requires an attached controller. Before,
+            // this reported a connected idle pad at every launch on the Games
+            // tab even with no controller, and nothing ever disconnected it.
+            if uiMode { publishNeutral() }
         }
     }
     var onNavigate: ((GamepadNavAction) -> Void)?
@@ -219,6 +247,20 @@ final class GamepadBridge: ObservableObject {
     /// driven by the motor speeds the game sets through XInputSetState.
     private var hapticEngine: CHHapticEngine?
     private var hapticPlayer: CHHapticAdvancedPatternPlayer?
+
+    /// ml831: XInput slot 0 has two sources, this physical controller and
+    /// the on-screen touch pad (TouchControlsModel in Xbox mode), and this
+    /// bridge is the ONLY writer of the slot. Nearly every game reads player
+    /// 1 only, and a second direct writer would be overwritten every frame
+    /// by publishNative or wiped by set_connected's memset. Main thread only.
+    /// nil = no physical contribution (no controller, disabled, or keyboard
+    /// & mouse mode); the struct's own `connected` field is ignored.
+    private var physicalPad: madeira_xinput_state? = nil
+    private var touchPad = madeira_xinput_state()
+    private var touchPadConnected = false
+    /// What commitPad0 last told the table, so set_connected (which
+    /// memsets the slot and logs) runs only on a real transition.
+    private var lastConnected = false
 
     private static var url: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -267,6 +309,11 @@ final class GamepadBridge: ObservableObject {
                                         object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             self.releaseAll(using: self.mapping)
+            // ml831: same for the XInput slot. The display link stops in the
+            // background, so the last stick/button state would linger there;
+            // keep the pad present (still attached) but idle.
+            if self.physicalPad != nil { self.physicalPad = madeira_xinput_state() }
+            self.commitPad0()
         })
         if let c = GCController.controllers().first { attach(c) }
         GCController.startWirelessControllerDiscovery(completionHandler: nil)
@@ -284,7 +331,7 @@ final class GamepadBridge: ObservableObject {
         controllerName = c.vendorName ?? "Controller"
         LogStore.shared.log("Controller connected: \(controllerName ?? "?") (\(native ? "XInput" : "keyboard/mouse") mode)",
                             level: .success)
-        if enabled && native { madeira_xinput_set_connected(0, 1) }
+        syncPhysicalPresence()
         setupHaptics(c)
 
         func bind(_ button: GCControllerButtonInput?, _ el: GamepadElement) {
@@ -329,7 +376,10 @@ final class GamepadBridge: ObservableObject {
 
     private func detach() {
         releaseAll(using: mapping)
-        madeira_xinput_set_connected(0, 0)
+        // Never set_connected(0, 0) here: its memset would also wipe (and
+        // disconnect) a touch pad the game is being played with.
+        physicalPad = nil
+        commitPad0()
         if let name = controllerName {
             LogStore.shared.log("Controller disconnected: \(name)")
         }
@@ -348,7 +398,6 @@ final class GamepadBridge: ObservableObject {
     /// packet number only advances on real changes.
     private func publishNative(_ pad: GCExtendedGamepad) {
         var s = madeira_xinput_state()
-        s.connected = 1
         var bits: UInt16 = 0
         if pad.dpad.up.isPressed { bits |= 0x0001 }
         if pad.dpad.down.isPressed { bits |= 0x0002 }
@@ -372,11 +421,106 @@ final class GamepadBridge: ObservableObject {
         s.ly = Self.axis(pad.leftThumbstick.yAxis.value)
         s.rx = Self.axis(pad.rightThumbstick.xAxis.value)
         s.ry = Self.axis(pad.rightThumbstick.yAxis.value)
-        madeira_xinput_set_state(0, &s)
+        physicalPad = s
+        commitPad0()
     }
 
     private static func axis(_ v: Float) -> Int16 {
         Int16(max(-32768, min(32767, Int(v * 32767))))
+    }
+
+    // MARK: XInput slot 0 (physical + touch)
+
+    /// Physical contribution present exactly when a controller is attached,
+    /// enabled and in XInput mode. Keeps the current state if it already
+    /// was (the next tick refreshes it); starts idle otherwise.
+    private func syncPhysicalPresence() {
+        if enabled && native && controller != nil {
+            if physicalPad == nil { physicalPad = madeira_xinput_state() }
+        } else {
+            physicalPad = nil
+        }
+        commitPad0()
+    }
+
+    /// Merge both sources into slot 0: buttons OR, triggers max, and per
+    /// stick the whole vector with the larger magnitude (a per-axis max
+    /// would invent diagonals when both are pushed). set_state dedupes, so
+    /// calling this with nothing changed costs one mutex.
+    private func commitPad0() {
+        let connected = physicalPad != nil || touchPadConnected
+        if connected != lastConnected {
+            lastConnected = connected
+            madeira_xinput_set_connected(0, connected ? 1 : 0)
+        }
+        guard connected else { return }
+        let p = physicalPad ?? madeira_xinput_state()
+        let t = touchPadConnected ? touchPad : madeira_xinput_state()
+        var s = madeira_xinput_state()
+        s.connected = 1
+        s.buttons = p.buttons | t.buttons
+        s.left_trigger = max(p.left_trigger, t.left_trigger)
+        s.right_trigger = max(p.right_trigger, t.right_trigger)
+        if Self.magnitude2(t.lx, t.ly) > Self.magnitude2(p.lx, p.ly) {
+            s.lx = t.lx; s.ly = t.ly
+        } else {
+            s.lx = p.lx; s.ly = p.ly
+        }
+        if Self.magnitude2(t.rx, t.ry) > Self.magnitude2(p.rx, p.ry) {
+            s.rx = t.rx; s.ry = t.ry
+        } else {
+            s.rx = p.rx; s.ry = p.ry
+        }
+        madeira_xinput_set_state(0, &s)
+    }
+
+    private static func magnitude2(_ x: Int16, _ y: Int16) -> Int {
+        Int(x) * Int(x) + Int(y) * Int(y)
+    }
+
+    /// ml831: on-screen touch pad input (TouchControlsModel in Xbox mode).
+    /// Axes are -32768..32767, up/right positive; triggers 0..255. Dropped
+    /// while the touch pad is not connected, so a stale press can never
+    /// appear when it connects. Main thread; hops there if called elsewhere.
+    func setTouchPad(buttons: UInt16, leftTrigger: UInt8, rightTrigger: UInt8,
+                     lx: Int16, ly: Int16, rx: Int16, ry: Int16) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async {
+                self.setTouchPad(buttons: buttons, leftTrigger: leftTrigger, rightTrigger: rightTrigger,
+                                 lx: lx, ly: ly, rx: rx, ry: ry)
+            }
+            return
+        }
+        guard touchPadConnected else { return }
+        let sameButtons = touchPad.buttons == buttons && touchPad.left_trigger == leftTrigger
+            && touchPad.right_trigger == rightTrigger
+        let sameAxes = touchPad.lx == lx && touchPad.ly == ly && touchPad.rx == rx && touchPad.ry == ry
+        if sameButtons && sameAxes { return }
+        touchPad.buttons = buttons
+        touchPad.left_trigger = leftTrigger
+        touchPad.right_trigger = rightTrigger
+        touchPad.lx = lx
+        touchPad.ly = ly
+        touchPad.rx = rx
+        touchPad.ry = ry
+        commitPad0()
+    }
+
+    /// ml831: whether the touch pad reports a connected controller (the
+    /// touch side keeps it up while mode == .xbox && visible, not just while
+    /// a finger is down, so engines that enumerate pads at startup see it).
+    /// false also zeroes the stored touch input.
+    func setTouchPadConnected(_ connected: Bool) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.setTouchPadConnected(connected) }
+            return
+        }
+        if !connected { touchPad = madeira_xinput_state() }
+        if connected != touchPadConnected {
+            touchPadConnected = connected
+            LogStore.shared.log("[xinput] ml831 touch pad \(connected ? "on" : "off")")
+        }
+        commitPad0()
     }
 
     private func setupHaptics(_ c: GCController) {
@@ -438,11 +582,12 @@ final class GamepadBridge: ObservableObject {
     }
 
     /// Connected, nothing pressed: what a game sees while the pad is busy
-    /// with the Games tab.
+    /// with the Games tab. Only for an attached, enabled XInput controller;
+    /// a touch pad still merges in through commitPad0.
     private func publishNeutral() {
-        var s = madeira_xinput_state()
-        s.connected = 1
-        madeira_xinput_set_state(0, &s)
+        guard controller != nil, enabled, native else { return }
+        physicalPad = madeira_xinput_state()
+        commitPad0()
     }
 
     private func setHeld(_ el: GamepadElement, _ down: Bool) {

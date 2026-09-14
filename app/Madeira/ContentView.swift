@@ -2722,6 +2722,15 @@ struct ContentView: View {
                     Toggle(isOn: $touchControls.visible) {
                         Label("Touch controller overlay", systemImage: "gamecontroller")
                     }
+                    // ml831: what the on-screen controls send. Each choice keeps
+                    // its own layout; the editor below edits the chosen one.
+                    Picker("Send to game as", selection: $touchControls.mode) {
+                        Text("Keyboard & mouse").tag(TouchControlsMode.keyboardMouse)
+                        Text("Xbox controller (XInput)").tag(TouchControlsMode.xbox)
+                    }
+                    Text("Xbox mode shows a controller layout that the game reads as player 1, alongside any physical controller.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     Button {
                         touchControls.visible = true
                         touchControls.ensureDefaultLayout()
@@ -4807,7 +4816,10 @@ enum ControlAction: Codable, Equatable, Hashable {
     case joystickWASD        // renders as a stick, posts W/A/S/D
     case joystickArrows      // renders as a stick, posts the arrow keys
     case keyboardToggle      // raises the iOS keyboard, as in portrait
-    case pad(String)         // ml645: Xbox button. NOT WIRED — see the panel.
+    /// ml645: an Xbox input by name (PadInput raw value). ml831: wired to XInput
+    /// slot 0 through GamepadBridge. Kept a String so layout files decode in
+    /// both directions across builds (an unknown name is simply inert).
+    case pad(String)
 
     /// The four keys a stick drives, up/right/down/left. nil for non-sticks.
     var stickKeys: [Int32]? {
@@ -4818,6 +4830,17 @@ enum ControlAction: Codable, Equatable, Hashable {
         }
     }
     var isPad: Bool { if case .pad = self { return true }; return false }
+    var padInput: PadInput? { if case .pad(let n) = self { return PadInput(rawValue: n) }; return nil }
+    /// ml831: driven by the finger's position rather than pressed: the key
+    /// sticks, the analog pad sticks and the D-pad cross. The ONE stick test
+    /// (hit slop, drawing, touch routing, release, editor).
+    var isStick: Bool {
+        switch self {
+        case .joystickWASD, .joystickArrows: return true
+        case .pad(let n): return PadInput(rawValue: n)?.isStick ?? false
+        default: return false
+        }
+    }
 
     var label: String {
         switch self {
@@ -4855,6 +4878,146 @@ enum ControlAction: Codable, Equatable, Hashable {
     }
 }
 
+/// ml831: the Xbox inputs a touch control can send (ControlAction.pad names).
+/// Bits are XInput's wButtons, as GamepadBridge.publishNative maps them.
+enum PadInput: String, CaseIterable {
+    case a = "A", b = "B", x = "X", y = "Y"
+    case lb = "LB", rb = "RB", lt = "LT", rt = "RT"
+    case ls = "LS", rs = "RS", l3 = "L3", r3 = "R3"
+    case menu = "Menu", view = "View", guide = "Guide"
+    case up = "D↑", down = "D↓", left = "D←", right = "D→"
+    case dpad = "DPad"                            // the cross: one control, four bits
+
+    enum Side { case left, right }
+
+    /// wButtons bit; 0 for the triggers, sticks and the cross.
+    var bit: UInt16 {
+        switch self {
+        case .up:    return 0x0001
+        case .down:  return 0x0002
+        case .left:  return 0x0004
+        case .right: return 0x0008
+        case .menu:  return 0x0010                // START
+        case .view:  return 0x0020                // BACK
+        case .l3:    return 0x0040
+        case .r3:    return 0x0080
+        case .lb:    return 0x0100
+        case .rb:    return 0x0200
+        case .guide: return 0x0400
+        case .a:     return 0x1000
+        case .b:     return 0x2000
+        case .x:     return 0x4000
+        case .y:     return 0x8000
+        case .lt, .rt, .ls, .rs, .dpad: return 0
+        }
+    }
+    var trigger: Side? {
+        switch self {
+        case .lt: return .left
+        case .rt: return .right
+        default:  return nil
+        }
+    }
+    var stick: Side? {
+        switch self {
+        case .ls: return .left
+        case .rs: return .right
+        default:  return nil
+        }
+    }
+    var isStick: Bool { stick != nil || self == .dpad }
+    /// The cross's bits in ControlAction.stickKeys order: up, right, down, left.
+    static let dpadBits: [UInt16] = [0x0001, 0x0008, 0x0002, 0x0004]
+}
+
+/// ml831: what a control's face shows. ONE spec read by the play-mode UIKit
+/// visual (ControlsInputView) and the SwiftUI layout editor (TouchControlButton),
+/// so the editor draws what play does. Plain colours only — no glass (ml822).
+struct ControlFace {
+    enum Kind { case stick, dpad, button }
+    var kind: Kind
+    var text: String
+    /// SF Symbol name, set only when this OS has the symbol; `text` otherwise.
+    var symbol: String?
+    var tint: UIColor
+    /// Button fill while held.
+    var heldFill: UIColor
+    var bold = false
+
+    /// Glyph point size on a face of diameter d.
+    func fontSize(_ d: CGFloat) -> CGFloat {
+        if symbol != nil { return d * 0.34 }
+        if bold { return d * 0.42 }
+        return d * (text.count > 2 ? 0.22 : 0.34)
+    }
+
+    static let plainHeld = UIColor(white: 1, alpha: 0.32)
+
+    static func of(_ a: ControlAction) -> ControlFace {
+        if a.isStick {
+            return ControlFace(kind: a.padInput == .dpad ? .dpad : .stick, text: a.label,
+                               symbol: nil, tint: .white, heldFill: plainHeld)
+        }
+        guard let p = a.padInput else {
+            return ControlFace(kind: .button, text: a.label, symbol: nil, tint: .white,
+                               heldFill: plainHeld)
+        }
+        func letter(_ c: UIColor) -> ControlFace {
+            ControlFace(kind: .button, text: a.label, symbol: nil, tint: c,
+                        heldFill: c.withAlphaComponent(0.35), bold: true)
+        }
+        switch p {
+        case .a: return letter(UIColor(red: 0.42, green: 0.80, blue: 0.25, alpha: 1))
+        case .b: return letter(UIColor(red: 0.95, green: 0.30, blue: 0.28, alpha: 1))
+        case .x: return letter(UIColor(red: 0.25, green: 0.56, blue: 1.00, alpha: 1))
+        case .y: return letter(UIColor(red: 1.00, green: 0.80, blue: 0.12, alpha: 1))
+        case .menu, .view, .guide:
+            let name: String
+            switch p {
+            case .menu: name = "line.3.horizontal"
+            case .view: name = "rectangle.on.rectangle"
+            default:    name = "logo.xbox"
+            }
+            return ControlFace(kind: .button, text: a.label,
+                               symbol: UIImage(systemName: name) != nil ? name : nil,
+                               tint: .white, heldFill: plainHeld)
+        default:
+            return ControlFace(kind: .button, text: a.label, symbol: nil, tint: .white,
+                               heldFill: plainHeld)
+        }
+    }
+
+    /// D-pad cross outline on a d × d face.
+    static func dpadCross(_ d: CGFloat) -> CGPath {
+        let c = d / 2, w = d * 0.15, l = d * 0.36     // half arm width, arm reach
+        let p = CGMutablePath()
+        p.addLines(between: [
+            CGPoint(x: c - w, y: c - l), CGPoint(x: c + w, y: c - l), CGPoint(x: c + w, y: c - w),
+            CGPoint(x: c + l, y: c - w), CGPoint(x: c + l, y: c + w), CGPoint(x: c + w, y: c + w),
+            CGPoint(x: c + w, y: c + l), CGPoint(x: c - w, y: c + l), CGPoint(x: c - w, y: c + w),
+            CGPoint(x: c - l, y: c + w), CGPoint(x: c - l, y: c - w), CGPoint(x: c - w, y: c - w),
+        ])
+        p.closeSubpath()
+        return p
+    }
+
+    /// One arm of the cross, i in stickKeys order: 0 up, 1 right, 2 down, 3 left.
+    static func dpadArm(_ i: Int, _ d: CGFloat) -> CGRect {
+        let c = d / 2, w = d * 0.15, l = d * 0.36
+        switch i {
+        case 0:  return CGRect(x: c - w, y: c - l, width: 2 * w, height: l - w)
+        case 1:  return CGRect(x: c + w, y: c - w, width: l - w, height: 2 * w)
+        case 2:  return CGRect(x: c - w, y: c + w, width: 2 * w, height: l - w)
+        default: return CGRect(x: c - l, y: c - w, width: l - w, height: 2 * w)
+        }
+    }
+}
+
+/// ml831: what the on-screen controls send to the game.
+enum TouchControlsMode: String, Codable, CaseIterable {
+    case keyboardMouse, xbox
+}
+
 /// One on-screen control.
 ///
 /// Position is NORMALISED (0–1 of the screen), never points: the device gets
@@ -4872,8 +5035,24 @@ final class TouchControlsModel: ObservableObject {
     static let shared = TouchControlsModel()
     static let baseDiameter: CGFloat = 64
 
+    /// The ACTIVE mode's layout; everything reads this. ml831: the other mode's
+    /// layout waits in `stashed`.
     @Published var controls: [TouchControl] = [] { didSet { save() } }
-    @Published var visible = false              { didSet { save() } }
+    @Published var visible = false              { didSet { save(); pushPadConnected() } }
+    /// ml831: what the controls send. Each mode keeps its own layout.
+    @Published var mode: TouchControlsMode = .keyboardMouse {
+        didSet {
+            guard !loading, mode != oldValue else { return }
+            // Stash BEFORE assigning `controls`: its didSet saves, and save()
+            // reads `stashed` as the other mode's layout.
+            let incoming = stashed
+            stashed = controls
+            selected = nil
+            controls = incoming                     // saves
+            ensureDefaultLayout()                   // seeds (and saves) if empty
+            pushPadConnected()
+        }
+    }
     @Published var fullScreen = false           // transient; overlay belongs to the desktop
     @Published var editing = false              // transient, never persisted
     @Published var selected: UUID?              // transient
@@ -4882,28 +5061,63 @@ final class TouchControlsModel: ObservableObject {
     @Published var launchPanelUp = false        // transient
 
     private var loading = false
+    /// ml831: the inactive mode's layout (not published; nothing draws it).
+    private var stashed: [TouchControl] = []
     private static var url: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("madeira-controls.json")
     }
 
-    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool }
+    /// ml831: `controls` is ALWAYS the keyboard & mouse layout, so an older build
+    /// keeps it. New fields are Optional: synthesized decoding ignores defaults,
+    /// and a failed decode would silently empty the layout. `mode` is the raw
+    /// string, so an unknown future mode reads as keyboard & mouse instead of
+    /// failing the whole file.
+    private struct Saved: Codable {
+        var controls: [TouchControl]
+        var visible: Bool
+        var mode: String?
+        var padControls: [TouchControl]?
+    }
 
     private init() {
         loading = true
         if let d = try? Data(contentsOf: Self.url),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
-            controls = s.controls
+            let m = s.mode.flatMap { TouchControlsMode(rawValue: $0) } ?? .keyboardMouse
+            let pad = s.padControls ?? []
+            mode     = m
+            controls = m == .xbox ? pad : s.controls
+            stashed  = m == .xbox ? s.controls : pad
             visible  = s.visible
         }
         loading = false
+        // ml831: next turn, so GamepadBridge.shared is never first touched from
+        // inside this static initializer.
+        DispatchQueue.main.async { [weak self] in self?.pushPadConnected() }
     }
 
     private func save() {
         guard !loading else { return }
-        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible))
-        else { return }
+        let pad = mode == .xbox
+        let s = Saved(controls: pad ? stashed : controls, visible: visible,
+                      mode: mode.rawValue, padControls: pad ? controls : stashed)
+        guard let d = try? JSONEncoder().encode(s) else { return }
         try? d.write(to: Self.url, options: .atomic)
+    }
+
+    /// ml831: the touch pad is connected while the Xbox layout is switched on,
+    /// not only while playing — engines enumerate pads behind the loading panel.
+    /// Transient states (editor, loading panel, leaving full screen) only zero
+    /// the input (ControlsInputView.releaseAll).
+    private func pushPadConnected() {
+        guard !loading else { return }
+        let on = mode == .xbox && visible
+        if Thread.isMainThread {
+            GamepadBridge.shared.setTouchPadConnected(on)
+        } else {
+            DispatchQueue.main.async { GamepadBridge.shared.setTouchPadConnected(on) }
+        }
     }
 
     func index(of id: UUID?) -> Int? {
@@ -4911,14 +5125,45 @@ final class TouchControlsModel: ObservableObject {
         return controls.firstIndex { $0.id == id }
     }
 
+    /// Seeds the ACTIVE mode's default layout when it has none.
     func ensureDefaultLayout() {
         guard controls.isEmpty else { return }
-        controls = [
-            TouchControl(nx: 0.16, ny: 0.72, scale: 1.35, action: .joystickWASD),
-            TouchControl(nx: 0.84, ny: 0.72, scale: 1.05, action: .mouseLeft),
-            TouchControl(nx: 0.73, ny: 0.60, scale: 0.88, action: .key(0x20)),
-            TouchControl(nx: 0.90, ny: 0.55, scale: 0.78, action: .key(0x1B)),
-        ]
+        controls = Self.defaultLayout(mode)
+    }
+
+    private static func defaultLayout(_ mode: TouchControlsMode) -> [TouchControl] {
+        switch mode {
+        case .keyboardMouse:
+            return [
+                TouchControl(nx: 0.16, ny: 0.72, scale: 1.35, action: .joystickWASD),
+                TouchControl(nx: 0.84, ny: 0.72, scale: 1.05, action: .mouseLeft),
+                TouchControl(nx: 0.73, ny: 0.60, scale: 0.88, action: .key(0x20)),
+                TouchControl(nx: 0.90, ny: 0.55, scale: 0.78, action: .key(0x1B)),
+            ]
+        case .xbox:
+            // Landscape. The top-left (perf HUD) and top-right (toolbar)
+            // corners stay clear: those rects take hits before any control.
+            func c(_ x: Double, _ y: Double, _ s: Double, _ n: PadInput) -> TouchControl {
+                TouchControl(nx: x, ny: y, scale: s, action: .pad(n.rawValue))
+            }
+            return [
+                c(0.13, 0.66, 1.50, .ls),
+                c(0.30, 0.84, 1.10, .dpad),
+                c(0.70, 0.80, 1.25, .rs),
+                c(0.87, 0.72, 0.80, .a),
+                c(0.94, 0.58, 0.80, .b),
+                c(0.80, 0.58, 0.80, .x),
+                c(0.87, 0.44, 0.80, .y),
+                c(0.08, 0.40, 0.75, .lb),
+                c(0.08, 0.26, 0.75, .lt),
+                c(0.92, 0.30, 0.75, .rb),
+                c(0.80, 0.30, 0.75, .rt),
+                c(0.44, 0.90, 0.60, .view),
+                c(0.56, 0.90, 0.60, .menu),
+                c(0.22, 0.50, 0.55, .l3),
+                c(0.62, 0.62, 0.55, .r3),
+            ]
+        }
     }
 
     /// ml826: the UIKit play-mode controls (ControlsInputView) own touches only
@@ -4952,6 +5197,19 @@ enum ControlsGeometry {
     /// Degrees past a sector edge before the held direction switches, for the
     /// same reason on the 8-way boundaries (W vs W+D flicker).
     static let sectorHysteresis: Double = 10
+    /// ml831: analog pad sticks. Deflection (of knob travel, clamped to 1) under
+    /// `analogDeadzone` sends 0; past it the magnitude is remapped onto
+    /// [analogFloor, 1], so a light thumb starts at the edge of the game's own
+    /// XInput deadzone (typically 7849/32767 ≈ 0.24) instead of deep inside it.
+    static let analogDeadzone: CGFloat = 0.08
+    static let analogFloor: CGFloat = 0.20
+
+    /// Output magnitude for a stick deflection `m` (0 = centre, 1 = full travel).
+    static func analogMagnitude(_ m: CGFloat) -> CGFloat {
+        let t = min(m, 1)
+        guard t >= analogDeadzone else { return 0 }
+        return analogFloor + (1 - analogFloor) * (t - analogDeadzone) / (1 - analogDeadzone)
+    }
 
     static func diameter(_ c: TouchControl) -> CGFloat {
         TouchControlsModel.baseDiameter * CGFloat(c.scale)
@@ -4971,7 +5229,7 @@ enum ControlsGeometry {
             let o = center(c, in: size)
             let r = diameter(c) / 2
             let dist = hypot(p.x - o.x, p.y - o.y)
-            let slop = c.action.stickKeys != nil ? stickSlop : buttonSlop
+            let slop = c.action.isStick ? stickSlop : buttonSlop
             guard dist <= r + slop else { continue }
             let score = dist / max(r, 1)
             if score < bestScore {
@@ -5171,10 +5429,17 @@ final class ControlsInputView: UIView {
     private final class Visual {
         let base = UIView()
         let label = UILabel()
+        let glyph = UIImageView()                    // ml831: SF Symbol faces
         let knob = CALayer()
+        let cross = CAShapeLayer()                   // ml831: D-pad outline
+        let arms: [CAShapeLayer] = (0..<4).map { _ in CAShapeLayer() }   // up right down left
         var laidOut: TouchControl?
         var size: CGSize = .zero
-        var isStick = false
+        var face = ControlFace.of(.none)
+        var dpadDir = -1
+
+        private static let armLit = UIColor(white: 1, alpha: 0.50).cgColor
+        private static let armDark = UIColor.clear.cgColor
 
         init() {
             base.isUserInteractionEnabled = false
@@ -5184,53 +5449,95 @@ final class ControlsInputView: UIView {
             label.adjustsFontSizeToFitWidth = true
             label.minimumScaleFactor = 0.5
             label.baselineAdjustment = .alignCenters
+            glyph.isUserInteractionEnabled = false
+            glyph.contentMode = .center
             base.addSubview(label)
+            base.addSubview(glyph)
+            arms.forEach { base.layer.addSublayer($0) }
+            base.layer.addSublayer(cross)            // outline over the lit arms
             base.layer.addSublayer(knob)             // after the label: knob on top
             knob.backgroundColor = UIColor(white: 1, alpha: 0.92).cgColor
+            cross.fillColor = UIColor(white: 1, alpha: 0.12).cgColor
+            cross.strokeColor = UIColor(white: 1, alpha: 0.60).cgColor
         }
 
-        /// Caller disables implicit actions.
+        /// Caller disables implicit actions. Paths, symbols and colours are built
+        /// here only, never per touch sample.
         func layout(_ c: TouchControl, in size: CGSize) {
             laidOut = c
             self.size = size
-            isStick = c.action.stickKeys != nil
+            face = ControlFace.of(c.action)
             let d = ControlsGeometry.diameter(c)
             base.bounds = CGRect(x: 0, y: 0, width: d, height: d)
             base.center = ControlsGeometry.center(c, in: size)
             base.layer.cornerRadius = d / 2
-            knob.isHidden = !isStick
-            label.isHidden = isStick
-            if isStick {
+            knob.isHidden = face.kind != .stick
+            cross.isHidden = face.kind != .dpad
+            arms.forEach { $0.isHidden = face.kind != .dpad }
+            label.isHidden = true
+            glyph.isHidden = true
+            switch face.kind {
+            case .stick:
                 let k = d * ControlsGeometry.knobDiameter
                 knob.bounds = CGRect(x: 0, y: 0, width: k, height: k)
                 knob.cornerRadius = k / 2
                 base.layer.borderWidth = max(1, d / 58)   // JoystickFace: 2 pt on a 116 pt face
-            } else {
-                let text = c.action.label
-                let fs = d * (text.count > 2 ? 0.22 : 0.34)
-                label.text = text
-                label.font = UIFont.systemFont(ofSize: fs, weight: .medium)
-                label.frame = CGRect(x: d * 0.08, y: 0, width: d * 0.84, height: d)
+            case .dpad:
+                cross.frame = base.bounds
+                cross.path = ControlFace.dpadCross(d)
+                cross.lineWidth = max(1, d / 64)
+                for (i, arm) in arms.enumerated() {
+                    arm.frame = base.bounds
+                    arm.path = UIBezierPath(rect: ControlFace.dpadArm(i, d)).cgPath
+                }
+                base.layer.borderWidth = max(1, d / 58)
+            case .button:
+                let fs = face.fontSize(d)
+                if let s = face.symbol,
+                   let img = UIImage(systemName: s,
+                                     withConfiguration: UIImage.SymbolConfiguration(pointSize: fs, weight: .medium)) {
+                    glyph.image = img
+                    glyph.tintColor = face.tint
+                    glyph.frame = base.bounds
+                    glyph.isHidden = false
+                } else {
+                    label.text = face.text
+                    label.textColor = face.tint
+                    label.font = UIFont.systemFont(ofSize: fs, weight: face.bold ? .bold : .medium)
+                    label.frame = CGRect(x: d * 0.08, y: 0, width: d * 0.84, height: d)
+                    label.isHidden = false
+                }
                 base.layer.borderWidth = 1
             }
             setKnob(.zero)
             setHeld(false)
+            setDpad(dpadDir)
         }
 
         func setHeld(_ held: Bool) {
-            if isStick {
+            switch face.kind {
+            case .stick, .dpad:
                 base.backgroundColor = UIColor(white: 0, alpha: held ? 0.36 : 0.28)
                 base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.80 : 0.55).cgColor
-            } else {
-                base.backgroundColor = held ? UIColor(white: 1, alpha: 0.32) : UIColor(white: 0, alpha: 0.28)
+            case .button:
+                base.backgroundColor = held ? face.heldFill : UIColor(white: 0, alpha: 0.28)
                 base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.75 : 0.28).cgColor
-                let pad = laidOut?.action.isPad ?? false
-                label.alpha = pad ? 0.45 : (held ? 1.0 : 0.85)
+                label.alpha = held ? 1.0 : 0.85
+                glyph.alpha = held ? 1.0 : 0.85
             }
         }
 
         func setKnob(_ o: CGPoint) {
             knob.position = CGPoint(x: base.bounds.midX + o.x, y: base.bounds.midY + o.y)
+        }
+
+        /// ml831: light the cross's arms for an 8-way direction (-1 = none).
+        func setDpad(_ dir: Int) {
+            dpadDir = dir
+            let lit = ControlsGeometry.directionKeys(dir, ControlsInputView.dpadArms)
+            for (i, arm) in arms.enumerated() {
+                arm.fillColor = lit.contains(Int32(i)) ? Self.armLit : Self.armDark
+            }
         }
     }
 
@@ -5242,6 +5549,24 @@ final class ControlsInputView: UIView {
     private var keyRefs: [Int32: Int] = [:]
     private var leftRefs = 0
     private var rightRefs = 0
+    /// ml831: the XInput counterpart. Per-bit and per-trigger hold counts, and
+    /// each analog stick's axes plus the grab that last drove it (another
+    /// finger's lift must not centre a stick it does not own). Sent to
+    /// GamepadBridge (the single slot-0 writer) only when the sum changes.
+    private struct PadOut: Equatable {
+        var buttons: UInt16 = 0
+        var lt: UInt8 = 0, rt: UInt8 = 0
+        var lx: Int16 = 0, ly: Int16 = 0, rx: Int16 = 0, ry: Int16 = 0
+    }
+    private var padBitRefs = [Int](repeating: 0, count: 16)
+    private var ltRefs = 0
+    private var rtRefs = 0
+    private var leftStickOwner: ObjectIdentifier?
+    private var rightStickOwner: ObjectIdentifier?
+    private var sticks = PadOut()                    // only the axes are used
+    private var publishedPad = PadOut()
+    /// directionKeys indices for the D-pad cross: up, right, down, left.
+    private static let dpadArms: [Int32] = [0, 1, 2, 3]
     /// A button's UP edge waits until it has been down this long, so one Wine
     /// input drain never carries both edges: a game that polls key state once
     /// per frame would otherwise never see a quick tap at all.
@@ -5404,7 +5729,7 @@ final class ControlsInputView: UIView {
             grabs[key] = Grab(touch: t, id: c.id, action: c.action, dir: -1,
                               downAt: CACurrentMediaTime())
             let v = visuals[c.id]
-            if c.action.stickKeys != nil {
+            if c.action.isStick {
                 v?.knob.removeAllAnimations()          // cut a release glide still in flight
                 quietly { v?.setHeld(true) }
                 driveStick(key)                        // ml824: no haptic for the stick
@@ -5418,7 +5743,7 @@ final class ControlsInputView: UIView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         for t in touches {
             let key = ObjectIdentifier(t)
-            if grabs[key]?.action.stickKeys != nil { driveStick(key) }   // buttons ignore motion
+            if grabs[key]?.action.isStick == true { driveStick(key) }   // buttons ignore motion
         }
     }
 
@@ -5435,8 +5760,10 @@ final class ControlsInputView: UIView {
 
     /// The vector runs from the stick's CENTRE to the finger and keeps tracking
     /// outside the ring. Keys change only when the (hysteretic) direction does.
+    /// ml831: an analog pad stick sends the vector itself; the D-pad cross uses
+    /// the same 8-way direction as the key sticks, onto its four bits.
     private func driveStick(_ key: ObjectIdentifier) {
-        guard var g = grabs[key], let q = g.action.stickKeys else { return }
+        guard var g = grabs[key], g.action.isStick else { return }
         guard let c = TouchControlsModel.shared.controls.first(where: { $0.id == g.id }) else {
             release(key, animated: false)
             return
@@ -5449,15 +5776,42 @@ final class ControlsInputView: UIView {
         let travel = r * ControlsGeometry.knobTravel
         let k: CGFloat = len > travel ? travel / len : 1
         let v = visuals[g.id]
-        quietly { v?.setKnob(CGPoint(x: dx * k, y: dy * k)) }
+        let pad = g.action.padInput
+        if pad != .dpad { quietly { v?.setKnob(CGPoint(x: dx * k, y: dy * k)) } }
+        if let side = pad?.stick {
+            // Deflection as a fraction of knob travel, clamped to the unit
+            // circle, then deadzone + floor (ControlsGeometry.analogMagnitude).
+            let m = len / max(travel, 1)
+            let s = m > 0 ? ControlsGeometry.analogMagnitude(m) / m : 0
+            let x = Int16(clamping: Int((dx / max(travel, 1) * s * 32767).rounded()))
+            let y = Int16(clamping: Int((-dy / max(travel, 1) * s * 32767).rounded()))  // XInput: up is +
+            if side == .left {
+                leftStickOwner = key
+                sticks.lx = x; sticks.ly = y
+            } else {
+                rightStickOwner = key
+                sticks.rx = x; sticks.ry = y
+            }
+            publishPad()
+            return
+        }
         let next = ControlsGeometry.stickDirection(dx: dx, dy: dy, radius: r, current: g.dir)
         guard next != g.dir else { return }
         // Release what is no longer held, press what newly is. A blanket
         // release/re-press would make a held direction stutter.
-        let old = Set(ControlsGeometry.directionKeys(g.dir, q))
-        let new = Set(ControlsGeometry.directionKeys(next, q))
-        for vk in old.subtracting(new) { keyUp(vk) }
-        for vk in new.subtracting(old) { keyDown(vk) }
+        if pad == .dpad {
+            let old = Set(ControlsGeometry.directionKeys(g.dir, Self.dpadArms))
+            let new = Set(ControlsGeometry.directionKeys(next, Self.dpadArms))
+            for i in old.subtracting(new) { padBit(PadInput.dpadBits[Int(i)], down: false) }
+            for i in new.subtracting(old) { padBit(PadInput.dpadBits[Int(i)], down: true) }
+            quietly { v?.setDpad(next) }
+            publishPad()
+        } else if let q = g.action.stickKeys {
+            let old = Set(ControlsGeometry.directionKeys(g.dir, q))
+            let new = Set(ControlsGeometry.directionKeys(next, q))
+            for vk in old.subtracting(new) { keyUp(vk) }
+            for vk in new.subtracting(old) { keyDown(vk) }
+        }
         g.dir = next
         grabs[key] = g
     }
@@ -5465,8 +5819,38 @@ final class ControlsInputView: UIView {
     private func release(_ key: ObjectIdentifier, animated: Bool) {
         guard let g = grabs.removeValue(forKey: key) else { return }
         let v = visuals[g.id]
-        if let q = g.action.stickKeys {
-            for vk in ControlsGeometry.directionKeys(g.dir, q) { keyUp(vk) }
+        if g.action.isStick {
+            let pad = g.action.padInput
+            if let side = pad?.stick {
+                // Centre the stick only if this finger is the one driving it.
+                if side == .left, leftStickOwner == key {
+                    leftStickOwner = nil
+                    sticks.lx = 0; sticks.ly = 0
+                } else if side == .right, rightStickOwner == key {
+                    rightStickOwner = nil
+                    sticks.rx = 0; sticks.ry = 0
+                }
+                publishPad()
+            } else if pad == .dpad {
+                let bits = ControlsGeometry.directionKeys(g.dir, Self.dpadArms).map { PadInput.dpadBits[Int($0)] }
+                quietly { v?.setDpad(-1) }
+                // XInput is level-polled: a real lift keeps the bits for minPress,
+                // like the pad buttons, so a quick tap spans a game poll.
+                let holdLeft = Self.minPress - (CACurrentMediaTime() - g.downAt)
+                if !animated || holdLeft <= 0 || bits.isEmpty {
+                    for b in bits { padBit(b, down: false) }
+                    publishPad()
+                } else {
+                    let epoch = releaseEpoch
+                    DispatchQueue.main.asyncAfter(deadline: .now() + holdLeft) { [weak self] in
+                        guard let self, self.releaseEpoch == epoch else { return }   // releaseAll already zeroed
+                        for b in bits { self.padBit(b, down: false) }
+                        self.publishPad()
+                    }
+                }
+            } else if let q = g.action.stickKeys {
+                for vk in ControlsGeometry.directionKeys(g.dir, q) { keyUp(vk) }
+            }
             quietly { v?.setHeld(false) }
             if animated {
                 // ml823: one short, non-bouncy glide back to centre, on release
@@ -5512,10 +5896,40 @@ final class ControlsInputView: UIView {
             if down { MetalBackedView.toggleKeyboard() }
         case .none, .joystickWASD, .joystickArrows:
             break
-        case .pad:
-            break     // ml645: no XInput yet — deliberately inert, and labelled so
+        case .pad(let n):
+            // ml831: sticks and the cross never come here (driveStick).
+            guard let p = PadInput(rawValue: n) else { break }
+            if let side = p.trigger {
+                if side == .left { ltRefs = max(0, ltRefs + (down ? 1 : -1)) }
+                else { rtRefs = max(0, rtRefs + (down ? 1 : -1)) }
+            } else if p.bit != 0 {
+                padBit(p.bit, down: down)
+            }
+            publishPad()
         }
         if down { haptic.impactOccurred() }
+    }
+
+    /// ml831: refcount one wButtons bit; the caller publishes.
+    private func padBit(_ bit: UInt16, down: Bool) {
+        guard bit != 0 else { return }
+        let i = bit.trailingZeroBitCount
+        padBitRefs[i] = max(0, padBitRefs[i] + (down ? 1 : -1))
+    }
+
+    /// ml831: XInput is level-polled, so this is state, not events: send the
+    /// whole pad whenever it differs from what was last sent. A layout without
+    /// pad controls never calls it with a change, so never sends.
+    private func publishPad() {
+        var s = sticks
+        s.buttons = 0
+        for i in 0..<16 where padBitRefs[i] > 0 { s.buttons |= UInt16(1) << UInt16(i) }
+        s.lt = ltRefs > 0 ? 255 : 0
+        s.rt = rtRefs > 0 ? 255 : 0
+        guard s != publishedPad else { return }
+        publishedPad = s
+        GamepadBridge.shared.setTouchPad(buttons: s.buttons, leftTrigger: s.lt, rightTrigger: s.rt,
+                                         lx: s.lx, ly: s.ly, rx: s.rx, ry: s.ry)
     }
 
     private func keyDown(_ vk: Int32) {
@@ -5558,6 +5972,15 @@ final class ControlsInputView: UIView {
         keyRefs.removeAll()
         if leftRefs > 0 { leftRefs = 0; winios_pointer(0, 0, 0x0004, 0) }
         if rightRefs > 0 { rightRefs = 0; winios_pointer(0, 0, 0x0010, 0) }
+        // ml831: neutral pad. The connection is the model's (mode + visible),
+        // so a game keeps its controller through the editor and loading panel.
+        padBitRefs = [Int](repeating: 0, count: 16)
+        ltRefs = 0
+        rtRefs = 0
+        leftStickOwner = nil
+        rightStickOwner = nil
+        sticks = PadOut()
+        publishPad()
         if held > 0 { fputs("[controls] ml826 release-all reason=\(reason) held=\(held)\n", stderr) }
     }
 }
@@ -5739,6 +6162,7 @@ struct TouchControlsOverlay: View {
                 if m.editing {
                     glassButton("plus") {
                         var c = TouchControl()
+                        if m.mode == .xbox { c.action = .pad(PadInput.a.rawValue) }   // ml831
                         // Stagger, so repeated adds do not stack invisibly.
                         c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
                         c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
@@ -5820,26 +6244,51 @@ struct TouchControlButton: View {
     @State private var dragStart: CGPoint?
 
     private var diameter: CGFloat { ControlsGeometry.diameter(control) }
-    private var isStick: Bool { control.action.stickKeys != nil }
+    private var isStick: Bool { control.action.isStick }
     private var isSelected: Bool { m.editing && m.selected == control.id }
+
+    /// ml831: the same ControlFace the play-mode UIKit visual draws.
+    @ViewBuilder private func faceView(_ face: ControlFace, _ d: CGFloat) -> some View {
+        switch face.kind {
+        case .stick:
+            // Same face the play-mode stick draws, at rest.
+            JoystickFace(held: false, dir: -1, alwaysExpanded: true, lightweight: true,
+                         freeKnob: .zero)
+                .frame(width: JoystickFace.padRadius * 2,
+                       height: JoystickFace.padRadius * 2)
+                .scaleEffect(d / (JoystickFace.padRadius * 2))
+        case .dpad:
+            Circle().fill(Color.black.opacity(0.28))
+            Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: max(1, d / 58))
+            Path(ControlFace.dpadCross(d)).fill(Color.white.opacity(0.12))
+            Path(ControlFace.dpadCross(d)).stroke(Color.white.opacity(0.60),
+                                                  lineWidth: max(1, d / 64))
+        case .button:
+            // ml826: plain translucent disc, as in play — no GlassShape.
+            Circle().fill(Color.black.opacity(0.28))
+            glyphView(face, d)
+        }
+    }
+
+    @ViewBuilder private func glyphView(_ face: ControlFace, _ d: CGFloat) -> some View {
+        let tint = Color(uiColor: face.tint).opacity(0.85)
+        if let s = face.symbol {
+            Image(systemName: s)
+                .font(.system(size: face.fontSize(d), weight: .medium))
+                .foregroundStyle(tint)
+        } else {
+            Text(face.text)
+                .font(.system(size: face.fontSize(d), weight: face.bold ? Font.Weight.bold : Font.Weight.medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+                .foregroundStyle(tint)
+                .frame(width: d * 0.84)
+        }
+    }
 
     var body: some View {
         ZStack {
-            if isStick {
-                // Same face the play-mode stick draws, at rest.
-                JoystickFace(held: false, dir: -1, alwaysExpanded: true, lightweight: true,
-                             freeKnob: .zero)
-                    .frame(width: JoystickFace.padRadius * 2,
-                           height: JoystickFace.padRadius * 2)
-                    .scaleEffect(diameter / (JoystickFace.padRadius * 2))
-            } else {
-                // ml826: plain translucent disc, as in play — no GlassShape.
-                Circle().fill(Color.black.opacity(0.28))
-                Text(control.action.label)
-                    .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
-                                  weight: .medium))
-                    .foregroundStyle(.white.opacity(control.action.isPad ? 0.45 : 0.85))
-            }
+            faceView(ControlFace.of(control.action), diameter)
         }
         .frame(width: diameter, height: diameter)
         .contentShape(Circle())
@@ -5896,7 +6345,9 @@ struct MappingPanel: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
-    @State private var tab = 0                    // 0 keyboard, 1 controller
+    /// 0 keyboard, 1 controller. ml831: opens on the controller tab in Xbox mode;
+    /// the keyboard tab stays for mixed layouts (an Esc key beside the pad).
+    @State private var tab = TouchControlsModel.shared.mode == .xbox ? 1 : 0
 
 
     var body: some View {
@@ -5934,7 +6385,7 @@ struct MappingPanel: View {
     private var layout: Placement {
         let cx = CGFloat(control.nx) * screen.width
         let cy = CGFloat(control.ny) * screen.height
-        let r  = TouchControlsModel.baseDiameter * CGFloat(control.scale) / 2
+        let r  = ControlsGeometry.diameter(control) / 2
         let gap: CGFloat = 14, edge: CGFloat = 8
 
         for size in [CGSize(width: 340, height: 236),
@@ -6024,20 +6475,21 @@ struct MappingPanel: View {
 
     private var controllerTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("These chips are placeholders for XInput, which needs the Wine HID stack "
-                 + "and isn't wired up yet. A physical controller works today: bind its "
-                 + "buttons to keys in Settings → Physical controller.")
+            // ml831: wired. The old orange "placeholders" note is gone.
+            Text("Sent to the game as an Xbox controller (XInput), together with any "
+                 + "physical controller. Sticks are analog.")
                 .font(.system(size: 11))
-                .foregroundStyle(.orange.opacity(0.95))
+                .foregroundStyle(.white.opacity(0.55))
                 .fixedSize(horizontal: false, vertical: true)
+            section("Sticks", [("Left stick", .pad("LS")), ("Right stick", .pad("RS")),
+                               ("D-pad", .pad("DPad")),
+                               ("L3", .pad("L3")), ("R3", .pad("R3"))])
             section("Face", [("A", .pad("A")), ("B", .pad("B")), ("X", .pad("X")), ("Y", .pad("Y"))])
-            section("D-pad", [("D↑", .pad("D↑")), ("D↓", .pad("D↓")),
-                              ("D←", .pad("D←")), ("D→", .pad("D→"))])
             section("Bumpers & triggers", [("LB", .pad("LB")), ("RB", .pad("RB")),
                                            ("LT", .pad("LT")), ("RT", .pad("RT"))])
-            section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
-                               ("L3", .pad("L3")), ("R3", .pad("R3"))])
-            section("System", [("Menu", .pad("Menu")), ("View", .pad("View")),
+            section("D-pad buttons", [("D↑", .pad("D↑")), ("D↓", .pad("D↓")),
+                                      ("D←", .pad("D←")), ("D→", .pad("D→"))])
+            section("System", [("View", .pad("View")), ("Menu", .pad("Menu")),
                                ("Guide", .pad("Guide"))])
         }
     }
@@ -6065,7 +6517,7 @@ struct MappingPanel: View {
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(1)
                 .minimumScaleFactor(0.55)
-                .foregroundStyle(.white.opacity(action.isPad ? 0.55 : 1.0))
+                .foregroundStyle(.white)
                 .frame(maxWidth: .infinity, minHeight: 30)
                 .background(RoundedRectangle(cornerRadius: 7)
                     .fill(.white.opacity(on ? 0.36 : 0.12)))
