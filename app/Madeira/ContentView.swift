@@ -360,7 +360,8 @@ final class MetalBackedView: UIView {
 
     /// Quick-tap detection shared by both modes, purely for the full-screen
     /// chrome: a short, still touch on the surface posts .madeiraSurfaceTap
-    /// so the auto-hidden toolbar can reappear. Game input is unaffected.
+    /// (with its window location) so the auto-hidden toolbar can reappear when
+    /// the tap is in the top band. Game input is unaffected.
     /// ml826: bound to the specific UITouch that landed alone.
     private var chromeTapStart = CGPoint.zero
     private var chromeTapTime: TimeInterval = 0
@@ -586,7 +587,11 @@ final class MetalBackedView: UIView {
             chromeTapTouch = nil
             let p = ct.location(in: self)
             if now - chromeTapTime < 0.3 && hypot(p.x - chromeTapStart.x, p.y - chromeTapStart.y) < 12 {
-                NotificationCenter.default.post(name: .madeiraSurfaceTap, object: nil)
+                // ml833: with where it landed, in window points (the main window
+                // and ControlsWindow share bounds), so only a top-band tap shows
+                // the toolbar.
+                NotificationCenter.default.post(name: .madeiraSurfaceTap, object: nil,
+                                                userInfo: ["location": ct.location(in: nil)])
             }
         }
         guard trackpadMode else {
@@ -2750,7 +2755,7 @@ struct ContentView: View {
                     .onChange(of: frameCapSetting) { _, v in
                         if let c = FrameCap(rawValue: Int32(v)) { FrameCap.apply(c, persist: true) }
                     }
-                    Text("A lower cap runs cooler: the game's frame loop waits on the display, so the CPU translation work per second falls with it. The cap never changes on its own. The pill in the overlay changes it too.")
+                    Text("A lower cap runs cooler: the game's frame loop waits on the display, so the CPU translation work per second falls with it. The cap never changes on its own.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -5363,17 +5368,18 @@ enum ControlsGeometry {
     }
 }
 
-/// ml826: where the SwiftUI chrome (toolbar, perf HUD) sits, in window
+/// ml826: where the SwiftUI chrome (the toolbar) sits, in window
 /// coordinates — the hosting view fills the window at origin 0. Measured by
 /// preference and read by ControlsWindow.hitTest. Replaces the blanket
 /// `y < 100` band, which swallowed a quarter of a landscape screen's height
 /// for the camera and sat above any control placed near the top.
 enum ControlsChrome {
     static var toolbar: CGRect = .null
-    static var perf: CGRect = .null
+    /// ml833: only the toolbar. The perf HUD takes no touches (its pacing pill
+    /// is gone), so taps on it fall through to the game surface and a top-band
+    /// tap there still shows the toolbar; camera swipes work over it again.
     static func contains(_ p: CGPoint) -> Bool {
-        (!toolbar.isNull && toolbar.insetBy(dx: -6, dy: -6).contains(p))
-            || (!perf.isNull && perf.insetBy(dx: -10, dy: -10).contains(p))
+        !toolbar.isNull && toolbar.insetBy(dx: -6, dy: -6).contains(p)
     }
 }
 
@@ -5424,7 +5430,7 @@ final class ControlsWindow: UIWindow {
         // the editor, not the chrome, not a control — so the panel's own close
         // button works. Before the editing check for the same reason as above.
         guard !m.launchPanelUp else { return nil }
-        // Edit mode owns the whole screen: drags and the scale pinch must not
+        // Edit mode owns the whole screen: drags and resizes must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing { return super.hitTest(point, with: event) }
         if ControlsChrome.contains(point) { return super.hitTest(point, with: event) }
@@ -5465,7 +5471,7 @@ final class ControlsRootController: UIViewController {
         // ml824: UIView.isMultipleTouchEnabled defaults to false, so this
         // window's hosting view took only the FIRST finger: holding the stick
         // made every other button dead ("i cant use other buttons while
-        // moving the stick"). Still needed for editing (drag + pinch).
+        // moving the stick"). Still needed for editing (drag, double-tap-hold resize).
         host.view.isMultipleTouchEnabled = true
         host.view.frame = view.bounds
         host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -6251,11 +6257,10 @@ extension Notification.Name {
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
-    @State private var pinchBase: Double?
-    /// Auto-hiding toolbar: shown on entry, on a quick tap of the surface,
-    /// on a tap where the hidden toolbar sits (ml826: was the whole top
-    /// edge), and while the layout editor is open; fades a few seconds after
-    /// the last interaction.
+    /// Auto-hiding toolbar: shown on entry, on a quick tap of the surface in
+    /// the top band (ml833: was anywhere on the surface), on a tap where the
+    /// hidden toolbar sits (ml826: was the whole top edge), and while the
+    /// layout editor is open; fades a few seconds after the last interaction.
     @State private var chromeVisible = true
     @State private var chromeHideWork: DispatchWorkItem?
     private var chromeShown: Bool { chromeVisible || m.editing }
@@ -6285,16 +6290,17 @@ struct TouchControlsOverlay: View {
                     // ml826: the full-width 100 pt tap catcher along the top
                     // edge is gone — it ate camera swipes and sat above any
                     // control placed up there. A hidden toolbar comes back on
-                    // a quick tap of the game, or a tap where it sits (below).
+                    // a quick tap of the game in the top band (ml833: the
+                    // surface-tap path, see onReceive below), or a tap where
+                    // it sits (below).
                     //
                     // Performance HUD: this window is the only thing that
                     // draws above the window-level Metal host, so the full
-                    // screen readout has to live here. Its measured frame is
-                    // routed to SwiftUI by ControlsWindow.hitTest, so the
-                    // pacing pill stays tappable.
+                    // screen readout has to live here. ml833: it takes no
+                    // touches; taps on it fall through to the game surface, so
+                    // a top-band tap there still shows the toolbar.
                     if perfOverlayEnabled {
                         FPSOverlay()
-                            .background { ChromeRectReporter(slot: "perf") }
                             .padding(.top, geo.safeAreaInsets.top + 10)
                             .padding(.leading, geo.safeAreaInsets.leading + 12)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -6327,13 +6333,19 @@ struct TouchControlsOverlay: View {
             .frame(width: geo.size.width, height: geo.size.height,
                    alignment: .topTrailing)
             .contentShape(Rectangle())
-            // ml826: the pinch only exists in the editor. In play it used to be
-            // installed over every touch the window took, and could win
-            // arbitration against the controls with two fingers down.
-            .gesture(scalePinch, including: m.editing ? GestureMask.all : GestureMask.subviews)
+            // ml833: the editor's pinch-to-scale is gone; a control is resized by
+            // double-tap-and-hold on it (TouchControlButton).
             .onPreferenceChange(ControlsChromeRectsKey.self) { rects in
                 ControlsChrome.toolbar = rects["toolbar"] ?? .null
-                ControlsChrome.perf = rects["perf"] ?? .null
+            }
+            // ml833: only a surface tap in the TOP band shows the toolbar: the
+            // top max(safe area + 72 pt, 16% of the height). Taps elsewhere
+            // still reach the game and leave the toolbar alone.
+            .onReceive(NotificationCenter.default.publisher(for: .madeiraSurfaceTap)) { note in
+                guard let p = note.userInfo?["location"] as? CGPoint,
+                      p.y < max(geo.safeAreaInsets.top + 72, geo.size.height * 0.16)
+                else { return }
+                showChrome()
             }
         }
         .ignoresSafeArea()
@@ -6342,9 +6354,6 @@ struct TouchControlsOverlay: View {
         // ml827: the 4 s auto-hide ran out during the load; show the toolbar
         // when the game appears.
         .onChange(of: m.launchPanelUp) { _, up in if !up { showChrome() } }
-        .onReceive(NotificationCenter.default.publisher(for: .madeiraSurfaceTap)) { _ in
-            showChrome()
-        }
     }
 
     private var topBar: some View {
@@ -6369,12 +6378,13 @@ struct TouchControlsOverlay: View {
                 MetalBackedView.toggleKeyboard()
             }
             if m.visible {
-                glassButton(m.editing ? "checkmark" : "pencil") {
+                glassButton(m.editing ? "checkmark" : "pencil",
+                            steam: m.editing, primary: m.editing) {
                     m.editing.toggle()
                     if !m.editing { m.selected = nil }
                 }
                 if m.editing {
-                    glassButton("plus") {
+                    glassButton("plus", steam: true) {
                         var c = TouchControl()
                         if m.mode == .xbox { c.action = .pad(PadInput.a.rawValue) }   // ml831
                         // Stagger, so repeated adds do not stack invisibly.
@@ -6392,26 +6402,21 @@ struct TouchControlsOverlay: View {
         // right (no directional icons in here, so nothing else flips).
         .environment(\.layoutDirection, .rightToLeft)
         .padding(6)
+        // ml833: fully opaque Steam base while the layout editor is open; the
+        // play-mode panel is unchanged.
         .background(RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.88)))
+                        .fill(m.editing ? SteamPalette.base
+                                        : Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.88)))
         .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
+                    .stroke(m.editing ? SteamPalette.border : Color.white.opacity(0.10), lineWidth: 1))
         .animation(.easeInOut(duration: 0.22), value: m.editing)
     }
 
-    /// Pinch anywhere scales the SELECTED control. With nothing selected it does
-    /// nothing rather than guessing which one you meant.
-    private var scalePinch: some Gesture {
-        MagnificationGesture()
-            .onChanged { v in
-                guard m.editing, let i = m.index(of: m.selected) else { return }
-                if pinchBase == nil { pinchBase = m.controls[i].scale }
-                m.controls[i].scale = min(max((pinchBase ?? 1) * Double(v), 0.5), 3.0)
-            }
-            .onEnded { _ in pinchBase = nil }
-    }
-
+    /// `steam`: ml833, the layout editor's own buttons (done, add) — solid
+    /// Steam Big Picture fills, white glyph; `primary` fills with the accent.
+    /// Play-mode buttons keep their look.
     private func glassButton(_ system: String, dim: Bool = false,
+                             steam: Bool = false, primary: Bool = false,
                              _ action: @escaping () -> Void) -> some View {
         Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -6420,11 +6425,14 @@ struct TouchControlsOverlay: View {
         } label: {
             // Stroke only — never a .fill variant.
             Image(systemName: system)
-                .font(.system(size: 18, weight: .medium))
-                .foregroundStyle(dim ? Color.white.opacity(0.35) : Color(red: 0.10, green: 0.62, blue: 1.0))
+                .font(.system(size: 18, weight: steam ? Font.Weight.semibold : Font.Weight.medium))
+                .foregroundStyle(steam ? Color.white
+                                 : (dim ? Color.white.opacity(0.35) : Color(red: 0.10, green: 0.62, blue: 1.0)))
                 .frame(width: 44, height: 44)
-                .background(Circle().fill(Color(red: 0.12, green: 0.15, blue: 0.20)))
-                .overlay(Circle().stroke(Color.white.opacity(0.08), lineWidth: 1))
+                .background(Circle().fill(steam ? (primary ? SteamPalette.accent : SteamPalette.surface)
+                                                : Color(red: 0.12, green: 0.15, blue: 0.20)))
+                .overlay(Circle().stroke(steam ? SteamPalette.border : Color.white.opacity(0.08),
+                                         lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -6445,6 +6453,21 @@ struct GlassShape: View {
     }
 }
 
+/// ml833: Steam Big Picture palette for the layout editor (mapping panel, chips,
+/// the editor's toolbar buttons, the delete badge). Everything opaque — the
+/// glass panel was hard to read over a bright game.
+enum SteamPalette {
+    static let base      = Color(red: 23 / 255, green: 26 / 255, blue: 33 / 255)    // #171A21
+    static let panel     = Color(red: 27 / 255, green: 40 / 255, blue: 56 / 255)    // #1B2838
+    static let surface   = Color(red: 42 / 255, green: 71 / 255, blue: 94 / 255)    // #2A475E
+    static let accent    = Color(red: 26 / 255, green: 159 / 255, blue: 255 / 255)  // #1A9FFF
+    static let chipText  = Color(red: 199 / 255, green: 213 / 255, blue: 224 / 255) // #C7D5E0
+    static let secondary = Color(red: 143 / 255, green: 152 / 255, blue: 160 / 255) // #8F98A0
+    static let border    = Color(red: 61 / 255, green: 68 / 255, blue: 80 / 255)    // #3D4450
+    static let danger    = Color(red: 217 / 255, green: 65 / 255, blue: 65 / 255)   // #D94141
+    static let corner: CGFloat = 10
+}
+
 /// ml826: layout-editor rendering and dragging ONLY. Play-mode input and visuals
 /// are ControlsInputView (UIKit): the per-control DragGesture this used to carry
 /// never released its keys on cancel, measured the stick from wherever the thumb
@@ -6456,6 +6479,12 @@ struct TouchControlButton: View {
     @ObservedObject private var m = TouchControlsModel.shared
     @State private var dragBase: CGPoint?
     @State private var dragStart: CGPoint?
+    /// ml833: double-tap-and-hold resizes (the editor's pinch is gone). When the
+    /// last plain tap on THIS control ended, when the current touch began, and
+    /// the scale a resize started from (non-nil = this touch is resizing).
+    @State private var lastTapEnd: Date?
+    @State private var touchBegan: Date?
+    @State private var resizeBase: Double?
 
     private var diameter: CGFloat { ControlsGeometry.diameter(control) }
     private var isStick: Bool { control.action.isStick }
@@ -6510,7 +6539,8 @@ struct TouchControlButton: View {
                                                 : (isStick ? 0 : 0.28)),
                                  lineWidth: isSelected ? 2 : 1))
         .overlay(alignment: .topTrailing) {
-            if isSelected {
+            // ml833: hidden while resizing, where the scale readout sits.
+            if isSelected && resizeBase == nil {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     m.controls.removeAll { $0.id == control.id }
@@ -6520,10 +6550,26 @@ struct TouchControlButton: View {
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(.white)
                         .frame(width: 22, height: 22)
-                        .background(Circle().fill(.red.opacity(0.85)))
+                        .background(Circle().fill(SteamPalette.danger))       // ml833: opaque
+                        .overlay(Circle().stroke(SteamPalette.border, lineWidth: 1))
                 }
                 .buttonStyle(.plain)
                 .offset(x: 8, y: -8)
+            }
+        }
+        .overlay(alignment: .top) {
+            // ml833: solid scale readout just above the control while resizing.
+            if isSelected, resizeBase != nil {
+                Text(String(format: "×%.2f", control.scale))
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(SteamPalette.panel))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(SteamPalette.border, lineWidth: 1))
+                    .fixedSize()
+                    .alignmentGuide(.top) { d in d[.bottom] + 8 }
+                    .allowsHitTesting(false)
             }
         }
         .position(ControlsGeometry.center(control, in: screen))
@@ -6541,6 +6587,26 @@ struct TouchControlButton: View {
                     if dragBase == nil || dragStart != v.startLocation {
                         dragBase = CGPoint(x: m.controls[i].nx, y: m.controls[i].ny)
                         dragStart = v.startLocation
+                        touchBegan = v.time
+                        // ml833: touching down again within 0.35 s of a plain tap
+                        // on this same control is double-tap-and-hold: this touch
+                        // resizes and never moves the control.
+                        if let t = lastTapEnd, v.time.timeIntervalSince(t) < 0.35 {
+                            resizeBase = m.controls[i].scale
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } else {
+                            resizeBase = nil
+                        }
+                        lastTapEnd = nil
+                    }
+                    if let base = resizeBase {
+                        // Up or right = bigger, down or left = smaller; the larger
+                        // component decides. 1% scale per 2 pt, 0.5–3.0.
+                        let right = v.translation.width, up = -v.translation.height
+                        let d = abs(right) >= abs(up) ? right : up
+                        let s = min(max(base + Double(d) * 0.005, 0.5), 3.0)
+                        if s != m.controls[i].scale { m.controls[i].scale = s }
+                        return
                     }
                     let b = dragBase ?? .zero
                     var c = m.controls[i]
@@ -6549,8 +6615,20 @@ struct TouchControlButton: View {
                     // One write (and one JSON save) per sample; it was two.
                     if c != m.controls[i] { m.controls[i] = c }
                 }
-                .onEnded { _ in dragBase = nil; dragStart = nil }
+                .onEnded { v in
+                    // ml833: a short, still touch that was not a resize is the
+                    // first tap of a possible double-tap-and-hold.
+                    let wasTap = resizeBase == nil
+                        && hypot(v.translation.width, v.translation.height) < 10
+                        && v.time.timeIntervalSince(touchBegan ?? Date.distantPast) < 0.3
+                    lastTapEnd = wasTap ? v.time : nil
+                    dragBase = nil; dragStart = nil; touchBegan = nil; resizeBase = nil
+                }
         )
+        // ml833: while resizing, draw above the opaque MappingPanel (a later
+        // ZStack sibling), which can sit just above the control and would hide
+        // the scale readout.
+        .zIndex(resizeBase != nil ? 1 : 0)
     }
 }
 
@@ -6565,21 +6643,26 @@ struct MappingPanel: View {
 
 
     var body: some View {
+        // ml833: Steam Big Picture style — opaque #1B2838 panel, #171A21 tab
+        // strip, accent-filled selection. No glass/material in the editor.
         VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                tabButton(0, "keyboard")
-                tabButton(1, "gamecontroller")
+            HStack(spacing: 8) {
+                tabButton(0, "keyboard", "Keyboard")
+                tabButton(1, "gamecontroller", "Controller")
             }
-            Rectangle().fill(.white.opacity(0.15)).frame(height: 1)
+            .padding(8)
+            .background(SteamPalette.base)
+            Rectangle().fill(SteamPalette.border).frame(height: 1)
             ScrollView {
                 (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
-                    .padding(10)
+                    .padding(12)
             }
         }
         .frame(width: layout.size.width, height: layout.size.height)
-        .background(GlassShape())
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.18), lineWidth: 1))
+        .background(SteamPalette.panel)
+        .clipShape(RoundedRectangle(cornerRadius: SteamPalette.corner))
+        .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                    .stroke(SteamPalette.border, lineWidth: 1))
         .position(layout.center)
     }
 
@@ -6631,12 +6714,24 @@ struct MappingPanel: View {
             size: size)
     }
 
-    private func tabButton(_ i: Int, _ icon: String) -> some View {
-        Button { tab = i } label: {
-            Image(systemName: icon)                       // stroke, not filled
-                .font(.system(size: 16, weight: .regular))
-                .foregroundStyle(.white.opacity(tab == i ? 1.0 : 0.38))
-                .frame(maxWidth: .infinity, minHeight: 36)
+    private func tabButton(_ i: Int, _ icon: String, _ title: String) -> some View {
+        let on = tab == i
+        return Button { tab = i } label: {
+            HStack(spacing: 6) {
+                Image(systemName: icon)                   // stroke, not filled
+                    .font(.system(size: 14, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .foregroundStyle(on ? Color.white : SteamPalette.chipText)
+            .frame(maxWidth: .infinity, minHeight: 30)
+            .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                .fill(on ? SteamPalette.accent : SteamPalette.surface))
+            .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -6692,8 +6787,8 @@ struct MappingPanel: View {
             // ml831: wired. The old orange "placeholders" note is gone.
             Text("Sent to the game as an Xbox controller (XInput), together with any "
                  + "physical controller. Sticks are analog.")
-                .font(.system(size: 11))
-                .foregroundStyle(.white.opacity(0.55))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(SteamPalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             section("Sticks", [("Left stick", .pad("LS")), ("Right stick", .pad("RS")),
                                ("D-pad", .pad("DPad")),
@@ -6709,11 +6804,13 @@ struct MappingPanel: View {
     }
 
     private func section(_ title: String, _ items: [(String, ControlAction)]) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.45))
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 6)], spacing: 6) {
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.6)
+                .textCase(.uppercase)
+                .foregroundStyle(SteamPalette.secondary)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 8)], spacing: 8) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, it in
                     chip(it.0, it.1)
                 }
@@ -6728,13 +6825,16 @@ struct MappingPanel: View {
             if let i = m.index(of: control.id) { m.controls[i].action = action }
         } label: {
             Text(label)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.55)
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity, minHeight: 30)
-                .background(RoundedRectangle(cornerRadius: 7)
-                    .fill(.white.opacity(on ? 0.36 : 0.12)))
+                .foregroundStyle(on ? Color.white : SteamPalette.chipText)
+                .padding(.horizontal, 4)
+                .frame(maxWidth: .infinity, minHeight: 32)
+                .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                    .fill(on ? SteamPalette.accent : SteamPalette.surface))
+                .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                    .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }

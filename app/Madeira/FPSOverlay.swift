@@ -38,12 +38,13 @@ let perfOverlayEnabledKey = "madeira.perfOverlayEnabled"
 /// state, Low Power Mode); this view only lays them out.
 ///
 ///   - Wide variant (portrait, full-screen HUD): one row —
-///     memory | thermal | present count | FPS | pacing pill.
+///     FPS | memory | thermal.
 ///   - Compact variant (landscape pillarbox bar, ~120pt): the same
-///     readouts stacked vertically, no present counter.
+///     readouts stacked vertically.
 ///   - ml832: tapping the readout does nothing (it used to collapse it to a
-///     dot, which read as the overlay switching off). Only the pacing pill
-///     reacts to a tap: it cycles the frame cap.
+///     dot, which read as the overlay switching off).
+///   - ml833: the pacing pill (frame-cap readout/cycler) is gone from both
+///     variants; the cap is set only in Settings → Performance.
 ///   - Settings → Performance overlay (or the gauge button in full screen)
 ///     is the only way to hide it. Warnings keep flowing to the log and banner.
 struct FPSOverlay: View {
@@ -51,9 +52,8 @@ struct FPSOverlay: View {
     var compact: Bool = false
     @ObservedObject private var perf = PerfMonitor.shared
     @AppStorage(perfOverlayEnabledKey) private var enabled = true
-    /// DXMT's g_madeira_vsync_mode, read fresh on every redraw (the perf
-    /// monitor publishes 4×/s) so a Settings change shows here without a
-    /// local copy going stale.
+    /// DXMT's g_madeira_vsync_mode, read fresh (no local copy to go stale).
+    /// ml833: only used to set the ProMotion intent on appear now.
     private var cap: FrameCap { FrameCap.current }
 
     var body: some View {
@@ -67,7 +67,6 @@ struct FPSOverlay: View {
                     Text("\(perf.memMB)M")
                         .foregroundColor(perf.memColor)
                     thermalBadge
-                    pacingPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
@@ -87,7 +86,6 @@ struct FPSOverlay: View {
                     Text("\(perf.memMB)MB")
                         .foregroundColor(.white)
                     thermalBadge
-                    pacingPill
                 }
                 .font(.system(size: 13, weight: .bold, design: .monospaced))
                 .padding(.horizontal, 10)
@@ -112,7 +110,7 @@ struct FPSOverlay: View {
     /// Thermometer glyph + state word, coloured by ProcessInfo.thermalState.
     /// "LPM" is appended while Low Power Mode is on, because it caps the
     /// panel at 60 Hz exactly like a serious thermal state does and the
-    /// pacing pill would otherwise look broken.
+    /// frame cap would otherwise look broken.
     private var thermalBadge: some View {
         HStack(spacing: 2) {
             Image(systemName: perf.thermalSymbol)
@@ -123,28 +121,6 @@ struct FPSOverlay: View {
             }
         }
         .foregroundColor(perf.thermalColor)
-    }
-
-    /// Pacing pill, cycles 60 → 40 → 30 → MAX(n) → RAW → 60. Shared by the
-    /// wide (portrait) and compact (landscape bar) overlay variants.
-    ///   60/40/30: presents paced to exactly that rate (30 and 40 are the
-    ///     cool-running options; 40 sits on every third refresh at 120 Hz).
-    ///   MAX(n): free-run to display refresh; n = current cap
-    ///     (120 = ProMotion; 60 = thermal/LPM capped).
-    ///   RAW: game unthrottled (frame-skip mailbox) — FPS readout =
-    ///     raw stack throughput.
-    private var pacingPill: some View {
-        HStack(spacing: 2) {
-            Text(cap.label)
-        }
-        .foregroundColor(cap.color)
-        .padding(.horizontal, 5)
-        .padding(.vertical, 1)
-        .overlay(RoundedRectangle(cornerRadius: 4)
-            .stroke(cap.color, lineWidth: 1))
-        .onTapGesture {
-            FrameCap.apply(cap.next, persist: true)
-        }
     }
 
     private var fpsColor: Color {
