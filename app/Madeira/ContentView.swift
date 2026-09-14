@@ -1448,6 +1448,10 @@ struct ContentView: View {
     /// FEX_TSOENABLED=0: skip x86 memory-ordering emulation. Big CPU saving,
     /// not safe for every title. Applied by runWineFullSequence.
     @AppStorage("madeira.fexNoTSO") private var fexNoTSO = false
+    /// ml829: DXMT shader cache on/off (Settings → DXMT Renderer). Read by
+    /// runWineFullSequence; defaults to whether madeira-shadercache.txt exists.
+    @AppStorage(ShaderCache.key) private var shaderCacheEnabled = false
+    @State private var shaderCacheSizeText = ""
     /// MADEIRA_DEBUG_VERBOSE=1: full WINEDEBUG trace (WineProcessBridge.m).
     @AppStorage("madeira.wineVerbose") private var wineVerbose = false
     /// Screen size of the Wine Virtual Desktop launcher, as "WxH". This is
@@ -2712,10 +2716,18 @@ struct ContentView: View {
                     LabeledContent("API", value: "Direct3D 11")
                     LabeledContent("Backend", value: "Metal")
                     LabeledContent("Build", value: "Bundled")
-                    Text("Per-title DXMT overrides can be supplied through madeira-dxmt.txt in Files.")
+                    Toggle("Shader cache", isOn: $shaderCacheEnabled)
+                    Button(role: .destructive) {
+                        ShaderCache.clear()
+                        shaderCacheSizeText = ShaderCache.sizeText()
+                    } label: {
+                        LabeledContent("Clear shader cache", value: shaderCacheSizeText)
+                    }
+                    Text("Saves converted shaders so a game doesn't rebuild them every launch, which means fewer stutters the second time you visit an area. Stored per Madeira build; an update starts a fresh cache. Takes effect the next time you open Madeira. Per-title DXMT overrides can be supplied through madeira-dxmt.txt in Files.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                .onAppear { shaderCacheSizeText = ShaderCache.sizeText() }
 
                 Section("Screen") {
                     Picker("Resolution", selection: $desktopResolution) {
@@ -4001,8 +4013,9 @@ struct ContentView: View {
                 }
             }
 
-            // ml819: DXMT shader-cache A/B (flag file only; not default-on until a
-            // device log shows fewer 2nd-launch hitches). Every launch today logs
+            // ml819: DXMT shader-cache A/B. ml829: now a Settings toggle
+            // (ShaderCache.key); madeira-shadercache.txt only decides its default
+            // until the user flips it. Without it every launch logs
             // "[CacheReader] Failed to resolve cache path": without a path, the unix
             // side asks confstr(_CS_DARWIN_USER_CACHE_DIR), which fails on iOS, so
             // every DXBC->AIR conversion reruns each launch. d3d11.dll honours
@@ -4011,12 +4024,12 @@ struct ContentView: View {
             // build: the table key (cache_15) is fixed in the prebuilt d3d11.dll and
             // does not change when CI rebuilds airconv, so a stale converter's output
             // must never be served to a newer build.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               FileManager.default.fileExists(atPath: d.appendingPathComponent("madeira-shadercache.txt").path),
-               let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            if !ShaderCache.enabled {
+                unsetenv("DXMT_SHADER_CACHE_PATH")
+                logStore.log("DXMT shader cache: off (Settings)")
+            } else if let root = ShaderCache.root {
                 let fm = FileManager.default
                 let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
-                let root = caches.appendingPathComponent("dxmt-shaders", isDirectory: true)
                 let dir = root.appendingPathComponent(build, isDirectory: true)
                 for old in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] where old != build {
                     try? fm.removeItem(at: root.appendingPathComponent(old))
@@ -4029,7 +4042,7 @@ struct ContentView: View {
                     let bytes = files.reduce(0) { acc, f in
                         acc + (((try? fm.attributesOfItem(atPath: dir.appendingPathComponent(f).path))?[.size] as? NSNumber)?.intValue ?? 0)
                     }
-                    logStore.log("DXMT shader cache: DXMT_SHADER_CACHE_PATH=\(p) (\(files.count) files, \(bytes / 1024) KB) via madeira-shadercache.txt")
+                    logStore.log("DXMT shader cache: DXMT_SHADER_CACHE_PATH=\(p) (\(files.count) files, \(bytes / 1024) KB) via Settings")
                 } catch {
                     logStore.log("DXMT shader cache: cannot create \(dir.path): \(error)", level: .error)
                 }
@@ -5958,5 +5971,49 @@ struct MappingPanel: View {
                     .fill(.white.opacity(on ? 0.36 : 0.12)))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// ml829: the DXMT shader cache switch and its storage.
+/// Library/Caches/dxmt-shaders/<CFBundleVersion>/shaders_<metalver>.db, written by
+/// d3d11.dll when runWineFullSequence sets DXMT_SHADER_CACHE_PATH.
+enum ShaderCache {
+    static let key = "madeira.shaderCache"
+
+    /// Until the user flips the switch, the old flag file decides (ml819), so a
+    /// cache someone already turned on stays on. Registered defaults are not
+    /// persisted; the first flip writes a real value.
+    static func registerDefault() {
+        let flag = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("madeira-shadercache.txt").path
+        let on = flag.map { FileManager.default.fileExists(atPath: $0) } ?? false
+        UserDefaults.standard.register(defaults: [key: on])
+    }
+
+    static var enabled: Bool { UserDefaults.standard.bool(forKey: key) }
+
+    static var root: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("dxmt-shaders", isDirectory: true)
+    }
+
+    static func sizeBytes() -> Int {
+        guard let root, let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey])
+        else { return 0 }
+        var total = 0
+        for case let url as URL in e {
+            total += (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        }
+        return total
+    }
+
+    static func sizeText() -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(sizeBytes()), countStyle: .file)
+    }
+
+    static func clear() {
+        guard let root else { return }
+        try? FileManager.default.removeItem(at: root)
+        LogStore.shared.log("DXMT shader cache: cleared from Settings")
     }
 }

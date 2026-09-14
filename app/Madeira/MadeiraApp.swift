@@ -15,6 +15,7 @@ final class MadeiraAppDelegate: NSObject, UIApplicationDelegate {
         // ml821: name the UI thread so [thr-cpu] shows "app-main" instead of a
         // bare Mach port, which makes SwiftUI/touch-control cost visible.
         pthread_setname_np("app-main")
+        ShaderCache.registerDefault()   // ml829: before any view reads the switch
         return true
     }
 
