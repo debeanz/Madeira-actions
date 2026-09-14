@@ -5,7 +5,7 @@ import UIKit
 // ============================================================================
 // Games tab (ml791/ml792): a console-style launcher.
 //
-//   TopBar      "Games" · Add game · Refresh · Desktop (icon pills)
+//   TopBar      "Games" · Add game · Refresh (icon pills)
 //   Grid        horizontal cover tiles, 2-4 columns depending on the width
 //   Card        opened with A / a tap on a tile: the cover big, the title,
 //               details, PLAY and a "…" button that opens the options sheet
@@ -118,13 +118,12 @@ final class GamesFocus: ObservableObject {
         case .topBar:
             switch action {
             case .left:  topIndex = max(0, topIndex - 1)
-            case .right: topIndex = min(2, topIndex + 1)
+            case .right: topIndex = min(1, topIndex + 1)   // ml834: Add game, Refresh
             case .down:  if gameCount > 0 { area = .grid }
             case .select:
                 switch topIndex {
                 case 0: fire(.addGame)
-                case 1: fire(.refresh)
-                default: fire(.desktop)
+                default: fire(.refresh)
                 }
             case .back:  if gameCount > 0 { area = .grid }
             default: break
@@ -576,11 +575,7 @@ struct LauncherView: View {
                     spinning: refreshSpin) {
                 library.rescan()
             }
-            TopPill(systemImage: "desktopcomputer", label: "Desktop",
-                    focused: focus.area == .topBar && focus.topIndex == 2,
-                    spinning: false) {
-                onOpenDesktop()
-            }
+            // ml834: no Desktop pill — the Games tab only launches games.
         }
         .padding(.horizontal, 16)
         .padding(.top, 10)
