@@ -16,6 +16,10 @@ void wine_set_ui_log_callback(wine_ui_log_callback_t cb);
 #include <stdint.h>
 uint64_t madeira_get_present_count(void);
 
+// ml840: lock census + every thread's pc/lr/state into madeira-log.txt
+// (signal_arm64_ios.c). Called when a game never draws a frame.
+void ios_hang_dump(const char *why);
+
 // DXMT vsync-lock toggle (winemetal_unix.c) — 1 = pace presents to 60
 // via afterMinimumDuration, 0 = free-run to display max (120 ProMotion,
 // requires CADisableMinimumFrameDurationOnPhone in Info.plist).

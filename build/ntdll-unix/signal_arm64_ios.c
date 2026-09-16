@@ -12852,6 +12852,19 @@ void ios_wait_chain_snapshot( const char *why )
     }
 }
 
+/* ml840: the app calls this when a game never drew a frame within 60 s. Enter
+ * the Gungeon (0.1.94) hung mid-load with its main thread parked in an
+ * exclusive wait on FEX's invalidation-tracker mutex (tracker+0x38) and no
+ * [census-hold] stamp naming a holder; without a full thread dump the reader
+ * that never let go could not be identified. Runs on an app thread: the
+ * census and the dump only read other threads' state. */
+void ios_hang_dump(const char *why)
+{
+    fprintf(stderr, "[hang-dump] ml840 %s\n", why ? why : "");
+    ios_lock_census();
+    ios_dump_all_thread_stacks();
+}
+
 void ios_dump_all_thread_stacks(void)
 {
     thread_act_array_t threads;

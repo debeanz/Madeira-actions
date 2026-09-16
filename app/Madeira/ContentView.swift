@@ -1922,6 +1922,9 @@ struct ContentView: View {
                 Thread.sleep(forTimeInterval: 0.25)
                 waited += 0.25
             }
+            // ml840: while the game's threads are still there, write every
+            // thread's state to the log so a load-time hang names its holder.
+            if !drew, !done.done { ios_hang_dump("\(title) never drew a frame within 60 s") }
             DispatchQueue.main.async {
                 self.firstFrameSeen = true
                 // ml801: a game that never drew within 60 s died at startup
