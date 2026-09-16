@@ -408,6 +408,88 @@ int ios_wx_repromote( unsigned long long pc )
     return 0;
 }
 
+/* ml843: make ONE alias page plainly writable so an exclusive-store loop
+ * (LDAXR ... STLXR ... CBNZ) can re-run on it natively.
+ *
+ * WHY: the ml787 STXR emulator can only do a real CAS when the register the
+ * paired LDAXR loaded is still intact. A compare-exchange that the compiler
+ * folded into the same register
+ *     ldaxr  w9, [x8]
+ *     cmp    w9, ...
+ *     csel   w9, ...          <- w9 is now the NEW value
+ *     stlxr  w10, w9, [x8]    <- faults (RX view); the OLD value is gone
+ * leaves nothing to compare against, and the fallback was a PLAIN store --
+ * exactly the lost update the loop exists to prevent. Enter the Gungeon's
+ * old Boehm-GC Mono keeps ntdll CRITICAL_SECTIONs inside its RWX heap (which
+ * Madeira aliases into the JIT pool); 60 of its first 64 STLXRs took that
+ * fallback, LockCount went wrong, and every thread parked on the lock forever
+ * ("RtlpWaitForCriticalSection ... blocked by 0000").
+ *
+ * WHY THIS IS SAFE: a page that receives exclusive-store RMWs holds DATA
+ * (lock words, refcounts). Guest x64 code on such a page is executed through
+ * FEX's translations, which read the guest bytes and never need the guest
+ * page's exec bit, so dropping it costs nothing; and the emulated path never
+ * invalidated FEX's translations on a write either (ml635), so no coherence
+ * is lost. If the assumption is ever wrong for a page -- something executes
+ * it natively -- the exec fault re-promotes it (ios_wx_repromote) and marks it
+ * sticky, and every later STXR on it goes back to emulation.
+ *
+ * NOT gated by MADEIRA_WX: this is correctness, not the ml691 fault-storm
+ * optimisation, and it demotes only pages that took an exclusive store. */
+int ios_wx_demote_for_exclusive( unsigned long long page, const char **why )
+{
+    static volatile unsigned n_full, n_sticky, n_failed;
+    int q, slot = -1;
+
+    for (q = 0; q < IOS_WX_MAX; q++)
+    {
+        if (ios_wx_pages[q].page == page) { slot = q; break; }
+        if (!ios_wx_pages[q].page && slot < 0) slot = q;
+    }
+    if (slot < 0)
+    {
+        if (__sync_add_and_fetch( &n_full, 1 ) <= 4)
+            dprintf(STDERR_FILENO, "[wx] ml843 table FULL (%d slots), cannot demote 0x%llx\n",
+                    IOS_WX_MAX, page);
+        *why = "W^X table full";
+        return 0;
+    }
+    if (ios_wx_pages[slot].page == page && ios_wx_pages[slot].sticky)
+    {
+        __sync_add_and_fetch( &n_sticky, 1 );
+        *why = "page is sticky (it was executed)";
+        return 0;
+    }
+    if (mprotect( (void *)(uintptr_t)page, 0x4000, PROT_READ | PROT_WRITE ))
+    {
+        if (__sync_add_and_fetch( &n_failed, 1 ) <= 4)
+            dprintf(STDERR_FILENO, "[wx] ml843 mprotect(RW) FAILED 0x%llx errno=%d\n", page, errno);
+        *why = "mprotect(RW) failed";
+        return 0;
+    }
+    ios_wx_pages[slot].page = page;      /* key first: readers test page, then demoted */
+    ios_wx_pages[slot].demoted = 1;
+    return 1;
+}
+
+/* ml843: an alias mapping is going away (freed, purged, or replaced by a new
+ * backing at the same VA). Drop its W^X entries so a later occupant of the
+ * address cannot inherit "demoted" (a spurious RX re-promote on an exec
+ * fault) or "sticky" (a refused demotion, i.e. the PLAIN-store fallback). */
+void ios_wx_forget_range( unsigned long long lo, unsigned long long hi )
+{
+    int q;
+    for (q = 0; q < IOS_WX_MAX; q++)
+    {
+        unsigned long long pg = ios_wx_pages[q].page;
+        if (!pg || pg < lo || pg >= hi) continue;
+        ios_wx_pages[q].demoted = 0;
+        ios_wx_pages[q].sticky = 0;
+        __sync_synchronize();
+        ios_wx_pages[q].page = 0;
+    }
+}
+
 /* Last thread that took an exec fault at a PE VA (i.e. made a native call
  * through the redirect path) — the game thread in practice. The [PROF]
  * sampler in server_ios.c follows this so it profiles the presenting
@@ -3432,6 +3514,11 @@ static void *ios_mach_exception_thread( void *arg )
                         int load_rt = -1, clobbered = 0, k;
                         uint64_t status = 0, expected = 0;
                         int did_cas = 0, swapped = 0;
+                        /* ml843: pc of the exclusive load paired with this store (same
+                         * base register); 0 when none is within the scan window. */
+                        uint64_t ldx_pc = 0;
+                        int native = 0, base_rewritten = 0;
+                        const char *refused = NULL;
                         /* Never read across the start of the page holding pc: the page
                          * below may be unmapped and this runs on the exception server. */
                         const uint64_t scan_lo = (uint64_t)fault_pc & ~0x3fffULL;
@@ -3441,13 +3528,29 @@ static void *ios_mach_exception_thread( void *arg )
                             uint32_t p = *(uint32_t *)(uintptr_t)(fault_pc - 4 * k);
                             if ((p & ldx_mask) == ldaxr || (p & ldx_mask) == ldxr)
                             {
-                                if (((p >> 5) & 0x1f) == Rn && (p & 0x1f) != 31) load_rt = p & 0x1f;
+                                if (((p >> 5) & 0x1f) == Rn)
+                                {
+                                    ldx_pc = (uint64_t)fault_pc - 4 * k;
+                                    if ((p & 0x1f) != 31) load_rt = p & 0x1f;
+                                }
                                 break;   /* the nearest exclusive load decides, match or not */
                             }
                             /* Anything in between whose Rd/Rt field names the loaded
                              * register or the base makes the register value untrustworthy.
                              * (Conservative: stores/branches also have a Rt field.) */
                             if ((p & 0x1f) == Rn) clobbered = 1;
+                            /* ml843: the native re-run (below) re-executes this body from
+                             * the LDAXR, which is only the architectural retry if nothing
+                             * in it REWRITES the base register. Data-processing (imm/reg)
+                             * and load-class instructions with Rd/Rt == Rn do; branches
+                             * (whose low bits are a condition code) and stores do not. */
+                            {
+                                unsigned cls = (p >> 25) & 0xf;          /* op0, bits 28:25 */
+                                int writes_gpr = ((cls & 0xe) == 0x8) ||  /* 100x data-proc imm */
+                                                 ((cls & 0x7) == 0x5) ||  /* x101 data-proc reg */
+                                                 (((cls & 0x5) == 0x4) && (p & (1u << 22)));  /* x1x0 load */
+                                if (writes_gpr && (p & 0x1f) == Rn) base_rewritten = 1;
+                            }
                         }
                         if (load_rt >= 0 && !clobbered)
                         {
@@ -3459,6 +3562,58 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                         }
 
+                        /* ml843 FIRST CHOICE: do not emulate the store at all. Make the
+                         * page plainly writable and rewind the thread to its LDAXR, so
+                         * the whole exclusive loop re-runs natively -- the architectural
+                         * retry, atomic against every other thread, whatever the loop
+                         * did to its registers. Enter the Gungeon's Mono keeps ntdll
+                         * CRITICAL_SECTIONs in its RWX heap: the compare-exchange in
+                         * RtlpWaitForCriticalSection reuses the loaded register for the
+                         * new value, so the CAS below is impossible and the PLAIN-STORE
+                         * fallback corrupted LockCount until every thread hung on it.
+                         * Only for anon aliases (guest memory); pool RX pages hold FEX's
+                         * own host code and keep the emulation. Nothing is written and
+                         * no register changes here: the thread resumes at the LDAXR
+                         * with the state it had when the store faulted. See
+                         * ios_wx_demote_for_exclusive() for why dropping exec is safe. */
+                        /* Never for an ALIGNMENT fault (kr 0x101): the page is not the
+                         * problem there, and a demoted page would just re-fault at the
+                         * same STXR forever. Those keep the emulation, as before. */
+                        if (fault_kr == 0x101)   refused = "alignment fault, not a protection fault";
+                        else if (in_jit)         refused = "pool RX page";
+                        else if (!ldx_pc)        refused = "no paired LDAXR/LDXR within 8 insns";
+                        else if (base_rewritten) refused = "loop body rewrites the base register";
+                        else
+                        {
+                            extern int ios_wx_demote_for_exclusive( unsigned long long, const char ** );
+                            if (ios_wx_demote_for_exclusive( (unsigned long long)fault_addr & ~0x3fffULL,
+                                                             &refused ))
+                            {
+                                extern void ios_jit_anon_alias_note_write( unsigned long long );
+                                ios_jit_anon_alias_note_write( (unsigned long long)fault_addr );
+                                __darwin_arm_thread_state64_set_pc_fptr(state,
+                                    (void *)(uintptr_t)ldx_pc);
+                                handled = 1;     /* resume at the LDAXR; NOT emulated, NOT +4 */
+                                native = 1;
+                            }
+                        }
+
+                        if (native)
+                        {
+                            static int stxr_native_n;
+                            int sn = ++stxr_native_n;
+                            if (sn <= 16 || (sn & 0xff) == 0)
+                                dprintf(STDERR_FILENO,
+                                    "[stxr-native] ml843 #%d insn=0x%08x pc=0x%llx addr=0x%llx size=%u "
+                                    "Rn=x%u Rt=x%u Rs=x%u load_rt=%d clobbered=%d -> page 0x%llx is now RW, "
+                                    "thread rewound to LDAXR 0x%llx (loop re-runs natively)\n",
+                                    sn, insn, (unsigned long long)fault_pc,
+                                    (unsigned long long)fault_addr, 1u << Size, Rn, Rt, Rs, load_rt,
+                                    clobbered, (unsigned long long)fault_addr & ~0x3fffULL,
+                                    (unsigned long long)ldx_pc);
+                        }
+                        else
+                        {
                         if (load_rt >= 0 && !clobbered)
                         {
                             expected = state.__x[load_rt] & szmask;
@@ -3498,13 +3653,15 @@ static void *ios_mach_exception_thread( void *arg )
                             if (stxr_n < 8 || (!did_cas && stxr_n < 64))
                                 dprintf(STDERR_FILENO,
                                     "[stxr-emul] ml787 #%d insn=0x%08x pc=0x%llx addr=0x%llx size=%u "
-                                    "Rn=x%u Rt=x%u Rs=x%u load_rt=%d %s expected=0x%llx new=0x%llx status=%llu\n",
+                                    "Rn=x%u Rt=x%u Rs=x%u load_rt=%d %s expected=0x%llx new=0x%llx status=%llu "
+                                    "(ml843 native path refused: %s)\n",
                                     ++stxr_n, insn, (unsigned long long)fault_pc,
                                     (unsigned long long)fault_addr, 1u << Size, Rn, Rt, Rs, load_rt,
                                     did_cas ? "CAS" : (clobbered ? "PLAIN-STORE (loaded reg clobbered)"
                                                                  : "PLAIN-STORE (no LDAXR found)"),
                                     (unsigned long long)expected, (unsigned long long)stval,
-                                    (unsigned long long)status);
+                                    (unsigned long long)status, refused ? refused : "?");
+                        }
                         }
                     }
                     /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
@@ -3987,8 +4144,11 @@ static void *ios_mach_exception_thread( void *arg )
                     /* ml350 DISCRIMINATOR: alias EXISTS but the instruction is not
                      * in this decode list — every such miss previously cost a full
                      * run to name (ml349's STRB-reg took one). Print the insn so
-                     * the next gap is a one-line diagnosis. Capped. */
-                    if (!emulated)
+                     * the next gap is a one-line diagnosis. Capped.
+                     * ml843: the STXR native path sets handled without emulated
+                     * (nothing was emulated -- the thread re-runs the loop), so it
+                     * must not be reported as an undecoded store. */
+                    if (!emulated && !handled)
                     {
                         static int undecoded_n;
                         if (undecoded_n < 8)

@@ -2057,6 +2057,11 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                             (void *)ios_jit_anon_aliases[i].user_va, (void *)a_start,
                             (unsigned long)(a_end - a_start),
                             (unsigned long)off, (unsigned long)alloc_size);
+                    /* ml843: drop the W^X entries of the dying mapping (see ios_wx_forget_range). */
+                    {
+                        extern void ios_wx_forget_range( unsigned long long, unsigned long long );
+                        ios_wx_forget_range( ios_jit_anon_aliases[i].user_va, ios_jit_anon_aliases[i].user_va_end );
+                    }
                     ios_jit_anon_aliases[i].user_va_end = 0;
                     __sync_synchronize();
                     ios_mono_alias_retire( ios_jit_anon_aliases[i].user_va );  /* ml648: unmap/teardown */
@@ -2969,6 +2974,11 @@ int ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
                     (void *)ios_jit_anon_aliases[i].user_va_end,
                     (void *)ios_jit_anon_aliases[i].jit_rw_alias,
                     user_va, (unsigned long)size, jit_rw_alias);
+            /* ml843: the old backing is dead; its W^X page state must not carry over. */
+            {
+                extern void ios_wx_forget_range( unsigned long long, unsigned long long );
+                ios_wx_forget_range( ios_jit_anon_aliases[i].user_va, ios_jit_anon_aliases[i].user_va_end );
+            }
             idx = i;
             break;
         }
@@ -6224,6 +6234,11 @@ void ios_jit_reclaim_process( void *peb )
             if (!ios_jit_anon_aliases[j].user_va) continue;
             if (rx >= (uintptr_t)(rx_base + off) && rx < (uintptr_t)(rx_base + off + size))
             {
+                /* ml843: drop the W^X entries of the dying mapping (see ios_wx_forget_range). */
+                {
+                    extern void ios_wx_forget_range( unsigned long long, unsigned long long );
+                    ios_wx_forget_range( ios_jit_anon_aliases[j].user_va, ios_jit_anon_aliases[j].user_va_end );
+                }
                 ios_jit_anon_aliases[j].user_va_end = 0;
                 __sync_synchronize();
                 ios_mono_alias_retire( ios_jit_anon_aliases[j].user_va );  /* ml648: unmap/teardown */
