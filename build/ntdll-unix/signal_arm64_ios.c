@@ -3290,21 +3290,27 @@ static void *ios_mach_exception_thread( void *arg )
                      *
                      * STP Q is not architecturally one atomic 32-byte transaction, so two
                      * 16-byte copies are correct. Rn==31 is SP, never __x[31]. */
-                    if (have_neon && (insn & 0xFE400000) == 0xAC000000)
+                    /* ml844: opened to the S (opc=00, 4-byte) and D (opc=01, 8-byte) pairs
+                     * as well -- same shape, only the element size and the imm7 scale
+                     * differ (4 << opc). opc=11 is unallocated and stays undecoded.
+                     * Mask 0x3E400000 == 0x2C000000 pins 101/V=1/L=0 and frees opc. */
+                    if (have_neon && (insn & 0x3E400000) == 0x2C000000 && ((insn >> 30) & 3) != 3)
                     {
                         const int mode = (insn >> 23) & 0x3; /* 0 stnp, 1 post, 2 offset, 3 pre */
                         const int rt   = insn & 0x1f;
                         const int rt2  = (insn >> 10) & 0x1f;
                         const int rn   = (insn >> 5) & 0x1f;
+                        const int esz  = 4 << ((insn >> 30) & 3); /* 4 S, 8 D, 16 Q */
+                        const uintptr_t pair_span = 2 * esz - 1;
                         int64_t imm7   = (int64_t)((insn >> 15) & 0x7f);
                         if (imm7 & 0x40) imm7 -= 0x80;          /* sign-extend 7 bits */
-                        const int64_t off = imm7 * 16;          /* Q registers scale by 16 */
+                        const int64_t off = imm7 * esz;         /* scaled by the element size */
 
                         /* The WHOLE 32-byte destination must live in the SAME alias, or the
                          * second copy would land outside it. */
-                        uintptr_t rw_end = in_jit ? (uintptr_t)(rw + ((fault_addr + 31) - rx))
-                                                  : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + 31 );
-                        if (!rw_end || rw_end != (uintptr_t)rw_addr + 31)
+                        uintptr_t rw_end = in_jit ? (uintptr_t)(rw + ((fault_addr + pair_span) - rx))
+                                                  : (uintptr_t)ios_jit_anon_alias_lookup( fault_addr + pair_span );
+                        if (!rw_end || rw_end != (uintptr_t)rw_addr + pair_span)
                         {
                             static int stp_span_n;
                             if (stp_span_n < 4)
@@ -3321,8 +3327,8 @@ static void *ios_mach_exception_thread( void *arg )
                             uint64_t base_new = base_old;
                             int wb = (mode == 1 || mode == 3);
 
-                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
-                            memcpy((void *)(rw_addr + 16), &neon_state.__v[rt2], 16);
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], esz);
+                            memcpy((void *)(rw_addr + esz), &neon_state.__v[rt2], esz);
 
                             if (wb)
                             {
@@ -3335,11 +3341,12 @@ static void *ios_mach_exception_thread( void *arg )
                                 static int stp_n;
                                 if (stp_n < 8)
                                     dprintf(STDERR_FILENO,
-                                        "[stp-emul] ml629 #%d insn=0x%08x mode=%s off=%+lld Rt=q%d Rt2=q%d "
+                                        "[stp-emul] ml629 #%d insn=0x%08x mode=%s off=%+lld Rt=%c%d Rt2=%c%d "
                                         "Rn=%s%d addr=0x%llx rw=0x%llx base 0x%llx -> 0x%llx%s\n",
                                         ++stp_n, insn,
                                         mode == 0 ? "stnp" : mode == 1 ? "post" : mode == 2 ? "offset" : "pre",
-                                        (long long)off, rt, rt2, rn == 31 ? "s" : "x", rn,
+                                        (long long)off, esz == 4 ? 's' : esz == 8 ? 'd' : 'q', rt,
+                                        esz == 4 ? 's' : esz == 8 ? 'd' : 'q', rt2, rn == 31 ? "s" : "x", rn,
                                         (unsigned long long)fault_addr, (unsigned long long)rw_addr,
                                         (unsigned long long)base_old, (unsigned long long)base_new,
                                         wb ? " (writeback)" : " (no writeback)");
@@ -3886,6 +3893,43 @@ static void *ios_mach_exception_thread( void *arg )
                                         ++stur_n, insn, (unsigned long long)fault_pc,
                                         (unsigned long long)fault_addr, 1 << size,
                                         "bhsd"[size], rt);
+                            }
+                        }
+                    }
+                    /* SIMD/FP STR (REGISTER offset), every width — ml844.
+                     *   size 111 1 00 opc 1 Rm option S 10 Rn Rt
+                     *   opc=00: size 00 B, 01 H, 10 S, 11 D;  opc=10 with size=00: Q.
+                     *   Bit 22 (opc[0]) = 0 is a store; loads are excluded, this is the
+                     *   WRITE-fault alias path. Mask 0x3f600c00 == 0x3c200800 pins
+                     *   111100 / bit22=0 / bit21=1 / bits[11:10]=10 and leaves size,
+                     *   opc[1], Rm, option and S free.
+                     * Enter the Gungeon (0.1.98): FEX host code 0xfc3be900 =
+                     *   `str d0, [x8, x27, sxtx]` -- a guest 8-byte vector store into
+                     *   Mono's aliased RWX heap. Every IMMEDIATE SIMD form has been
+                     *   decoded since ml786; the register-offset form never was, so it
+                     *   fell through to [store-undecoded] and was delivered to the guest
+                     *   as an access violation six times at the same pc. fault_addr is
+                     *   already the effective address (base + extended/shifted Rm), so
+                     *   only the source register and its width matter here. */
+                    else if ((insn & 0x3f600c00) == 0x3c200800)
+                    {
+                        int rt = insn & 0x1f;
+                        int size = (insn >> 30) & 3;
+                        int q = (insn >> 23) & 1;              /* opc[1]: Q form, size must be 00 */
+                        int bytes = q ? (size == 0 ? 16 : 0) : (1 << size);
+                        if (have_neon && bytes)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], bytes);
+                            emulated = 1;
+                            {
+                                static int strreg_n;
+                                if (strreg_n < 4)
+                                    dprintf(STDERR_FILENO,
+                                        "[str-simd-reg] ml844 #%d insn=0x%08x pc=0x%llx addr=0x%llx "
+                                        "%d-byte %c%d\n",
+                                        ++strreg_n, insn, (unsigned long long)fault_pc,
+                                        (unsigned long long)fault_addr, bytes,
+                                        q ? 'q' : "bhsd"[size], rt);
                             }
                         }
                     }
