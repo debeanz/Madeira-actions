@@ -3838,17 +3838,42 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;           /* old value lands here */
                         uint64_t align_mask = (1ULL << size_lg2) - 1;
 
-                        /* An unaligned atomic cannot be emulated atomically. Fall through
-                         * to the discriminator rather than quietly doing something weaker. */
+                        /* ml839: UNALIGNED swap (Enter the Gungeon's Mono patched its own
+                         * JIT code with `SWPAL X25, X25, [X6]`, insn 0xf8f980d9, at
+                         * 0x...56). ml626 refused it, the store never happened, and the
+                         * game died before its first frame.
+                         *
+                         * Why this is still atomic where it matters: we only get here
+                         * for a write through the READ-ONLY (RX) view of a JIT alias.
+                         * Every guest write to that page traps and lands in THIS
+                         * handler, and the single Mach exception-server thread handles
+                         * one fault at a time. So no other guest writer can interleave
+                         * between the read and the write below. The store itself is one
+                         * memcpy (a single unaligned STR on arm64), which is what an
+                         * x86 XCHG looks like to a concurrent reader anyway. */
                         if (rw_addr & align_mask)
                         {
-                            static int swp_unalign_n;
-                            if (swp_unalign_n < 4)
-                                dprintf(STDERR_FILENO,
-                                    "[swp-emul] ml626 #%d REFUSING unaligned atomic: insn=0x%08x size=%d "
-                                    "addr=0x%llx rw=0x%llx\n",
-                                    ++swp_unalign_n, insn, 1 << size_lg2,
-                                    (unsigned long long)fault_addr, (unsigned long long)rw_addr);
+                            uint64_t in = (rs == 31) ? 0 : state.__x[rs];
+                            uint64_t old = 0;
+                            size_t nbytes = (size_t)1 << size_lg2;
+                            memcpy(&old, (void *)(uintptr_t)rw_addr, nbytes);   /* little-endian: low bytes */
+                            memcpy((void *)(uintptr_t)rw_addr, &in, nbytes);
+                            if (rt != 31) state.__x[rt] = old;  /* XZR discards the result */
+                            emulated = 1;
+                            if (size_lg2 == 3)
+                                ios_mono_bridge_capture( state.__x[18], state.__x[28],
+                                                         (uint64_t)state.__pc,
+                                                         (uint64_t)fault_addr );
+                            {
+                                static int swp_unalign_n;
+                                if (swp_unalign_n < 8)
+                                    dprintf(STDERR_FILENO,
+                                        "[swp-emul] ml839 #%d unaligned insn=0x%08x size=%d Rs=x%d Rt=x%d "
+                                        "addr=0x%llx rw=0x%llx in=0x%llx old=0x%llx\n",
+                                        ++swp_unalign_n, insn, 1 << size_lg2, rs, rt,
+                                        (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                        (unsigned long long)in, (unsigned long long)old);
+                            }
                         }
                         else
                         {
@@ -3895,6 +3920,68 @@ static void *ios_mach_exception_thread( void *arg )
                                         (unsigned long long)fault_addr, (unsigned long long)rw_addr,
                                         (unsigned long long)in, (unsigned long long)old);
                             }
+                        }
+                    }
+                    /* ml839: CAS{A}{L}{B,H} — LSE compare-and-swap on a JIT alias.
+                     *   size 001000 1 L 1 Rs o0 11111 Rn Rt   mask 0x3FA07C00 value 0x08A07C00
+                     * Semantics: old = mem[Rn]; if (old == Rs) mem[Rn] = Rt; Rs = old
+                     * (zero-extended). Enter the Gungeon's Mono reached this as
+                     * CASAL X8, X0, [X7] (0xc8e8fce0) after the ml839 SWPAL above; the
+                     * ucontext path (ml408) had it, this Mach path did not. Aligned:
+                     * a real atomic CAS on the RW alias. Unaligned: read-compare-write,
+                     * serialised by the single exception-server thread like the
+                     * unaligned SWP above. */
+                    else if ((insn & 0x3FA07C00) == 0x08A07C00)
+                    {
+                        int size_lg2 = (insn >> 30) & 0x3;
+                        int rs = (insn >> 16) & 0x1f;   /* expected value; receives old */
+                        int rt = insn & 0x1f;           /* new value */
+                        size_t nbytes = (size_t)1 << size_lg2;
+                        uint64_t szmask = (size_lg2 == 3) ? ~0ULL : ((1ULL << (8 * nbytes)) - 1);
+                        uint64_t expect = ((rs == 31) ? 0 : state.__x[rs]) & szmask;
+                        uint64_t val = ((rt == 31) ? 0 : state.__x[rt]) & szmask;
+                        uint64_t old = 0;
+                        int swapped;
+                        if (rw_addr & ((1ULL << size_lg2) - 1))
+                        {
+                            memcpy(&old, (void *)(uintptr_t)rw_addr, nbytes);
+                            swapped = ((old & szmask) == expect);
+                            if (swapped) memcpy((void *)(uintptr_t)rw_addr, &val, nbytes);
+                        }
+                        else
+                        {
+                            switch (size_lg2)
+                            {
+                            case 0: { uint8_t  e = (uint8_t)expect;
+                                      swapped = __atomic_compare_exchange_n((uint8_t *)rw_addr, &e, (uint8_t)val,
+                                                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                                      old = e; break; }
+                            case 1: { uint16_t e = (uint16_t)expect;
+                                      swapped = __atomic_compare_exchange_n((uint16_t *)rw_addr, &e, (uint16_t)val,
+                                                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                                      old = e; break; }
+                            case 2: { uint32_t e = (uint32_t)expect;
+                                      swapped = __atomic_compare_exchange_n((uint32_t *)rw_addr, &e, (uint32_t)val,
+                                                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                                      old = e; break; }
+                            default: { uint64_t e = expect;
+                                       swapped = __atomic_compare_exchange_n((uint64_t *)rw_addr, &e, val,
+                                                                             0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                                       old = e; break; }
+                            }
+                        }
+                        if (rs != 31) state.__x[rs] = old & szmask;
+                        emulated = 1;
+                        {
+                            static int cas_mach_n;
+                            if (cas_mach_n < 8)
+                                dprintf(STDERR_FILENO,
+                                    "[cas-emul] ml839 #%d insn=0x%08x size=%d Rs=x%d Rt=x%d addr=0x%llx "
+                                    "rw=0x%llx old=0x%llx new=0x%llx swapped=%d%s\n",
+                                    ++cas_mach_n, insn, (int)nbytes, rs, rt,
+                                    (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                    (unsigned long long)(old & szmask), (unsigned long long)val, swapped,
+                                    (rw_addr & ((1ULL << size_lg2) - 1)) ? " unaligned" : "");
                         }
                     }
                     /* ml350 DISCRIMINATOR: alias EXISTS but the instruction is not
