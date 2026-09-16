@@ -15010,6 +15010,25 @@ static void ios_fexva_note( void *base, SIZE_T size, void *peb )
 static struct { uint64_t base; void *peb; } ios_deadtop[IOS_DEADTOP_MAX];
 static unsigned ios_deadtop_n;
 
+/* ml841: is this address inside a recorded FEX arena (a windowed 16MB
+ * reservation)? Those hold FEX's own data — rpmalloc spans, thread state,
+ * lookup caches — never guest code. */
+static int ios_fexva_contains( const void *addr )
+{
+    uint64_t a = (uint64_t)(uintptr_t)addr;
+    unsigned i;
+    int hit = 0;
+
+    pthread_mutex_lock( &ios_fexva_lock );
+    for (i = 0; i < ios_fexva_n; i++)
+    {
+        if (!ios_fexva[i].base) continue;
+        if (a >= ios_fexva[i].base && a < ios_fexva[i].base + ios_fexva[i].size) { hit = 1; break; }
+    }
+    pthread_mutex_unlock( &ios_fexva_lock );
+    return hit;
+}
+
 static void ios_fexva_release( void *base )      /* guard 2 */
 {
     uint64_t b = (uint64_t)(uintptr_t)base;
@@ -16184,6 +16203,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     unsigned int status = STATUS_SUCCESS;
     LPVOID addr = *addr_ptr;
     SIZE_T size = *size_ptr;
+    int hide_decommit_from_fex = 0;   /* ml841 */
 
     TRACE("%p %p %08lx %x\n", process, addr, size, type );
 
@@ -16311,6 +16331,25 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     {
     case MEM_DECOMMIT:
         status = decommit_pages( view, base, size );
+        /* ml841: THE MID-LOAD SELF-DEADLOCK. Enter the Gungeon (0.1.94) hung
+         * with its only thread parked on the writer gate of FEX's
+         * InvalidationTracker::IntervalsLock. The thread was inside
+         * HandleImageMap (unique_lock held, inserting VERSION.dll's second
+         * section) when rpmalloc — FEX's own allocator, freeing the old
+         * interval-vector buffer — decommitted a span (this range). The
+         * arm64ec ntdll then reported the free to FEX (NotifyMemoryFree,
+         * After=TRUE, status 0), which took IntervalsLock again on the same
+         * thread: a std::shared_mutex is not recursive, so it waited forever.
+         * Heap-state dependent, hence intermittent.
+         *
+         * FEX only acts on that notification when the free SUCCEEDED, and a
+         * decommit inside FEX's own arenas has nothing to invalidate (no
+         * guest code lives there). So do the decommit, then report failure
+         * to the caller. rpmalloc's os_mdecommit ignores the result (its
+         * assert is compiled out), and it never touches a decommitted
+         * sub-span again; the zeroing contract still holds because the pages
+         * were remapped above. */
+        if (!status && size && ios_fexva_contains( base )) hide_decommit_from_fex = 1;
         break;
     case MEM_RELEASE:
         if (!size) size = view->size;
@@ -16336,6 +16375,14 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         *size_ptr = size;
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (hide_decommit_from_fex)
+    {
+        static unsigned long hidden_n;
+        if (++hidden_n <= 8 || (hidden_n % 256) == 0)
+            dprintf( 2, "[decommit-hide] ml841 #%lu base=%p size=0x%lx done, reported as failed so "
+                        "FEX's tracker is not re-entered\n", hidden_n, base, (unsigned long)size );
+        return STATUS_UNABLE_TO_FREE_VM;
+    }
     return status;
 }
 
