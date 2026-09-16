@@ -13902,6 +13902,31 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
  *             NtAllocateVirtualMemory   (NTDLL.@)
  *             ZwAllocateVirtualMemory   (NTDLL.@)
  */
+/* ml842: THE MID-LOAD SELF-DEADLOCK, second half. ml841 hid FEX's own decommits
+ * from FEX, and Enter the Gungeon still hung at the same DLL load with its only
+ * thread parked on the tracker's writer gate ([hang-dump] in 0.1.96 showed every
+ * other thread idle). rpmalloc decommits a page's tail when it goes back to the
+ * cache and RE-COMMITS it on the next allocation from that page
+ * (page_commit_memory_pages). That MEM_COMMIT succeeds, the arm64ec ntdll
+ * reports it to FEX (NotifyMemoryAlloc, After, status 0), and
+ * HandleMemoryProtectionNotification takes IntervalsLock — on the thread that
+ * already holds it inside HandleImageMap. The tracker is in the prebuilt
+ * xtajit64.dll, so the fix is the same as ml841: the commit is done (on this
+ * port a decommit only zeroes, the pages never left), then reported as failed.
+ * FEX acts on the report only when the call succeeded; rpmalloc's os_mcommit
+ * ignores the result (assert compiled out). Only a bare MEM_COMMIT inside a
+ * recorded FEX arena: reservations must keep returning their address. */
+static int ios_fexva_contains( const void *addr );
+static NTSTATUS ios_hide_fex_commit( NTSTATUS st, ULONG type, void *addr, SIZE_T size )
+{
+    static unsigned long hidden_n;
+    if (st || type != MEM_COMMIT || !addr || !ios_fexva_contains( addr )) return st;
+    if (++hidden_n <= 8 || (hidden_n % 256) == 0)
+        dprintf( 2, "[commit-hide] ml842 #%lu base=%p size=0x%lx done, reported as failed so "
+                    "FEX's tracker is not re-entered\n", hidden_n, addr, (unsigned long)size );
+    return STATUS_ALREADY_COMMITTED;
+}
+
 NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                          SIZE_T *size_ptr, ULONG type, ULONG protect )
 {
@@ -14806,7 +14831,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                          hit == (unsigned)-1 ? 0 : ios_steer[hit].freed, ios_steer_n );
             }
         }
-        return st;
+        return ios_hide_fex_commit( st, type, *ret, *size_ptr );   /* ml842 */
     }
 #else
     return allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
@@ -16182,7 +16207,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                          hit == (unsigned)-1 ? 0 : ios_steer[hit].freed, ios_steer_n );
             }
         }
-        return st;
+        return ios_hide_fex_commit( st, type, *ret, *size_ptr );   /* ml842 */
     }
 #else
     return allocate_virtual_memory( ret, size_ptr, type, protect,
