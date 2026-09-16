@@ -490,6 +490,9 @@ void ios_wx_forget_range( unsigned long long lo, unsigned long long hi )
     }
 }
 
+/* ml845: defined next to ios_hang_dump; used by the AV dump and the ticker. */
+void ios_tls_epoch_check( int verbose, const char *why );
+
 /* Last thread that took an exec fault at a PE VA (i.e. made a native call
  * through the redirect path) — the game thread in practice. The [PROF]
  * sampler in server_ios.c follows this so it profiles the presenting
@@ -7623,6 +7626,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                              cidx, cbase, csize, cfree ? "FREE(recycled!)" : "live",
                              (fault_addr >= cbase && fault_addr < cbase + csize) ? 1 : 0 );
                 dprintf( 2, " regs=%d rev=ml613\n", have_regs );
+                ios_tls_epoch_check( 1, "av" );   /* ml845: every thread's static-init epoch */
 
                 /* iOS-Madeira ml619 [tree-caller]: NAME THE CORRUPTED CONTAINER.
                  *
@@ -13062,10 +13066,227 @@ void ios_wait_chain_snapshot( const char *why )
  * [census-hold] stamp naming a holder; without a full thread dump the reader
  * that never let go could not be identified. Runs on an app thread: the
  * census and the dump only read other threads' state. */
+/* ================= ml845 MSVC THREAD-SAFE-STATIC EPOCH GUARD =================
+ *
+ * Enter the Gungeon (0.1.99) died in UnityPlayer.dll's Camera::DoRender with a
+ * NULL vtable: the object was Camera::DefaultPerformRenderFunction::Instance()'s
+ * function-local static, and its guard ($TSS0) was still 0 -- the constructor
+ * had never run. MSVC's thread-safe statics decide that with ONE compare:
+ *
+ *     mov  rax, gs:[0x58]            ; TEB->ThreadLocalStoragePointer
+ *     mov  ecx, [_tls_index]
+ *     mov  rcx, [rax+rcx*8]          ; this module's TLS block, this thread
+ *     mov  eax, [rcx+4]              ; _Init_thread_epoch (template: INT_MIN)
+ *     cmp  [$TSS0], eax
+ *     jg   slow_path                 ; guard > epoch -> construct under lock
+ *     lea  rax, [instance]           ; else: assume already constructed
+ *
+ * _Init_global_epoch starts at INT_MIN and increments once per completed
+ * static, so a thread's epoch is NEVER >= 0 in a healthy process. The main
+ * thread's copy nevertheless read as >= 0 (the neighbouring guards held
+ * INT_MIN+2..+6, i.e. other threads were fine), the fast path was taken, and
+ * the uninitialised instance was returned. Which write got it there is not
+ * yet known -- the block is an 8-byte process-heap allocation made by
+ * alloc_thread_tls -- so this guard both REPORTS and REPAIRS it:
+ *
+ *   - every image whose TLS template is exactly [0, INT_MIN] (that is
+ *     _tls_start + _Init_thread_epoch and nothing else) is watched;
+ *   - for every registered thread of the process that loaded the image, the
+ *     epoch dword of its block is read; a value >= 0 is logged and reset to
+ *     INT_MIN. Resetting can only make the thread take the CRT's locked slow
+ *     path (which re-derives the truth from the guard) -- it can never make
+ *     it SKIP a construction -- so the repair is safe even against a racing
+ *     _Init_thread_footer, and a corrupted value would otherwise be fatal.
+ *
+ * Runs from the periodic cycle (silent unless it repairs), from the guest AV
+ * dump and from the hang dump (verbose: every thread's epoch is printed). All
+ * guest reads go through mach_vm_read_overwrite; nothing is dereferenced. */
+#define IOS_TLSE_MAX_MODS 8
+struct ios_tlse_mod {
+    uintptr_t base;         /* guest image base */
+    uintptr_t index_addr;   /* &_tls_index (absolute, relocated) */
+    uintptr_t tmpl;         /* StartAddressOfRawData */
+    uintptr_t peb;          /* pseudo-process that loaded it; 0 = unresolved */
+    char name[24];
+};
+static struct ios_tlse_mod ios_tlse_mods[IOS_TLSE_MAX_MODS];
+static int ios_tlse_nmods, ios_tlse_seen_total = -1;
+static const unsigned char ios_tlse_template[8] = { 0, 0, 0, 0, 0, 0, 0, 0x80 };
+
+static int ios_tlse_read( uintptr_t addr, void *out, size_t n )
+{
+    mach_vm_size_t got = 0;
+    if (!addr) return 0;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, (mach_vm_size_t)n,
+                                   (mach_vm_address_t)(uintptr_t)out, &got ) == KERN_SUCCESS && got == n;
+}
+
+/* Does the loader list of `peb` contain an entry with DllBase == base? Bounded,
+ * read-only walk of InLoadOrderModuleList. */
+static int ios_tlse_peb_has_module( uintptr_t peb, uintptr_t base )
+{
+    uintptr_t ldr = 0, head, cur = 0;
+    int n;
+    if (!ios_tlse_read( peb + offsetof(PEB, LdrData), &ldr, sizeof(ldr) ) || !ldr) return 0;
+    head = ldr + offsetof(PEB_LDR_DATA, InLoadOrderModuleList);
+    if (!ios_tlse_read( head, &cur, sizeof(cur) )) return 0;            /* head.Flink */
+    for (n = 0; n < 512 && cur && cur != head; n++)
+    {
+        uintptr_t dllbase = 0, next = 0;
+        if (!ios_tlse_read( cur + offsetof(LDR_DATA_TABLE_ENTRY, DllBase), &dllbase, sizeof(dllbase) )) return 0;
+        if (dllbase == base) return 1;
+        if (!ios_tlse_read( cur + offsetof(LDR_DATA_TABLE_ENTRY, InLoadOrderLinks), &next, sizeof(next) )) return 0;
+        cur = next;
+    }
+    return 0;
+}
+
+/* Rescan the image ledger when its count changes: PE32+ headers -> TLS
+ * directory -> keep the images whose template is [0, INT_MIN]. */
+static void ios_tlse_scan(void)
+{
+    extern int ios_jit_mapping_total(void);
+    extern int ios_jit_mapping_pe_image( int i, void **pe_base, size_t *size );
+    extern const char *ios_pe_module_name( const void *image_base, size_t image_size );
+    static unsigned calls;
+    int total = ios_jit_mapping_total(), i, j;
+
+    /* Rescan when the ledger grows, and every 64th call regardless (a freed
+     * slot reused by a new image does not change the count). */
+    if (total == ios_tlse_seen_total && (++calls & 63)) return;
+    ios_tlse_seen_total = total;
+    for (i = 0; i < total; i++)
+    {
+        void *pe = NULL;
+        size_t sz = 0;
+        uintptr_t b;
+        uint32_t e_lfanew = 0, sig = 0, dd[2] = { 0, 0 }, zf = 0;
+        uint16_t magic = 0;
+        uint64_t start = 0, end = 0, idx_addr = 0;
+        unsigned char t[8];
+        const char *nm;
+
+        if (!ios_jit_mapping_pe_image( i, &pe, &sz )) continue;
+        b = (uintptr_t)pe;
+        for (j = 0; j < ios_tlse_nmods; j++) if (ios_tlse_mods[j].base == b) break;
+        if (j < ios_tlse_nmods) continue;
+        if (ios_tlse_nmods >= IOS_TLSE_MAX_MODS) break;
+        if (!ios_tlse_read( b + 0x3c, &e_lfanew, 4 ) || e_lfanew < 0x40 || e_lfanew > 0x1000) continue;
+        if (!ios_tlse_read( b + e_lfanew, &sig, 4 ) || sig != 0x00004550) continue;
+        if (!ios_tlse_read( b + e_lfanew + 24, &magic, 2 ) || magic != 0x20b) continue;   /* PE32+ */
+        if (!ios_tlse_read( b + e_lfanew + 24 + 112 + 9 * 8, dd, 8 ) || !dd[0] || dd[1] < 40) continue;
+        if (!ios_tlse_read( b + dd[0], &start, 8 ) || !ios_tlse_read( b + dd[0] + 8, &end, 8 ) ||
+            !ios_tlse_read( b + dd[0] + 16, &idx_addr, 8 ) || !ios_tlse_read( b + dd[0] + 32, &zf, 4 ))
+            continue;
+        if (end != start + 8 || zf) continue;
+        if (!ios_tlse_read( (uintptr_t)start, t, 8 ) || memcmp( t, ios_tlse_template, 8 )) continue;
+
+        nm = ios_pe_module_name( pe, sz );
+        j = ios_tlse_nmods;
+        ios_tlse_mods[j].base = b;
+        ios_tlse_mods[j].index_addr = (uintptr_t)idx_addr;
+        ios_tlse_mods[j].tmpl = (uintptr_t)start;
+        ios_tlse_mods[j].peb = 0;
+        snprintf( ios_tlse_mods[j].name, sizeof(ios_tlse_mods[j].name), "%s", nm ? nm : "?" );
+        __sync_synchronize();
+        ios_tlse_nmods = j + 1;
+        dprintf( 2, "[tls-epoch] ml845 watching %s base=%p: TLS template is [0, INT_MIN] "
+                    "(MSVC _Init_thread_epoch only), _tls_index@%p, template@%p\n",
+                 ios_tlse_mods[j].name, pe, (void *)(uintptr_t)idx_addr, (void *)(uintptr_t)start );
+    }
+}
+
+void ios_tls_epoch_check( int verbose, const char *why )
+{
+    static unsigned repairs, refused, dumped, tmpl_bad;
+    int m, i, nthreads;
+
+    ios_tlse_scan();
+    if (!ios_tlse_nmods) return;
+    nthreads = ios_thread_registry_count();
+
+    for (m = 0; m < ios_tlse_nmods; m++)
+    {
+        struct ios_tlse_mod *md = &ios_tlse_mods[m];
+        uint32_t idx = 0;
+        unsigned char t[8];
+
+        /* The image may have been unmapped, or its template damaged: say so
+         * (once) and do not act on it. */
+        if (!ios_tlse_read( md->tmpl, t, 8 ) || memcmp( t, ios_tlse_template, 8 ))
+        {
+            if (__sync_add_and_fetch( &tmpl_bad, 1 ) <= 4)
+                dprintf( 2, "[tls-epoch] ml845 %s: template of %s at %p is no longer [0, INT_MIN] "
+                            "(unmapped or overwritten) -- not touching its threads\n",
+                         why, md->name, (void *)md->tmpl );
+            continue;
+        }
+        if (!ios_tlse_read( md->index_addr, &idx, 4 ) || idx >= 512) continue;
+
+        for (i = 0; i < nthreads; i++)
+        {
+            uintptr_t teb = ios_thread_registry_teb( i ), arr = 0, blk = 0, tpeb = 0;
+            uint64_t tid = 0;
+            int32_t v[2];
+
+            if (!teb) continue;
+            if (!ios_tlse_read( teb + offsetof(TEB, Peb), &tpeb, sizeof(tpeb) ) || !tpeb) continue;
+            /* Only threads of the pseudo-process that loaded this image: another
+             * process's slot `idx` belongs to a different module. */
+            if (!md->peb)
+            {
+                if (!ios_tlse_peb_has_module( tpeb, md->base )) continue;
+                md->peb = tpeb;
+            }
+            if (tpeb != md->peb) continue;
+            /* LdrShutdownThread NULLs the array pointer before freeing, so a
+             * cleanly exited thread is skipped here. */
+            if (!ios_tlse_read( teb + offsetof(TEB, ThreadLocalStoragePointer), &arr, sizeof(arr) ) || !arr) continue;
+            if (!ios_tlse_read( arr + (uintptr_t)idx * sizeof(void *), &blk, sizeof(blk) ) || !blk) continue;
+            if (!ios_tlse_read( blk, v, 8 )) continue;
+            ios_tlse_read( teb + offsetof(TEB, ClientId) + sizeof(HANDLE), &tid, sizeof(tid) );
+
+            if (verbose && dumped < 96)
+            {
+                dumped++;
+                dprintf( 2, "[tls-epoch] ml845 %s: %s tid=%04llx teb=%p slot=%u block=%p "
+                            "tls_start=0x%08x epoch=0x%08x%s\n",
+                         why, md->name, (unsigned long long)tid, (void *)teb, idx, (void *)blk,
+                         (unsigned)v[0], (unsigned)v[1],
+                         v[1] >= 0 ? "  <== IMPOSSIBLE (>= 0): this thread skips every uninitialised static" : "" );
+            }
+            if (v[1] < 0) continue;
+
+            if (v[0] != 0)
+            {
+                /* Not the block we think it is (tls_start must be 0): report only. */
+                if (__sync_add_and_fetch( &refused, 1 ) <= 8)
+                    dprintf( 2, "[tls-epoch] ml845 %s: %s tid=%04llx block=%p epoch=0x%08x but dword0=0x%08x "
+                                "-- not an [0, epoch] block, NOT repaired\n",
+                             why, md->name, (unsigned long long)tid, (void *)blk, (unsigned)v[1], (unsigned)v[0] );
+                continue;
+            }
+            {
+                int32_t fix = (int32_t)0x80000000u;
+                kern_return_t kr = mach_vm_write( mach_task_self(), (mach_vm_address_t)(blk + 4),
+                                                  (vm_offset_t)(uintptr_t)&fix, 4 );
+                unsigned n = __sync_add_and_fetch( &repairs, 1 );
+                if (n <= 32 || (n & 0x3f) == 0)
+                    dprintf( 2, "[tls-epoch] ml845 %s: REPAIR #%u %s tid=%04llx teb=%p slot=%u block=%p "
+                                "epoch=0x%08x -> 0x80000000 (kr=%d) -- the thread would have skipped every "
+                                "uninitialised static; find what wrote it\n",
+                             why, n, md->name, (unsigned long long)tid, (void *)teb, idx, (void *)blk,
+                             (unsigned)v[1], (int)kr );
+            }
+        }
+    }
+}
+
 void ios_hang_dump(const char *why)
 {
     fprintf(stderr, "[hang-dump] ml840 %s\n", why ? why : "");
     ios_lock_census();
+    ios_tls_epoch_check( 1, "hang-dump" );   /* ml845 */
     ios_dump_all_thread_stacks();
 }
 

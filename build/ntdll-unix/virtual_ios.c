@@ -164,6 +164,23 @@ struct ios_jit_mapping {
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
 
+/* ml845: read-only view of the image ledger for the TLS epoch guard
+ * (ios_tls_epoch_check in signal_arm64_ios.c). Lock-free snapshot; a slot
+ * whose pe_base is NULL or size is 0 is free/reclaimed and reported absent. */
+int ios_jit_mapping_total(void)
+{
+    return ios_jit_mapping_count;
+}
+
+int ios_jit_mapping_pe_image( int i, void **pe_base, size_t *size )
+{
+    if (i < 0 || i >= ios_jit_mapping_count) return 0;
+    if (!ios_jit_mappings[i].pe_base || !ios_jit_mappings[i].size) return 0;
+    *pe_base = ios_jit_mappings[i].pe_base;
+    *size = ios_jit_mappings[i].size;
+    return 1;
+}
+
 /* JIT pool head bump allocator. Owned by mprotect_exec's PE-image copy path
  * (was a function-local static there); file-scope so the S1 per-child
  * ntdll copy allocates from the same cursor instead of guessing pool usage.
@@ -725,8 +742,10 @@ static void *ios_pool_warmer_thread( void *arg )
             {
                 extern void ios_pump_sample(void);
                 extern void ios_thread_cpu_sample(void);
+                extern void ios_tls_epoch_check( int verbose, const char *why );
                 ios_pump_sample();
                 ios_thread_cpu_sample();   /* ml819 [thr-cpu]: self-throttled to 2 s; keep ungated */
+                ios_tls_epoch_check( 0, "tick" );   /* ml845: every cycle, cheap */
             }
             {
                 task_vm_info_data_t vmi;
