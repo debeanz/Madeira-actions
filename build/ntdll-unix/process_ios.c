@@ -2124,6 +2124,24 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                     dprintf(2, "[term-stack] rip=%llx stack=[%llx..%llx]\n",
                             (unsigned long long)rip, (unsigned long long)slimit,
                             (unsigned long long)sbase);
+                    /* ml851: the terminating thread's Win32 last error and the
+                     * NTSTATUS that produced it (RtlNtStatusToDosError stores
+                     * it in LastStatusValue). Untitled Goose Game (Unity
+                     * 2018.4, mono-2.0-bdwgc) abort()s from Mono's
+                     * mono_os_cond_timedwait: "SleepConditionVariableCS failed
+                     * with error 5" — ERROR_ACCESS_DENIED, which several
+                     * NTSTATUS values map to (STATUS_ACCESS_DENIED,
+                     * STATUS_THREAD_IS_TERMINATING, STATUS_PROCESS_IS_TERMINATING,
+                     * STATUS_INVALID_LOCK_SEQUENCE, ...). The wait itself
+                     * (RtlWaitOnAddress -> NtWaitForAlertByThreadId) can only
+                     * return ALERTED, TIMEOUT or INVALID_CID, so the status
+                     * names whichever layer actually failed. Nothing between
+                     * the failed call and abort() sets an error, so the TEB
+                     * still holds it here. */
+                    dprintf(2, "[term-stack] ml851 tid=%04x last_error=%u last_status=0x%08x\n",
+                            (unsigned)(ULONG_PTR)cur_teb->ClientId.UniqueThread,
+                            (unsigned)cur_teb->LastErrorValue,
+                            (unsigned)cur_teb->LastStatusValue);
                     dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
                             gregs[0], gregs[1], gregs[2], gregs[3],
                             gregs[4], gregs[5], gregs[6], gregs[7]);
