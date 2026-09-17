@@ -14009,14 +14009,53 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
  * ignores the result (assert compiled out). Only a bare MEM_COMMIT inside a
  * recorded FEX arena: reservations must keep returning their address. */
 static int ios_fexva_contains( const void *addr );
+
+/* ml852: a deliberate failure status that leaves the guest thread's Win32
+ * last error untouched.
+ *
+ * The ml841/ml842 hides run inside FEX's OWN allocator (rpmalloc) while FEX
+ * compiles a block, i.e. on the guest thread that is about to execute that
+ * block, and rpmalloc reaches us through kernelbase's VirtualAlloc/VirtualFree.
+ * Those wrappers turn any failure into SetLastError(RtlNtStatusToDosError(st)),
+ * so every hidden commit rewrote the guest thread's LastErrorValue — with
+ * STATUS_ALREADY_COMMITTED that is ERROR_ACCESS_DENIED (5). Untitled Goose Game
+ * (Unity 2018.4, mono-2.0-bdwgc) died from exactly that: a Mono thread's
+ * SleepConditionVariableCS timed out (LastError = ERROR_TIMEOUT), FEX then
+ * compiled the timeout branch on that thread, rpmalloc committed a page, the
+ * hide reported it failed, kernelbase set LastError = 5, and Mono's
+ * mono_os_cond_timedwait read GetLastError() != ERROR_TIMEOUT and aborted:
+ * output_log.txt "SleepConditionVariableCS failed with error 5", and the ml851
+ * probe showed last_error=5 last_status=0xc0000021 on the aborting thread.
+ * ~10,000 hides per run, so any x64 code that checks GetLastError() right
+ * after an API call is exposed.
+ *
+ * kernelbase always calls SetLastError on a nonzero status, so the only way
+ * to keep the value is to make that store a no-op: RtlNtStatusToDosError maps
+ * 0xC007xxxx (NTSTATUS_FROM_WIN32 convention) straight to its low word, so a
+ * status of 0xC0070000 | current LastErrorValue maps back to the current
+ * value. It is still nonzero, so VirtualAlloc/VirtualFree still return
+ * failure (rpmalloc ignores that) and the arm64ec ntdll still passes a failed
+ * status to FEX's NotifyMemoryAlloc/Free, which is what keeps the tracker
+ * from re-entering IntervalsLock (the whole point of ml841/ml842).
+ * LastStatusValue becomes the synthetic status; nothing reads it back on this
+ * path. Values above 0xffff (HRESULTs some apps stash) cannot be encoded, so
+ * those keep the old status. */
+static NTSTATUS ios_fail_keeping_last_error( NTSTATUS fallback )
+{
+    TEB *teb = NtCurrentTeb();
+    if (!teb || teb->LastErrorValue > 0xffff) return fallback;
+    return (NTSTATUS)(0xC0070000 | teb->LastErrorValue);
+}
+
 static NTSTATUS ios_hide_fex_commit( NTSTATUS st, ULONG type, void *addr, SIZE_T size )
 {
     static unsigned long hidden_n;
     if (st || type != MEM_COMMIT || !addr || !ios_fexva_contains( addr )) return st;
     if (++hidden_n <= 8 || (hidden_n % 256) == 0)
         dprintf( 2, "[commit-hide] ml842 #%lu base=%p size=0x%lx done, reported as failed so "
-                    "FEX's tracker is not re-entered\n", hidden_n, addr, (unsigned long)size );
-    return STATUS_ALREADY_COMMITTED;
+                    "FEX's tracker is not re-entered (ml852: last error kept)\n",
+                 hidden_n, addr, (unsigned long)size );
+    return ios_fail_keeping_last_error( STATUS_ALREADY_COMMITTED );   /* ml852 */
 }
 
 NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
@@ -16499,8 +16538,11 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         static unsigned long hidden_n;
         if (++hidden_n <= 8 || (hidden_n % 256) == 0)
             dprintf( 2, "[decommit-hide] ml841 #%lu base=%p size=0x%lx done, reported as failed so "
-                        "FEX's tracker is not re-entered\n", hidden_n, base, (unsigned long)size );
-        return STATUS_UNABLE_TO_FREE_VM;
+                        "FEX's tracker is not re-entered (ml852: last error kept)\n",
+                     hidden_n, base, (unsigned long)size );
+        /* ml852: same guest thread, same kernelbase SetLastError on the way
+         * out (VirtualFree) — see ios_fail_keeping_last_error. */
+        return ios_fail_keeping_last_error( STATUS_UNABLE_TO_FREE_VM );
     }
     return status;
 }
