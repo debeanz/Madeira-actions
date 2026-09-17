@@ -1304,7 +1304,10 @@ void ios_thread_cpu_sample(void)
 
     tkr = KERN_SUCCESS;
     mach_timebase_info( &tb );
-    if (last_ticks && now <= last_ticks) TC_SKIP(1);   /* ml820: 0.1.74 logged dt=6148914513 once */
+    /* ml847: 0.1.103 skipped every call for the whole run (last=0xffff...feb9c556,
+     * a negative tick count) because a bad baseline could never be replaced.
+     * Re-arm on the way out so the next call measures again. */
+    if (last_ticks && now <= last_ticks) { last_ticks = now; TC_SKIP(1); }   /* ml820: 0.1.74 logged dt=6148914513 once */
     if (last_ticks && tb.denom) ns = (now - last_ticks) * tb.numer / tb.denom;
     /* The normal between-samples return (the caller runs a few times a second),
      * so a streak of 30 here is already abnormal. */
@@ -4215,6 +4218,68 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                             extern void ios_jit_anon_alias_note_write( unsigned long long );
                             ios_jit_anon_alias_note_write( (unsigned long long)fault_addr );
+
+                            /* ================ ml847 GC-HEAP PAGE DEMOTION ==========
+                             *
+                             * Enter the Gungeon 0.1.103: booted to its loading screen and
+                             * sat at 0 fps -- the main thread took 3.8M of the run's 4.0M
+                             * emulated stores (Boehm GC sweeps and array fills, stride 4-8
+                             * across a 390 MB heap) at ~10 us a round trip: 38 of 60 s
+                             * inside this handler. Old Unity Mono's collector allocates its
+                             * heap PAGE_EXECUTE_READWRITE, so every guest write to managed
+                             * DATA is a Mach fault here.
+                             *
+                             * A Boehm heap page never holds code (the alias is tagged at
+                             * allocation from Boehm's `bytes + 1` request, see
+                             * ios_jit_anon_alias_is_boehm), guest x64 is executed through
+                             * FEX translations that never need the guest page's exec bit,
+                             * and this path never told FEX about writes anyway (ml635), so
+                             * the page can simply be made RW on its FIRST emulated write:
+                             * every later write lands natively. Mono CODE chunks are left
+                             * alone -- their XCHG backpatch faults feed the ml648 Mono
+                             * bridge and must keep trapping. Pool RX pages (FEX host code)
+                             * are never touched (in_jit). A page ml843 marked sticky (it
+                             * was executed natively) is skipped. No registry: the mapping
+                             * is the state, and an exec fault on a demoted guest page is
+                             * already handled by the anon-alias RX redirect.
+                             * Kill switch for A/B: MADEIRA_NO_PAGE_DEMOTE=1. */
+                            if (!in_jit)
+                            {
+                                extern int ios_jit_anon_alias_is_boehm( uintptr_t );
+                                static int demote_off = -1;
+                                if (demote_off < 0)
+                                {
+                                    const char *e = getenv( "MADEIRA_NO_PAGE_DEMOTE" );
+                                    demote_off = (e && e[0] == '1') ? 1 : 0;
+                                    dprintf( 2, "[demote] ml847 GC-heap page demotion %s\n",
+                                             demote_off ? "DISABLED (MADEIRA_NO_PAGE_DEMOTE)" : "enabled" );
+                                }
+                                if (!demote_off && ios_jit_anon_alias_is_boehm( (uintptr_t)fault_addr ))
+                                {
+                                    unsigned long long pg = (unsigned long long)fault_addr & ~0x3fffull;
+                                    static volatile unsigned demoted_n, failed_n, sticky_n;
+                                    int q, sticky = 0;
+                                    for (q = 0; q < IOS_WX_MAX; q++)
+                                        if (ios_wx_pages[q].page == pg) { sticky = ios_wx_pages[q].sticky; break; }
+                                    if (sticky)
+                                        __sync_add_and_fetch( &sticky_n, 1 );
+                                    else if (mprotect( (void *)(uintptr_t)pg, 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                                    {
+                                        unsigned d = __sync_add_and_fetch( &demoted_n, 1 );
+                                        if (d <= 8 || (d & 0x3ff) == 0)
+                                            dprintf( 2, "[demote] ml847 #%u GC-heap page 0x%llx -> RW on first "
+                                                        "emulated write (failed=%u sticky=%u)\n",
+                                                     d, pg, failed_n, sticky_n );
+                                    }
+                                    else
+                                    {
+                                        unsigned f = __sync_add_and_fetch( &failed_n, 1 );
+                                        if (f <= 4)
+                                            dprintf( 2, "[demote] ml847 mprotect(RW) FAILED page 0x%llx errno=%d\n",
+                                                     pg, errno );
+                                    }
+                                }
+                            }
 
                             /* ================ ml691 PAGE-GRANULAR W^X ==========
                              *

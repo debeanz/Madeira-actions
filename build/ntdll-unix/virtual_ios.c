@@ -1801,8 +1801,20 @@ struct ios_jit_anon_alias {
     uintptr_t user_va_end;
     uintptr_t jit_rw_alias;
     uintptr_t jit_rx_alias;
+    /* ml847: 1 = Boehm GC heap block. Old Unity Mono's collector asks for
+     * PAGE_EXECUTE_READWRITE heap in `bytes + 1` sized requests
+     * (GC_win32_get_mem: "+1 so adjacent allocations are not merged"), so a
+     * request size ending in ...001 is the GC heap and holds DATA only; Mono's
+     * code-manager chunks are exact page multiples and hold JIT code whose
+     * backpatch faults the ml648 Mono bridge must keep seeing. */
+    unsigned char boehm;
 };
 static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
+/* ml847: raw (unrounded) size of the executable allocation in flight on this
+ * thread, stashed at the NtAllocateVirtualMemory(Ex) entry and consumed
+ * (and cleared) when the anon RWX alias for it is registered. Thread-local so
+ * concurrent allocators cannot tag each other's regions. */
+static __thread SIZE_T ios_exec_alloc_req_size;
 static volatile int ios_jit_anon_alias_count = 0;
 /* ml630: census — live entries, tombstones (reclaimed slots) and the high-water
  * mark, so "how close are we to the ceiling" is answerable from any run. */
@@ -3021,6 +3033,18 @@ int ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
     }
     ios_jit_anon_aliases[idx].user_va_end = (uintptr_t)user_va + size;
     ios_jit_anon_aliases[idx].jit_rw_alias = (uintptr_t)jit_rw_alias;
+    /* ml847: tag Boehm GC heap blocks (see the struct comment); the stash is
+     * one-shot so a remap that is not an allocation (a protect) reads 0. */
+    ios_jit_anon_aliases[idx].boehm = (ios_exec_alloc_req_size & 0xfff) == 1;
+    if (ios_jit_anon_aliases[idx].boehm)
+    {
+        static int boehm_n;
+        if (boehm_n < 12)
+            dprintf(2, "[boehm-tag] ml847 #%d %p+0x%lx is GC heap (request 0x%lx): its pages will be "
+                       "demoted to RW on their first emulated write\n",
+                    ++boehm_n, user_va, (unsigned long)size, (unsigned long)ios_exec_alloc_req_size);
+    }
+    ios_exec_alloc_req_size = 0;
     ios_jit_anon_aliases[idx].jit_rx_alias = 0;  /* set via _set_rx */
     __sync_synchronize();
     /* ml648: retire the slot's previous occupant before it is overwritten, or a
@@ -3181,6 +3205,19 @@ uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr)
             return ios_jit_anon_aliases[i].jit_rw_alias +
                    (fault_addr - ios_jit_anon_aliases[i].user_va);
         }
+    }
+    return 0;
+}
+
+/* ml847: is this guest address inside a Boehm GC heap alias (data only)? */
+int ios_jit_anon_alias_is_boehm(uintptr_t addr)
+{
+    int n = ios_jit_anon_alias_count;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (addr >= ios_jit_anon_aliases[i].user_va &&
+            addr <  ios_jit_anon_aliases[i].user_va_end)
+            return ios_jit_anon_aliases[i].boehm;
     }
     return 0;
 }
@@ -14018,6 +14055,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
     if (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
     {
         static int execalloc_n;
+        ios_exec_alloc_req_size = size_ptr ? *size_ptr : 0;   /* ml847: raw size for the Boehm tag */
         if (execalloc_n < 20)
         {
             execalloc_n++;
@@ -15670,6 +15708,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
     if (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
     {
         static int execalloc_n;
+        ios_exec_alloc_req_size = size_ptr ? *size_ptr : 0;   /* ml847: raw size for the Boehm tag */
         if (execalloc_n < 20)
         {
             execalloc_n++;
