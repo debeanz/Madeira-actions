@@ -1316,6 +1316,7 @@ private struct OptionsSheet: View {
                                  }))
         }
         out.append(contentsOf: shaderCacheRows(g))
+        out.append(contentsOf: perGameSettingRows(g))   // ml849
         if case .playing(let t) = session, t == g.title {
             out.append(OptionRow(id: "forceclose", title: "Force close", systemImage: "xmark.octagon",
                                  destructive: true, checked: false,
@@ -1398,6 +1399,82 @@ private struct OptionsSheet: View {
                 }
             }
         }
+    }
+
+    // MARK: Per-game settings (ml849)
+
+    /// Resolution, the x86 memory-ordering switch and the frame rate cap for
+    /// this game. Each row cycles "Default" (the Settings value, shown in
+    /// brackets) and its options on tap or A, the way the shader cache row
+    /// toggles. Resolution and the TSO switch reach the game only at launch,
+    /// so they are disabled while it runs; the cap applies at once when this
+    /// game is the one playing, and Settings' cap comes back when it ends.
+    private func perGameSettingRows(_ g: LauncherGame) -> [OptionRow] {
+        let busy: Bool = busyGameIDs.contains(g.id)
+        let id: String = g.id
+        let s: GameSettings = library.gameSettings[id] ?? GameSettings()
+        let defaults = UserDefaults.standard
+        var out: [OptionRow] = []
+
+        let globalRes: String = defaults.string(forKey: "madeira.desktopResolution") ?? "960x540"
+        let resOptions: [String?] = [nil] + GameSettings.resolutionOptions.map { Optional($0) }
+        out.append(OptionRow(id: "resolution", title: "Resolution",
+                             systemImage: "rectangle.expand.vertical",
+                             destructive: false, checked: false,
+                             trailing: s.resolution ?? "Default (\(globalRes))",
+                             disabled: busy,
+                             action: {
+                                 let cur: Int = resOptions.firstIndex(where: { $0 == s.resolution }) ?? 0
+                                 let next: String? = resOptions[(cur + 1) % resOptions.count]
+                                 library.updateSettings(for: id) { $0.resolution = next }
+                             }))
+
+        let globalNoTSO: Bool = defaults.bool(forKey: "madeira.fexNoTSO")
+        let tsoText: String
+        switch s.noTSO {
+        case nil:          tsoText = "Default (\(globalNoTSO ? "On" : "Off"))"
+        case .some(true):  tsoText = "On"
+        case .some(false): tsoText = "Off"
+        }
+        out.append(OptionRow(id: "notso", title: "Skip x86 memory-ordering emulation",
+                             systemImage: "cpu",
+                             destructive: false, checked: false,
+                             trailing: tsoText,
+                             disabled: busy,
+                             action: {
+                                 let next: Bool?
+                                 switch s.noTSO {
+                                 case nil:          next = true
+                                 case .some(true):  next = false
+                                 case .some(false): next = nil
+                                 }
+                                 library.updateSettings(for: id) { $0.noTSO = next }
+                             }))
+
+        let capOptions: [Int?] = [nil] + FrameCap.allCases.map { Int($0.rawValue) }
+        let capText: String
+        if let raw = s.frameCap, let c = FrameCap(rawValue: Int32(raw)) {
+            capText = c.label
+        } else {
+            capText = "Default (\(FrameCap.saved.label))"
+        }
+        var playingThis: Bool = false
+        if case .playing(let t) = session, t == g.title { playingThis = true }
+        out.append(OptionRow(id: "framecap", title: "Frame rate cap",
+                             systemImage: "speedometer",
+                             destructive: false, checked: false,
+                             trailing: capText,
+                             disabled: false,
+                             action: {
+                                 let cur: Int = capOptions.firstIndex(where: { $0 == s.frameCap }) ?? 0
+                                 let next: Int? = capOptions[(cur + 1) % capOptions.count]
+                                 library.updateSettings(for: id) { $0.frameCap = next }
+                                 if playingThis {
+                                     let cap: FrameCap = next.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
+                                     FrameCap.apply(cap, persist: false)
+                                 }
+                             }))
+        return out
     }
 
     // MARK: Delete (ml830)

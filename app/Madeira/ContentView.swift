@@ -1480,10 +1480,8 @@ struct ContentView: View {
     /// to this size, so it also bounds what a game's own resolution menu
     /// can offer.
     @AppStorage("madeira.desktopResolution") private var desktopResolution = "960x540"
-    private static let desktopResolutions = [
-        "960x540", "1280x720", "1600x900", "1920x1080", "2048x1084", "2796x1290",
-        "1024x768", "1280x960",
-    ]
+    /// ml849: one list, shared with each game's own Resolution row.
+    private static let desktopResolutions = GameSettings.resolutionOptions
     /// Version of the Wine Mono runtime CI placed in the bundle's mono/
     /// folder (mscoree finds it via WINEDATADIR = bundle), or nil.
     static var bundledMonoVersion: String? {
@@ -1744,7 +1742,13 @@ struct ContentView: View {
         // fallback (4:3) and the 16:9 game was pillarboxed into it. Setting it
         // here — before desktopFullScreen — makes the first layout correct.
         // Harmless for the running-session path: the value is unchanged.
-        let (screenW0, screenH0) = desktopSize
+        // ml849: this game's own resolution and TSO choice (⋯ menu), or the
+        // Settings defaults. The resolution is the logical screen for the
+        // whole session part this game runs in; the TSO switch travels to the
+        // agent as the tso= line because FEX loads its config per process.
+        let perGame = GameLibrary.shared.settings(for: game.id)
+        let (screenW0, screenH0) = perGame.resolution.flatMap(GameSettings.size) ?? desktopSize
+        let effectiveNoTSO: Bool = perGame.noTSO ?? fexNoTSO
         setenv("MADEIRA_SCREEN_W", String(screenW0), 1)
         setenv("MADEIRA_SCREEN_H", String(screenH0), 1)
         let launchInSession: (String) -> Void = { args in
@@ -1752,18 +1756,28 @@ struct ContentView: View {
             // the launch, because the runtime's environment was fixed when it started.
             let cache = ShaderCache.launchValue(for: game)
             logStore.log("Games: launching \(game.title) → \(exePath) (shader cache: "
-                         + (cache == "off" ? "off" : ShaderCache.dirName(forGameID: game.id)) + ")")
+                         + (cache == "off" ? "off" : ShaderCache.dirName(forGameID: game.id))
+                         + ", TSO emulation " + (effectiveNoTSO ? "off" : "on")
+                         + (perGame.noTSO != nil ? " for this game" : "") + ")")
             if !args.isEmpty {
-                logStore.log("Games: \(game.title) — first launch at \(screenW0)x\(screenH0) (Unity: \(args))")
+                logStore.log("Games: \(game.title) — "
+                             + (perGame.resolution != nil ? "this game's resolution" : "first launch")
+                             + " \(screenW0)x\(screenH0) (Unity: \(args))")
             }
             // ml837: args = GameResolutionDefault's Unity screen options, or "".
-            SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, args: args, shaderCache: cache) { outcome in
+            SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, args: args, shaderCache: cache,
+                                          noTSO: effectiveNoTSO) { outcome in
                 switch outcome {
                 case .started(let pid):
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)
                     GameLibrary.shared.markPlayed(game)
                     GameLibrary.shared.noteStartedThisRun(game.id)   // ml837: user.reg lags the live registry
                     playingPid = pid
+                    // ml849: this game's frame rate cap; Settings' cap returns when it ends.
+                    if let raw = perGame.frameCap, let cap = FrameCap(rawValue: Int32(raw)) {
+                        FrameCap.apply(cap, persist: false)
+                        logStore.log("\(game.title): frame rate cap \(cap.label) for this game")
+                    }
                     unexitedGames[pid] = game.id
                     launcherSession = .playing(game.title)
                     watchHostedGame(pid: pid, title: game.title, gameID: game.id)
@@ -1812,7 +1826,13 @@ struct ContentView: View {
                 DispatchQueue.global(qos: .userInitiated).async {
                     var probe = game
                     probe.lastPlayed = lastPlayed
-                    let args = GameResolutionDefault.launchArgs(for: probe, width: screenW0, height: screenH0)
+                    let args: String
+                    if perGame.resolution != nil, let exe = probe.exe, GameResolutionDefault.isUnity(exe: exe) {
+                        // ml849: a per-game resolution is asked for on EVERY launch, saved size or not.
+                        args = GameResolutionDefault.arguments(width: screenW0, height: screenH0)
+                    } else {
+                        args = GameResolutionDefault.launchArgs(for: probe, width: screenW0, height: screenH0)
+                    }
                     DispatchQueue.main.async {
                         guard case .launching(let t2) = launcherSession, t2 == game.title,
                               launchingGame?.id == game.id else { return }
@@ -2057,6 +2077,8 @@ struct ContentView: View {
         SessionLauncher.shared.waitForExit(pid: pid) { code in
             done.done = true          // ml814: stop the stall watchdog
             unexitedGames.removeValue(forKey: pid)   // ml830: THIS instance's files are closed now
+            // ml849: a per-game frame rate cap ends with the game.
+            if FrameCap.current != FrameCap.saved { FrameCap.apply(FrameCap.saved, persist: false) }
             logStore.log("\(title) ended (exit code \(code))")
             // ml812: a non-zero exit is a crash (a clean quit and our WM_CLOSE
             // force-close both report 0). Remember it: the threads it left

@@ -62,6 +62,35 @@ struct LauncherGame: Identifiable, Equatable {
     }
 }
 
+/// ml849: one game's overrides of the Settings defaults. nil = "Default", i.e.
+/// the value in Settings at launch time. Kept in UserDefaults
+/// "madeira.launcher.gameSettings" as JSON keyed by game id.
+struct GameSettings: Codable, Equatable {
+    /// Logical screen for this game as "WxH" (Settings → Desktop resolution
+    /// otherwise). A Unity game also gets it as -screen-width/-height on every
+    /// launch; another game sees it as the display size.
+    var resolution: String? = nil
+    /// Skip x86 memory-ordering emulation for this game (FEX_TSOENABLED=0),
+    /// sent to the agent as the tso= line.
+    var noTSO: Bool? = nil
+    /// FrameCap raw value for this game; Settings' cap comes back when it ends.
+    var frameCap: Int? = nil
+
+    var isEmpty: Bool { resolution == nil && noTSO == nil && frameCap == nil }
+
+    /// The resolutions Settings offers; the per-game row cycles the same list.
+    static let resolutionOptions = [
+        "960x540", "1280x720", "1600x900", "1920x1080", "2048x1084", "2796x1290",
+        "1024x768", "1280x960",
+    ]
+
+    static func size(_ s: String) -> (w: Int, h: Int)? {
+        let parts = s.split(separator: "x").compactMap { Int($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return nil }
+        return (parts[0], parts[1])
+    }
+}
+
 final class GameLibrary: ObservableObject {
     static let shared = GameLibrary()
 
@@ -72,9 +101,12 @@ final class GameLibrary: ObservableObject {
     /// ml830: ids whose own shader cache switch is OFF (default is on).
     /// Persisted in UserDefaults "madeira.launcher.shaderCacheOff".
     @Published private(set) var shaderCacheOff: Set<String> = []
+    /// ml849: per-game overrides (resolution, TSO switch, frame cap) by game id.
+    @Published private(set) var gameSettings: [String: GameSettings] = [:]
 
     init() {
         let defaults = UserDefaults.standard
+        gameSettings = GameLibrary.loadGameSettings()
         // ml830: Hide is gone (Delete replaces it), so everything hidden by an
         // earlier build comes back once and can be deleted properly.
         if !defaults.bool(forKey: GameLibrary.hiddenMigratedKey) {
@@ -263,6 +295,35 @@ final class GameLibrary: ObservableObject {
         UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
         shaderCacheOff = off
         LogStore.shared.log("Games: shader cache \(on ? "on" : "off") for \(game(withID: id)?.title ?? id)")
+    }
+
+    // MARK: Per-game settings (ml849)
+
+    private static let gameSettingsKey = "madeira.launcher.gameSettings"
+
+    /// Reads UserDefaults, not the @Published copy: safe off the main thread.
+    static func loadGameSettings() -> [String: GameSettings] {
+        guard let data = UserDefaults.standard.data(forKey: gameSettingsKey),
+              let dict = try? JSONDecoder().decode([String: GameSettings].self, from: data) else { return [:] }
+        return dict
+    }
+
+    /// This game's overrides (all nil when it has none).
+    func settings(for id: String) -> GameSettings {
+        GameLibrary.loadGameSettings()[id] ?? GameSettings()
+    }
+
+    /// Main thread. A game whose overrides are all back to Default drops out
+    /// of the dictionary.
+    func updateSettings(for id: String, _ change: (inout GameSettings) -> Void) {
+        var all = GameLibrary.loadGameSettings()
+        var s = all[id] ?? GameSettings()
+        change(&s)
+        if s.isEmpty { all.removeValue(forKey: id) } else { all[id] = s }
+        if let data = try? JSONEncoder().encode(all) {
+            UserDefaults.standard.set(data, forKey: GameLibrary.gameSettingsKey)
+        }
+        gameSettings = all
     }
 
     // MARK: Resolution reset (ml837)

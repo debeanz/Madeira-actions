@@ -109,7 +109,11 @@ final class SessionLauncher {
     /// `shaderCache`: nil sends nothing (the game inherits the session's DXMT
     /// cache variables); otherwise "off" or an absolute cache directory, sent
     /// as the ml830 shadercache= line.
+    /// `noTSO`: ml849 — true/false sends "tso=off"/"tso=on", which the agent
+    /// turns into FEX_TSOENABLED=0/1 around this game's CreateProcessW; nil
+    /// sends nothing (the game inherits the runtime's setting).
     func launch(exe: String, dir: String, args: String = "", shaderCache: String? = nil,
+                noTSO: Bool? = nil,
                 readyTimeout: TimeInterval = 120,
                 completion: @escaping (Outcome) -> Void) {
         queue.async {
@@ -136,6 +140,9 @@ final class SessionLauncher {
                     .replacingOccurrences(of: "\r", with: "")
                     .replacingOccurrences(of: "\n", with: "")
                 text += "shadercache=\(value)\r\n"
+            }
+            if let noTSO = noTSO {
+                text += "tso=\(noTSO ? "off" : "on")\r\n"   // ml849
             }
             let tmp = self.agentDir.appendingPathComponent("launch.tmp")
             do {

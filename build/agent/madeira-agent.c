@@ -15,6 +15,7 @@
  *     dir=C:\Games\Hollow Knight
  *     args=<optional>
  *     shadercache=off  or  shadercache=/abs/unix/dir    (optional, ml830)
+ *     tso=off  or  tso=on                                 (optional, ml849)
  *
  * The agent deletes the request, CreateProcess()es the game with its folder
  * as working directory, and answers in C:\madeira\launch.result:
@@ -316,11 +317,12 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
 static void handle_request( void )
 {
     char *text = read_text_file( REQUEST_PATH );
-    char id[128], exe[1024], dir[1024], args[2048], cache[2048], result[256];
+    char id[128], exe[1024], dir[1024], args[2048], cache[2048], tso[16], result[256];
     WCHAR *wexe, *wdir, *wargs, *wcache = NULL;
     DWORD pid, err = 0;
     int cache_mode = 0;   /* ml830: 0 = leave the environment alone, 1 = off, 2 = cache dir */
-    struct saved_env saved[2];
+    int tso_mode = 0;     /* ml849: 0 = leave it, 1 = FEX_TSOENABLED=0 (off), 2 = FEX_TSOENABLED=1 (on) */
+    struct saved_env saved[3];
 
     if (!text) return;
     /* Delete first so a failure cannot be retried forever. */
@@ -380,6 +382,16 @@ static void handle_request( void )
         else if (cache[0] == '/') cache_mode = 2;
         else agent_log( "shadercache=%s ignored: neither \"off\" nor an absolute path", cache );
     }
+    /* ml849: per-game FEX memory-ordering switch. FEX rebuilds its environment
+     * in every process's ProcessInit (the CRT .CRT$FEXB InitEnv reads the
+     * PEB block CreateProcessW copied from ours), so the value set around this
+     * one CreateProcessW is what the game's own FEX context loads. */
+    if (get_field( text, "tso", tso, sizeof(tso) ))
+    {
+        if (!strcmp( tso, "off" )) tso_mode = 1;
+        else if (!strcmp( tso, "on" )) tso_mode = 2;
+        else agent_log( "tso=%s ignored: neither \"off\" nor \"on\"", tso );
+    }
     HeapFree( GetProcessHeap(), 0, text );
 
     wexe = utf8_to_wide( exe );
@@ -433,6 +445,22 @@ static void handle_request( void )
         }
     }
 
+    /* ml849: FEX_TSOENABLED for this CreateProcessW only, same snapshot rule. */
+    if (tso_mode)
+    {
+        if (!save_env( &saved[2], L"FEX_TSOENABLED" ))
+        {
+            agent_log( "tso override skipped: could not save the agent's environment" );
+            tso_mode = 0;
+        }
+        else
+        {
+            BOOL ok = SetEnvironmentVariableW( L"FEX_TSOENABLED", tso_mode == 1 ? L"0" : L"1" );
+            agent_log( "tso=%s: FEX_TSOENABLED=%s%s (agent had %ls)", tso, tso_mode == 1 ? "0" : "1",
+                       ok ? "" : " FAILED", saved[2].value ? saved[2].value : L"<unset>" );
+        }
+    }
+
     pid = start_process( wexe, wargs, wdir );
     if (!pid) err = GetLastError();
     if (cache_mode)
@@ -441,6 +469,7 @@ static void handle_request( void )
         restore_env( &saved[0] );
         restore_env( &saved[1] );
     }
+    if (tso_mode) restore_env( &saved[2] );   /* ml849 */
     if (pid) snprintf( result, sizeof(result), "id=%s\r\nok pid=%lu\r\n", id, (unsigned long)pid );
     else     snprintf( result, sizeof(result), "id=%s\r\nerr code=%lu\r\n", id, (unsigned long)err );
     agent_log( "%s", result );
