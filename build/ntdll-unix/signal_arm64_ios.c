@@ -13147,7 +13147,6 @@ static void ios_tlse_scan(void)
 {
     extern int ios_jit_mapping_total(void);
     extern int ios_jit_mapping_pe_image( int i, void **pe_base, size_t *size );
-    extern const char *ios_pe_module_name( const void *image_base, size_t image_size );
     static unsigned calls;
     int total = ios_jit_mapping_total(), i, j;
 
@@ -13181,7 +13180,7 @@ static void ios_tlse_scan(void)
         if (end != start + 8 || zf) continue;
         if (!ios_tlse_read( (uintptr_t)start, t, 8 ) || memcmp( t, ios_tlse_template, 8 )) continue;
 
-        nm = ios_pe_module_name( pe, sz );
+        nm = ios_pe_module_name( (uint64_t)b );   /* this file's export-name reader (mach_vm_read) */
         j = ios_tlse_nmods;
         ios_tlse_mods[j].base = b;
         ios_tlse_mods[j].index_addr = (uintptr_t)idx_addr;
