@@ -13347,6 +13347,248 @@ void ios_tls_epoch_check( int verbose, const char *why )
     }
 }
 
+/* ================= ml848 GUEST SAMPLING PROFILER ([gprof]) =================
+ *
+ * Enter the Gungeon 0.1.104: the main menu ran at 9-18 fps with the Unity
+ * render thread (UnityGfxDeviceWorker) at ~92% of a core and five job
+ * workers at 30-50% each, gameplay at 55-60 with the game thread at 72-78%
+ * and ~35k wineserver requests/s. [thr-cpu] names the thread but not the
+ * code, and the ml819-era [PROF] sampler is off in the app's normal
+ * (MADEIRA_QUIET) mode and buckets HOST addresses, which say nothing about
+ * FEX-translated guest code. This sampler follows the busiest registered
+ * guest thread (re-chosen every 2 s) at 200 Hz and attributes each sample to:
+ *   guest   host pc inside the JIT pool but not inside a PE image copy = a
+ *           FEX translation; the guest RIP is FEX's ThreadState (x28)+0x18,
+ *           block-granular. Named as module+RVA (symbolisable offline with
+ *           the module's PDB) or jit@page for Mono-generated code.
+ *   native  host pc inside a PE image copy = ARM64EC code (ntdll, DXMT
+ *           d3d11/dxgi, xtajit64 itself) running natively: module+RVA.
+ *   host    everything else (app binary, dyld cache): the pc's symbol, and
+ *           for system-library pcs (kernel waits) the caller's LR symbol --
+ *           this is where wineserver round trips and drawable waits show.
+ * Every 600 samples (~3 s) it prints the split and the top buckets, then
+ * halves the counts so the histogram tracks the current phase. Cost: 200
+ * suspend/get_state/resume per second on one thread, well under 1%.
+ * Off switch: MADEIRA_NO_GPROF=1. */
+enum { GP_SLOTS = 1024, GP_NAMES = 64 };
+struct gp_slot { uint64_t key; uint32_t n; };
+static struct gp_slot gp_hist[GP_SLOTS];
+static struct { uintptr_t base; size_t size; char name[24]; } gp_names[GP_NAMES];
+static int gp_nnames;
+
+static const char *gp_module_for( uintptr_t va, uintptr_t *base_out )
+{
+    extern int ios_jit_mapping_total(void);
+    extern int ios_jit_mapping_pe_image( int i, void **pe_base, size_t *size );
+    int i, total;
+    for (i = 0; i < gp_nnames; i++)
+        if (va >= gp_names[i].base && va < gp_names[i].base + gp_names[i].size)
+        { *base_out = gp_names[i].base; return gp_names[i].name; }
+    total = ios_jit_mapping_total();
+    for (i = 0; i < total; i++)
+    {
+        void *pe = NULL; size_t sz = 0;
+        if (!ios_jit_mapping_pe_image( i, &pe, &sz )) continue;
+        if (va >= (uintptr_t)pe && va < (uintptr_t)pe + sz)
+        {
+            const char *nm = ios_pe_module_name( (uint64_t)(uintptr_t)pe );
+            if (gp_nnames < GP_NAMES)
+            {
+                int j = gp_nnames;
+                gp_names[j].base = (uintptr_t)pe; gp_names[j].size = sz;
+                snprintf( gp_names[j].name, sizeof(gp_names[j].name), "%s", nm ? nm : "?" );
+                gp_nnames = j + 1;
+                *base_out = (uintptr_t)pe;
+                return gp_names[j].name;
+            }
+            *base_out = (uintptr_t)pe;
+            return nm ? nm : "?";
+        }
+    }
+    return NULL;
+}
+
+static void gp_count( uint64_t key )
+{
+    int i, victim = 0;
+    for (i = 0; i < GP_SLOTS; i++)
+    {
+        if (gp_hist[i].n && gp_hist[i].key == key) { gp_hist[i].n++; return; }
+        if (!gp_hist[i].n) { gp_hist[i].key = key; gp_hist[i].n = 1; return; }
+        if (gp_hist[i].n < gp_hist[victim].n) victim = i;
+    }
+    gp_hist[victim].key = key; gp_hist[victim].n = 1;   /* full: evict the coldest */
+}
+
+/* key layout: top 4 bits = kind (1 guest-module, 2 guest-jit, 3 native, 4 host-pc, 5 host-lr),
+ * low 60 bits = address >> 6 (64-byte buckets). */
+#define GP_KEY(kind, addr) (((uint64_t)(kind) << 60) | (((uint64_t)(addr) >> 6) & ((1ull << 60) - 1)))
+
+static void *ios_gprof_thread( void *arg )
+{
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t );
+    extern int ios_jit_pool_addr_to_pe( uintptr_t addr, uintptr_t *pe_va );
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    mach_port_t self = pthread_mach_thread_np( pthread_self() );
+    mach_port_t cur = MACH_PORT_NULL;
+    unsigned iter = 0, n = 0, n_guest = 0, n_native = 0, n_host = 0, n_nostate = 0;
+    char tname[48] = "";
+    (void)arg;
+    pthread_setname_np( "wine-gprof" );
+
+    for (;;)
+    {
+        usleep( 5000 );
+        /* (re)choose the busiest registered guest thread every ~2 s */
+        if ((iter++ % 400) == 0)
+        {
+            thread_act_array_t tl = NULL;
+            mach_msg_type_number_t tc = 0, k;
+            if (task_threads( mach_task_self(), &tl, &tc ) == KERN_SUCCESS)
+            {
+                integer_t best_cpu = -1;
+                mach_port_t best = MACH_PORT_NULL;
+                for (k = 0; k < tc; k++)
+                {
+                    thread_basic_info_data_t bi;
+                    mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+                    if (tl[k] == self || !ios_thread_is_registered( tl[k] )) continue;
+                    if (thread_info( tl[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic ) != KERN_SUCCESS) continue;
+                    if (bi.cpu_usage > best_cpu) { best_cpu = bi.cpu_usage; best = tl[k]; }
+                }
+                if (best != MACH_PORT_NULL && best != cur)
+                {
+                    pthread_t pt = pthread_from_mach_thread_np( best );
+                    tname[0] = 0;
+                    if (pt) pthread_getname_np( pt, tname, sizeof(tname) );
+                    if (!tname[0])
+                    {
+                        int r, cnt = ios_thread_registry_count();
+                        for (r = 0; r < cnt; r++)
+                            if (ios_thread_registry_mach( r ) == best && ios_thread_registry_teb( r ))
+                            {
+                                uint64_t tid = 0;
+                                ios_tlse_read( ios_thread_registry_teb( r ) + offsetof(TEB, ClientId) + sizeof(HANDLE), &tid, sizeof(tid) );
+                                snprintf( tname, sizeof(tname), "w%04llx", (unsigned long long)tid );
+                                break;
+                            }
+                    }
+                    if (cur != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), cur );
+                    mach_port_mod_refs( mach_task_self(), best, MACH_PORT_RIGHT_SEND, 1 );
+                    cur = best;
+                    memset( gp_hist, 0, sizeof(gp_hist) );
+                    n = n_guest = n_native = n_host = n_nostate = 0;
+                    dprintf( 2, "[gprof] ml848 following '%s' port=0x%x cpu=%d\n", tname, cur, (int)best_cpu );
+                }
+                for (k = 0; k < tc; k++) mach_port_deallocate( mach_task_self(), tl[k] );
+                vm_deallocate( mach_task_self(), (vm_address_t)tl, tc * sizeof(*tl) );
+            }
+        }
+        if (cur == MACH_PORT_NULL) continue;
+
+        {
+            arm_thread_state64_t st;
+            mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            uint64_t pc, lr, x28;
+            uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, sz = ios_jit_pool_size_global, pe = 0;
+            if (thread_suspend( cur ) != KERN_SUCCESS) { mach_port_deallocate( mach_task_self(), cur ); cur = MACH_PORT_NULL; continue; }
+            if (thread_get_state( cur, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) != KERN_SUCCESS)
+            { thread_resume( cur ); n_nostate++; continue; }
+            thread_resume( cur );
+            pc = (uint64_t)__darwin_arm_thread_state64_get_pc( st );
+            lr = (uint64_t)__darwin_arm_thread_state64_get_lr( st );
+            x28 = st.__x[28];
+            n++;
+            if (rx && sz && pc >= rx && pc < rx + sz)
+            {
+                if (ios_jit_pool_addr_to_pe( (uintptr_t)pc, &pe ))
+                {   /* ARM64EC native code running from its pool copy */
+                    n_native++;
+                    gp_count( GP_KEY( 3, pe ) );
+                }
+                else
+                {   /* FEX translation: block-granular guest RIP from ThreadState */
+                    uint64_t grip = 0;
+                    n_guest++;
+                    if (x28 > 0x10000 && ios_tlse_read( (uintptr_t)x28 + 0x18, &grip, 8 ) && grip > 0x10000)
+                    {
+                        uintptr_t mb = 0;
+                        if (gp_module_for( (uintptr_t)grip, &mb )) gp_count( GP_KEY( 1, grip ) );
+                        else if (ios_jit_anon_alias_lookup( (uintptr_t)grip )) gp_count( GP_KEY( 2, grip & ~0xfffull ) );
+                        else gp_count( GP_KEY( 2, grip ) );
+                    }
+                    else gp_count( GP_KEY( 2, 0 ) );
+                }
+            }
+            else
+            {
+                Dl_info di;
+                n_host++;
+                if (dladdr( (void *)(uintptr_t)pc, &di ) && di.dli_fname &&
+                    (strstr( di.dli_fname, "/usr/lib/" ) || strstr( di.dli_fname, "/System/" )))
+                    gp_count( GP_KEY( 5, lr ) );       /* in a system library: name the caller */
+                else
+                    gp_count( GP_KEY( 4, pc ) );
+            }
+        }
+
+        if (n && (n % 600) == 0)
+        {
+            char line[900];
+            int len, rank, i;
+            len = snprintf( line, sizeof(line), "[gprof] ml848 '%s' n=%u guest=%u%% native=%u%% host=%u%% nostate=%u | top:",
+                            tname, n, n_guest * 100 / n, n_native * 100 / n, n_host * 100 / n, n_nostate );
+            for (rank = 0; rank < 14 && len < (int)sizeof(line) - 80; rank++)
+            {
+                int best = -1; uint32_t bc = 0;
+                uint64_t key, addr; unsigned kind;
+                uintptr_t mb = 0;
+                const char *nm;
+                for (i = 0; i < GP_SLOTS; i++) if (gp_hist[i].n > bc) { bc = gp_hist[i].n; best = i; }
+                if (best < 0 || bc < 3) break;
+                key = gp_hist[best].key; gp_hist[best].n = 0;
+                kind = (unsigned)(key >> 60); addr = (key & ((1ull << 60) - 1)) << 6;
+                switch (kind)
+                {
+                case 1: case 3:
+                    nm = gp_module_for( (uintptr_t)addr, &mb );
+                    len += snprintf( line + len, sizeof(line) - len, " %s%s+0x%llx*%u", kind == 3 ? "ec:" : "",
+                                     nm ? nm : "?", (unsigned long long)(addr - mb), bc );
+                    break;
+                case 2:
+                    len += snprintf( line + len, sizeof(line) - len, " jit@0x%llx*%u", (unsigned long long)addr, bc );
+                    break;
+                default:
+                {
+                    Dl_info di;
+                    if (dladdr( (void *)(uintptr_t)addr, &di ) && di.dli_sname)
+                        len += snprintf( line + len, sizeof(line) - len, " %s%s+0x%llx*%u", kind == 5 ? "host-lr:" : "host:",
+                                         di.dli_sname, (unsigned long long)(addr - (uintptr_t)di.dli_saddr), bc );
+                    else
+                        len += snprintf( line + len, sizeof(line) - len, " %s0x%llx*%u", kind == 5 ? "host-lr:" : "host:",
+                                         (unsigned long long)addr, bc );
+                }
+                }
+            }
+            dprintf( 2, "%s\n", line );
+            for (i = 0; i < GP_SLOTS; i++) gp_hist[i].n >>= 1;
+            n = n_guest = n_native = n_host = 0;   /* per-window split */
+        }
+    }
+    return NULL;
+}
+
+void ios_gprof_start(void)
+{
+    static int started;
+    pthread_t t;
+    const char *e = getenv( "MADEIRA_NO_GPROF" );
+    if (started || (e && e[0] == '1')) return;
+    started = 1;
+    if (pthread_create( &t, NULL, ios_gprof_thread, NULL ) == 0) pthread_detach( t );
+}
+
 void ios_hang_dump(const char *why)
 {
     fprintf(stderr, "[hang-dump] ml840 %s\n", why ? why : "");

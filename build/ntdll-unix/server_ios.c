@@ -2888,6 +2888,10 @@ void server_init_process_done(void)
          * (unix side), or elsewhere — mapping the hot buckets tells us
          * where the ~1.4s/frame actually goes. Counts halve at each print
          * so the histogram tracks the current phase. */
+        {   /* ml848: guest-attributing sampler, on in every mode (see [gprof]) */
+            extern void ios_gprof_start(void);
+            ios_gprof_start();
+        }
         if (!getenv("MADEIRA_QUIET"))
         {
             /* iOS-Madeira 2026-07-05 quiet mode: the sampler thread_suspends

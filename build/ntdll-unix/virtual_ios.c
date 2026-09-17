@@ -181,6 +181,27 @@ int ios_jit_mapping_pe_image( int i, void **pe_base, size_t *size )
     return 1;
 }
 
+/* ml848: a pool address inside a PE image COPY (ARM64EC native code running
+ * from the pool) -> the equivalent PE VA, so a sampled host pc can be named
+ * as module+RVA. 0 when the address is not inside any image copy (FEX
+ * translations, tail carves). Lock-free snapshot. */
+int ios_jit_pool_addr_to_pe( uintptr_t addr, uintptr_t *pe_va )
+{
+    int i, n = ios_jit_mapping_count;
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t jb = (uintptr_t)ios_jit_mappings[i].jit_base;
+        size_t sz = ios_jit_mappings[i].size;
+        if (!ios_jit_mappings[i].pe_base || !jb || !sz) continue;
+        if (addr >= jb && addr < jb + sz)
+        {
+            *pe_va = (uintptr_t)ios_jit_mappings[i].pe_base + (addr - jb);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* JIT pool head bump allocator. Owned by mprotect_exec's PE-image copy path
  * (was a function-local static there); file-scope so the S1 per-child
  * ntdll copy allocates from the same cursor instead of guessing pool usage.
