@@ -490,7 +490,8 @@ void ios_wx_forget_range( unsigned long long lo, unsigned long long hi )
     }
 }
 
-/* ml845: defined next to ios_hang_dump; used by the AV dump and the ticker. */
+/* ml845: defined next to ios_hang_dump; used by the AV dump and the ticker
+ * (run 101 was a GitHub checkout 503, re-triggered). */
 void ios_tls_epoch_check( int verbose, const char *why );
 
 /* Last thread that took an exec fault at a PE VA (i.e. made a native call
