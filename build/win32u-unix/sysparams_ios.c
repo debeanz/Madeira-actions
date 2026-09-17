@@ -200,18 +200,49 @@ static struct monitor virtual_monitor =
 };
 
 #ifdef WINE_IOS
+/* Mode a game selected through ChangeDisplaySettings; 0 = desktop size.
+ * The desktop surface itself does not resize (the compositor and the
+ * SM_C{X,Y}SCREEN metrics stay at MADEIRA_SCREEN_W/H), but a game that
+ * re-queries ENUM_CURRENT_SETTINGS after a successful change must see
+ * what it asked for or it re-applies forever.
+ * ml850: remembered with the pseudo-process that set it — every game in
+ * this Mach process shares these statics, and a CDS_FULLSCREEN mode is
+ * per process on Windows (undone when that process goes away). */
+static UINT ios_current_mode_w, ios_current_mode_h;
+static DWORD ios_current_mode_pid;
+
 /* S2 virtual desktop: screen size for the virtual monitor. The app sets
  * MADEIRA_SCREEN_W/H (device pixels, e.g. 1170x2532) in desktop mode so
  * the wine desktop covers the whole display; default stays 1024x768 for
- * the games path. */
+ * the games path.
+ *
+ * ml850: re-read on every call. The app changes MADEIRA_SCREEN_W/H per
+ * game launch (ml849 per-game resolution, or a Settings change between
+ * games on a warm runtime), and win32u is ONE dylib shared by every
+ * pseudo-process, so a value cached on the first call froze the screen
+ * size at whatever the runtime booted with: the Metal host followed the
+ * new size (aspect) while the game was told the old one. When the size
+ * changes: forget a mode the previous game selected, resize the virtual
+ * monitor's work area and force the next display-cache refresh so the
+ * server's monitor union (the cursor clip reset rect) follows too. */
 static void ios_screen_size( int *w, int *h )
 {
     static int sw, sh;
-    if (!sw)
+    const char *we = getenv( "MADEIRA_SCREEN_W" ), *he = getenv( "MADEIRA_SCREEN_H" );
+    int nw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
+    int nh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
+
+    if (nw != sw || nh != sh)
     {
-        const char *we = getenv( "MADEIRA_SCREEN_W" ), *he = getenv( "MADEIRA_SCREEN_H" );
-        sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
-        sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
+        if (sw)
+            dprintf( 2, "[vmode] ml850 screen %dx%d -> %dx%d (MADEIRA_SCREEN_W/H changed)\n", sw, sh, nw, nh );
+        sw = nw;
+        sh = nh;
+        ios_current_mode_w = ios_current_mode_h = 0;
+        ios_current_mode_pid = 0;
+        virtual_monitor.rc_work.right = sw;
+        virtual_monitor.rc_work.bottom = sh;
+        monitor_update_serial = 0;   /* next update_display_cache() rebuilds + set_winstation_monitors */
     }
     *w = sw;
     *h = sh;
@@ -2902,6 +2933,15 @@ static BOOL lock_display_devices( BOOL force )
     pthread_mutex_lock( &display_lock );
 
     serial = get_monitor_update_serial();
+#ifdef WINE_IOS
+    {
+        /* ml850: a MADEIRA_SCREEN_W/H change (per-game resolution on a warm
+         * runtime) zeroes monitor_update_serial, so probe it BEFORE the
+         * up-to-date check or this process keeps the old virtual monitor. */
+        int sw, sh;
+        ios_screen_size( &sw, &sh );
+    }
+#endif
     if (!force && monitor_update_serial >= serial) return TRUE;
 
     /* services do not have any adapters, only a virtual monitor */
@@ -3895,12 +3935,12 @@ static const struct ios_mode ios_mode_table[] =
     { 2048, 1152 }, { 2560, 1440 }, { 2796, 1290 },
 };
 
-/* Mode a game selected through ChangeDisplaySettings; 0 = desktop size.
- * The desktop surface itself does not resize (the compositor and the
- * SM_C{X,Y}SCREEN metrics stay at MADEIRA_SCREEN_W/H), but a game that
- * re-queries ENUM_CURRENT_SETTINGS after a successful change must see
- * what it asked for or it re-applies forever. */
-static UINT ios_current_mode_w, ios_current_mode_h;
+/* ios_current_mode_w/h: see the definition next to ios_screen_size (ml850).
+ * A mode is only "current" for the pseudo-process that selected it. */
+static BOOL ios_current_mode_is_ours(void)
+{
+    return ios_current_mode_w && ios_current_mode_h && ios_current_mode_pid == GetCurrentProcessId();
+}
 
 static UINT ios_virtual_modes( struct ios_mode *out, UINT max )
 {
@@ -3944,7 +3984,7 @@ static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, D
     {
         devmode->dmPelsWidth = sw;
         devmode->dmPelsHeight = sh;
-        if (index == ENUM_CURRENT_SETTINGS && ios_current_mode_w && ios_current_mode_h)
+        if (index == ENUM_CURRENT_SETTINGS && ios_current_mode_is_ours())
         {
             devmode->dmPelsWidth = ios_current_mode_w;
             devmode->dmPelsHeight = ios_current_mode_h;
@@ -3990,8 +4030,8 @@ static LONG ios_virtual_change_display_settings( const DEVMODEW *devmode, DWORD 
     int sw, sh;
 
     ios_screen_size( &sw, &sh );
-    cur_w = ios_current_mode_w ? ios_current_mode_w : (UINT)sw;
-    cur_h = ios_current_mode_h ? ios_current_mode_h : (UINT)sh;
+    cur_w = ios_current_mode_is_ours() ? ios_current_mode_w : (UINT)sw;
+    cur_h = ios_current_mode_is_ours() ? ios_current_mode_h : (UINT)sh;
 
     if (!devmode)
     {
@@ -4031,11 +4071,16 @@ static LONG ios_virtual_change_display_settings( const DEVMODEW *devmode, DWORD 
 
     if (w == cur_w && h == cur_h) return DISP_CHANGE_SUCCESSFUL;
 
-    if (w == (UINT)sw && h == (UINT)sh) ios_current_mode_w = ios_current_mode_h = 0;
+    if (w == (UINT)sw && h == (UINT)sh)
+    {
+        ios_current_mode_w = ios_current_mode_h = 0;
+        ios_current_mode_pid = 0;
+    }
     else
     {
         ios_current_mode_w = w;
         ios_current_mode_h = h;
+        ios_current_mode_pid = GetCurrentProcessId();
     }
     dprintf(STDERR_FILENO, "[vmode] current mode %ux%u -> %ux%u (desktop %dx%d, flags=%#x)\n",
             cur_w, cur_h, w, h, sw, sh, (unsigned)flags);

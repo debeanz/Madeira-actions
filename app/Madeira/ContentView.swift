@@ -1856,7 +1856,12 @@ struct ContentView: View {
                 desktopFullScreen = true
                 // Let the loading screen paint before the JIT pool freeze.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    launchGameSession()
+                    // ml850: boot the runtime at THIS game's screen size. It used to
+                    // re-read Settings here and overwrite the per-game value set
+                    // above, so a per-game resolution only ever reached the Metal
+                    // host (aspect) while win32u/DXGI told the game the Settings size.
+                    launchGameSession(screenW: screenW0, screenH: screenH0,
+                                      perGame: perGame.resolution != nil)
                     startInSession()
                 }
             }
@@ -1874,9 +1879,13 @@ struct ContentView: View {
     ///
     /// The display path is chosen once at runtime start, so the Desktop tab
     /// is unavailable for the rest of this run (gameSessionOnly).
-    private func launchGameSession() {
-        let (screenW, screenH) = desktopSize
-        logStore.log("Games: game session — madeira-agent.exe + services.exe, no desktop; screen \(screenW)x\(screenH)")
+    ///
+    /// ml850: the screen size is the caller's effective size for the game
+    /// that starts this session (its own resolution, else Settings) — not
+    /// re-read from Settings here, which silently undid a per-game choice.
+    private func launchGameSession(screenW: Int, screenH: Int, perGame: Bool) {
+        logStore.log("Games: game session — madeira-agent.exe + services.exe, no desktop; screen \(screenW)x\(screenH)"
+                     + (perGame ? " (this game's resolution)" : " (Settings)"))
         // Bare name (no backslash, no "x64") → aarch64-windows bundle; the
         // agent is native AArch64, its children pick arm64ec via the
         // cross-arch links exactly as under the desktop session.
