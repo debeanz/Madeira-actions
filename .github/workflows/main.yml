@@ -203,7 +203,7 @@ jobs:
           # The job log needs repo admin; annotations are public. Say why configure died.
           if ! ../configure --enable-win64 --disable-tests --without-x --without-freetype > /tmp/wine-configure.log 2>&1; then
             tail -n 40 /tmp/wine-configure.log
-            msg="$( { echo "wine configure failed:"; tail -n 14 /tmp/wine-configure.log; echo "--- config.log errors:"; grep -E "error:|fatal|cannot|not found" config.log | tail -n 14 || true; } | sed 's/%/%25/g; s//%0D/g' | awk '{ printf "%s%%0A", $0 }' | cut -c1-3800)"
+            msg="$( { echo "wine configure failed:"; tail -n 14 /tmp/wine-configure.log; echo "--- config.log errors:"; grep -E "error:|fatal|cannot|not found" config.log | tail -n 14 || true; } | sed 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }' | cut -c1-3800)"
             echo "::error::$msg"
             exit 1
           fi
