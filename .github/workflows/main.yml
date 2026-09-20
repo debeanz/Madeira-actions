@@ -179,6 +179,22 @@ jobs:
       # from it is $build/include, and widl output is arch-independent.
       # ==============================================================
 
+      # wow64 merge: 125hz/wine's dlls/ntdll/unix/sync.c, server/event.c and
+      # server/inproc_sync.c include three headers that live in THIS repo
+      # (build/ntdll-unix/shims). Wine's makedep scans every #include while
+      # configure creates the Makefile and aborts on one it cannot find
+      # (run 112: "sync.c:81: error: ios_srv_stats.h: No such file or directory",
+      # "could not create Makefile"), so put copies in wine/include, where both
+      # makedep and every later compile look. Unconditional: the Wine build dir is
+      # cached but the source tree is a fresh checkout on every run.
+      - name: Expose Madeira shim headers to the Wine tree
+        run: |
+          set -euxo pipefail
+          for h in ios_srv_stats.h ios_spin_hist.h ios_fastsync.h; do
+            cp "build/ntdll-unix/shims/$h" wine/include/
+          done
+          ls -l wine/include/ios_*.h
+
       - name: Cache Wine build
         id: winecache
         uses: actions/cache@v4
