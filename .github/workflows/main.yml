@@ -190,10 +190,15 @@ jobs:
       - name: Expose Madeira shim headers to the Wine tree
         run: |
           set -euxo pipefail
+          # makedep resolves a quoted include from include/ ONLY if it is listed in
+          # include/Makefile.in (run 113 proved a plain copy there is ignored); it does
+          # look on disk in the including file's own directory, so copy them there.
           for h in ios_srv_stats.h ios_spin_hist.h ios_fastsync.h; do
-            cp "build/ntdll-unix/shims/$h" wine/include/
+            for d in wine/dlls/ntdll/unix wine/server wine/include; do
+              cp "build/ntdll-unix/shims/$h" "$d/"
+            done
           done
-          ls -l wine/include/ios_*.h
+          ls -l wine/dlls/ntdll/unix/ios_*.h wine/server/ios_*.h
 
       - name: Cache Wine build
         id: winecache
