@@ -179,6 +179,7 @@ echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"
 if [ -n "$FAILED_FILES" ]; then
     echo "Failed:$FAILED_FILES"
+    bash "$BUILD_DIR/../ci-report-errors.sh" "ntdll-unix" "$OBJ_DIR" $FAILED_FILES
 fi
 
 echo ""

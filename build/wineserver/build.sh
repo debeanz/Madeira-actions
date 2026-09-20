@@ -56,6 +56,7 @@ compile_one() {
     else
         echo "FAILED (see $OBJ_DIR/err-$name.txt)"
         cat "$OBJ_DIR/err-$name.txt"
+        bash "$BUILD_DIR/../ci-report-errors.sh" "wineserver" "$OBJ_DIR" "$name"
         return 1
     fi
 }

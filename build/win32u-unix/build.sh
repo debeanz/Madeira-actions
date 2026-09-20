@@ -134,6 +134,7 @@ echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"
 if [ -n "$FAILED_FILES" ]; then
     echo "Failed:$FAILED_FILES"
+    bash "$BUILD_DIR/../ci-report-errors.sh" "win32u-unix" "$OBJ_DIR" $FAILED_FILES
 fi
 
 if [ $FAILED -gt 0 ]; then
