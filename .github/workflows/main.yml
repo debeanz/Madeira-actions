@@ -700,7 +700,7 @@ jobs:
 
       # Replacement XInput DLLs (ARM64EC). Overwrites the checked-in Wine
       # built-ins in the working tree before xcodebuild bundles the folder.
-      - name: Build XInput DLLs (ARM64EC)
+      - name: Build XInput DLLs (ARM64EC + i386)
         run: |
           set -euxo pipefail
           bash build/xinput/build.sh

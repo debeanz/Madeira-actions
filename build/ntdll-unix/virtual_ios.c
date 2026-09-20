@@ -8008,6 +8008,7 @@ extern const void *audio_null_ios_unix_call_funcs[];
  * xinput1_x.dll (build/xinput/xinput.c). Filled by the app from
  * GameController; see xinput_ios.c. */
 extern const void *madeira_xinput_unix_call_funcs[];
+extern const void *madeira_xinput_unix_call_wow64_funcs[];   /* 32-bit games, see xinput_ios.c */
 
 #ifndef MADEIRA_SIMULATOR_RUNTIME
 /* iOS-Madeira 2026-07-05 (Steam S0): network + crypto unix tables,
@@ -8330,13 +8331,13 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             funcs64 = (const void *)dxmt_d3d9_unix_call_funcs;
             funcs_wow64 = (const void *)dxmt_d3d9_unix_call_wow64_funcs;
         } else if (match && (strstr(match, "xinput") || strstr(match, "XInput"))) {
-            /* This fork's replacement ARM64EC xinput1_x.dll (build/xinput, fed by
-             * Gamepad.swift). 64-bit table only: a 32-bit caller is refused by
-             * ios_bind_unixlib_table rather than handed parameter blocks of the
-             * wrong width (wow64 merge; 32-bit controller support is a follow-up). */
+            /* This fork's replacement xinput1_x.dll (build/xinput, fed by
+             * Gamepad.swift): ARM64EC for 64-bit games, i386 for 32-bit ones.
+             * The argument blocks are pointer-free, so the wow64 table holds the
+             * same functions (madeira_xinput.h). */
             libname = "madeira_xinput";
             funcs64 = (const void *)madeira_xinput_unix_call_funcs;
-            funcs_wow64 = NULL;
+            funcs_wow64 = (const void *)madeira_xinput_unix_call_wow64_funcs;
         } else if (match && (strstr(match, "wineios.drv") || strstr(match, "winecoreaudio") || strstr(match, "winealsa") || strstr(match, "winepulse"))) {
             /* NOTE: mmdevapi does NOT reach the driver through this by-module
              * path — __wine_load_unix_lib() asks for "wine<name>.drv" BY NAME

@@ -90,15 +90,15 @@ int madeira_xinput_get_rumble(uint32_t index, uint16_t *low, uint16_t *high)
 static NTSTATUS xinput_get_state(void *args)
 {
     struct madeira_xinput_get_state_args *a = args;
-    if (!a || a->index >= MADEIRA_XINPUT_MAX_PADS || !a->state) return STATUS_INVALID_PARAMETER;
+    if (!a || a->index >= MADEIRA_XINPUT_MAX_PADS) return STATUS_INVALID_PARAMETER;
     pthread_mutex_lock(&g_lock);
-    *a->state = g_pads[a->index];
+    a->state = g_pads[a->index];
     pthread_mutex_unlock(&g_lock);
     if (!g_first_query_logged)
     {
         g_first_query_logged = 1;
         dprintf(2, "[xinput] first XInputGetState from a game (pad %u %s)\n",
-                a->index, a->state->connected ? "connected" : "not connected");
+                a->index, a->state.connected ? "connected" : "not connected");
     }
     return STATUS_SUCCESS;
 }
@@ -121,6 +121,15 @@ static NTSTATUS xinput_set_rumble(void *args)
 /* Indexed by enum madeira_xinput_call. Handed to the PE side as the
  * unixlib handle; __wine_unix_call_dispatcher does funcs[code](args). */
 const void *madeira_xinput_unix_call_funcs[] = {
+    xinput_get_state,     /* MADEIRA_XINPUT_CALL_GET_STATE */
+    xinput_set_rumble,    /* MADEIRA_XINPUT_CALL_SET_RUMBLE */
+};
+
+/* The table a 32-bit (WoW64) game's xinput1_x.dll is bound to. Both argument
+ * blocks are pointer-free and lay out identically for an i386 caller (see
+ * madeira_xinput.h), and the WoW64 module has already turned the outer args
+ * pointer into a host address, so the very same functions serve it. */
+const void *madeira_xinput_unix_call_wow64_funcs[] = {
     xinput_get_state,     /* MADEIRA_XINPUT_CALL_GET_STATE */
     xinput_set_rumble,    /* MADEIRA_XINPUT_CALL_SET_RUMBLE */
 };

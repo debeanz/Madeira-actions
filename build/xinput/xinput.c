@@ -71,6 +71,19 @@ static BOOL g_enabled = TRUE;            /* XInputEnable */
  * code goes through __os_arm64x_check_icall, which classifies a target
  * outside any PE image as x64 code and would run the unix dispatcher
  * under the emulator. */
+#if defined(__i386__)
+/* 32-bit build (WoW64 games). The i386 ntdll's __wine_unix_call_dispatcher is
+ * an ordinary stdcall function pointer: under WoW64 it leads into the unix-call
+ * thunk the CPU backend publishes inside the guest window, which turns the
+ * outer args pointer into a host address and enters the wow64 table
+ * (madeira_xinput_unix_call_wow64_funcs). No ARM64EC icall concern here, so a
+ * plain indirect call is right. The 64-bit handle is two stack words. */
+typedef NTSTATUS (WINAPI *unix_call32_fn)(UINT64 handle, unsigned int code, void *args);
+static NTSTATUS unix_call(UINT64 handle, unsigned int code, void *args)
+{
+    return ((unix_call32_fn)madeira_xinput_unix_dispatcher)(handle, code, args);
+}
+#else
 __attribute__((naked)) static NTSTATUS unix_call(UINT64 handle, unsigned int code, void *args)
 {
     __asm__(
@@ -78,6 +91,7 @@ __attribute__((naked)) static NTSTATUS unix_call(UINT64 handle, unsigned int cod
         "ldr  x16, [x16, :lo12:madeira_xinput_unix_dispatcher]\n\t"
         "br   x16\n\t");
 }
+#endif
 
 static BOOL init_unix(void)
 {
@@ -91,8 +105,12 @@ static BOOL init_unix(void)
 
     ntdll = GetModuleHandleW(L"ntdll.dll");
     qvm = ntdll ? (nt_qvm_fn)GetProcAddress(ntdll, "NtQueryVirtualMemory") : NULL;
+#if defined(__i386__)
+    slot = ntdll ? (unix_call_fn *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher") : NULL;
+#else
     slot = ntdll ? (unix_call_fn *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher_arm64ec") : NULL;
     if (!slot && ntdll) slot = (unix_call_fn *)GetProcAddress(ntdll, "__wine_unix_call_dispatcher");
+#endif
     if (!qvm || !slot || !*slot)
     {
         OutputDebugStringA("madeira xinput: ntdll unix-call dispatcher missing\n");
@@ -120,10 +138,10 @@ static DWORD fetch(DWORD index, struct madeira_xinput_state *s)
     struct madeira_xinput_get_state_args a;
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
     if (!init_unix()) return ERROR_DEVICE_NOT_CONNECTED;
+    memset(&a, 0, sizeof(a));
     a.index = index;
-    a.pad_ = 0;
-    a.state = s;
     if (unix_call(g_unix_handle, MADEIRA_XINPUT_CALL_GET_STATE, &a) != 0) return ERROR_DEVICE_NOT_CONNECTED;
+    *s = a.state;   /* embedded, not pointed to: see madeira_xinput.h */
     if (!s->connected) return ERROR_DEVICE_NOT_CONNECTED;
     return ERROR_SUCCESS;
 }

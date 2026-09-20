@@ -37,10 +37,17 @@ enum madeira_xinput_call {
     MADEIRA_XINPUT_CALL_COUNT
 };
 
+/* No pointers on purpose (wow64 merge): a 32-bit game's xinput1_x.dll reaches
+ * the unix side through Wine's WoW64 unix-call path, which converts only the
+ * OUTER args pointer from the guest window to a host address. An embedded
+ * pointer would arrive as a 32-bit guest address and need its own +B
+ * conversion; an embedded struct needs nothing, and the layout (4-byte
+ * alignment, 28 bytes) is identical for i386, x86-64/ARM64EC and the ARM64
+ * unix side, so ONE function serves both call tables. */
 struct madeira_xinput_get_state_args {
-    uint32_t index;
+    uint32_t index;                       /* in */
     uint32_t pad_;
-    struct madeira_xinput_state *state;   /* same address space: written directly */
+    struct madeira_xinput_state state;    /* out: filled by the unix side */
 };
 
 struct madeira_xinput_set_rumble_args {
