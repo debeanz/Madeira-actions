@@ -76,6 +76,8 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "ios_wow.h"
+#include "ios_srv_stats.h"   /* ml951: [thrinfo] buckets */
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -1329,6 +1331,13 @@ void *get_cpu_area( USHORT machine )
 #else
     cpu = ULongToPtr( NtCurrentTeb64()->TlsSlots[WOW64_TLS_CPURESERVED] );
 #endif
+    /* iOS-Madeira (WOW64_DESIGN.md, stage C review F3): wow_peb is a SESSION
+     * global while pseudo-processes share the address space, so once any
+     * 32-bit child exists is_wow64() is true on 64-bit threads too — and those
+     * threads have no CPU area.  Upstream can dereference unconditionally
+     * because a process is WoW or it is not; here the NULL check is what keeps
+     * a 64-bit thread from faulting on cpu->Machine. */
+    if (!cpu) return NULL;
     if (cpu->Machine != machine) return NULL;
     switch (cpu->Machine)
     {
@@ -1379,26 +1388,51 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     if (wow_teb)
     {
         WOW64_CPURESERVED *cpu;
+        /* iOS-Madeira (stage C review F1): size and tag the CPU area from the
+         * OWNING pseudo-process's main image, not from the session global.
+         * main_image_info is restored to the session's exe by
+         * wine_ios_child_main (loader_ios.c, "main_image_info =
+         * session_image_info") BEFORE init_thread_stack runs for the child, so
+         * a 32-bit child used to get an ARM64-sized area tagged ARM64 here and
+         * get_cpu_area( IMAGE_FILE_MACHINE_I386 ) then returned NULL — no
+         * Eax/Ebx/Esp/Eip were ever written into the initial 32-bit context.
+         * The ChpeV2 branch below (":Owner-aware (X3)") already keys off the
+         * owning PEB; this is the same rule. */
+        extern const SECTION_IMAGE_INFORMATION *ios_image_info_for_peb( void *peb_id );
+        USHORT wow_machine = ios_image_info_for_peb( teb->Peb )->Machine;
         SIZE_T cpusize = sizeof(WOW64_CPURESERVED) +
-            ((get_machine_context_size( main_image_info.Machine ) + 7) & ~7) + sizeof(ULONG64);
+            ((get_machine_context_size( wow_machine ) + 7) & ~7) + sizeof(ULONG64);
 
         /* 64-bit stack */
         if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, 0x40000, 0x40000, TRUE ))) return status;
         cpu = (WOW64_CPURESERVED *)(((ULONG_PTR)stack.StackBase - cpusize) & ~15);
-        cpu->Machine = main_image_info.Machine;
+        cpu->Machine = wow_machine;
 
 #ifdef _WIN64
         teb->Tib.StackBase = teb->TlsSlots[WOW64_TLS_CPURESERVED] = cpu;
         teb->Tib.StackLimit = stack.StackLimit;
         teb->DeallocationStack = stack.DeallocationStack;
 
-        /* 32-bit stack */
+        /* 32-bit stack.  `limit` is a GUEST ceiling;
+         * virtual_alloc_thread_stack turns it into [B, B+limit] for a
+         * windowed process, and the resulting addresses are host, so every
+         * 32-bit TEB field below converts back to guest. */
         if (!limit || limit > user_space_wow_limit) limit = user_space_wow_limit;
+#ifdef WINE_IOS
+        /* user_space_wow_limit is published from the main image's
+         * large-address-aware bit (virtual_set_large_address_space, and
+         * ios_wow_image_ceiling when the image is mapped before init_peb), so
+         * the line above is the normal path.  It can only still be 0 for a
+         * thread created before that, and then the conservative 2 GB is the
+         * safe answer for both LAA and non-LAA images — 4 GB would put a
+         * non-LAA program's own stack above 0x80000000. */
+        if (!limit && ios_wow_base()) limit = limit_2g - 1;
+#endif
         if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
             return status;
-        wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
-        wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
-        wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
+        wow_teb->Tib.StackBase = ios_wow_guest_addr( stack.StackBase );
+        wow_teb->Tib.StackLimit = ios_wow_guest_addr( stack.StackLimit );
+        wow_teb->DeallocationStack = ios_wow_guest_addr( stack.DeallocationStack );
         return STATUS_SUCCESS;
 #else
         wow_teb->Tib.StackBase = wow_teb->TlsSlots[WOW64_TLS_CPURESERVED] = PtrToUlong( cpu );
@@ -1748,6 +1782,10 @@ void abort_process( int status )
     ERR("abort_process: status=0x%x -> pseudo-process exit instead of _exit()\n", (unsigned)status);
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
     process_exit_wrapper( get_unix_exit_code( status ));
+    /* wow64 merge (125hz): process_exit_wrapper never returns on iOS (exit()
+     * shim longjmps, or pthread_exit()s a thread that has no jmpbuf); never
+     * fall through to anything that could end the whole app. */
+    for (;;) pthread_exit( NULL );
 #else
     _exit( get_unix_exit_code( status ));
 #endif
@@ -2509,6 +2547,77 @@ static BOOL is_process_wow64( const CLIENT_ID *id )
 }
 
 /******************************************************************************
+ *   iOS-Madeira ml951: NtQueryInformationThread's own-thread cache
+ *
+ * [srv-stats] put `get_thread_info' second only to `get_message': 103140
+ * requests in a 10 s window, ~10 k/s, and every one of them originates in
+ * NtQueryInformationThread below (the only other caller in this file is
+ * ios_mach_thread_for_handle(), which runs once per terminate).
+ *
+ * Most of what ThreadBasicInformation returns for the CALLING thread cannot
+ * change while that thread is the one asking:
+ *   - ExitStatus is STATUS_PENDING by construction (we are running);
+ *   - TebBaseAddress and ClientId are fixed for the lifetime of the thread;
+ *   - Priority / BasePriority / AffinityMask change only through
+ *     NtSetInformationThread, which bumps ios_thread_info_gen.
+ * So a one-entry per-thread cache, keyed on the HANDLE it was learned from
+ * and invalidated by the generation counter, answers the whole call with no
+ * server round trip.  The handle key is what lets a real (non-pseudo) self
+ * handle hit as well: the first query resolves it, and reply->tid tells us it
+ * was us.  A handle to ANOTHER thread is never cached — ExitStatus there is
+ * exactly the thing the caller is polling for.
+ *
+ * The generation counter is process-wide and bumped by every
+ * NtSetInformationThread, so a SetThreadPriority on any thread invalidates
+ * every cache; a cross-process priority change (which does not pass through
+ * this ntdll) is covered by the IOS_TBI_MAX_USES refresh cap.
+ */
+#define IOS_TBI_MAX_USES 4096
+
+struct ios_self_tbi
+{
+    HANDLE                   handle;   /* handle this entry was learned from */
+    unsigned int             gen;      /* 0 = empty                          */
+    unsigned int             uses;
+    THREAD_BASIC_INFORMATION info;
+};
+
+static __thread struct ios_self_tbi ios_self_tbi;
+static unsigned int ios_thread_info_gen = 1;
+
+static BOOL ios_tbi_get( HANDLE handle, THREAD_BASIC_INFORMATION *info )
+{
+    struct ios_self_tbi *c = &ios_self_tbi;
+
+    if (!c->gen || c->handle != handle) return FALSE;
+    if (c->gen != __atomic_load_n( &ios_thread_info_gen, __ATOMIC_RELAXED )) return FALSE;
+    if (++c->uses > IOS_TBI_MAX_USES) { c->gen = 0; return FALSE; }
+    *info = c->info;
+    return TRUE;
+}
+
+static void ios_tbi_put( HANDLE handle, const THREAD_BASIC_INFORMATION *info )
+{
+    struct ios_self_tbi *c = &ios_self_tbi;
+
+    if (info->ClientId.UniqueThread != NtCurrentTeb()->ClientId.UniqueThread ||
+        info->ExitStatus != STATUS_PENDING)
+    {
+        c->gen = 0;   /* another thread, or one that has exited: never cache */
+        return;
+    }
+    c->handle = handle;
+    c->info   = *info;
+    c->uses   = 0;
+    c->gen    = __atomic_load_n( &ios_thread_info_gen, __ATOMIC_RELAXED );
+}
+
+static void ios_tbi_invalidate(void)
+{
+    __atomic_fetch_add( &ios_thread_info_gen, 1, __ATOMIC_RELAXED );
+}
+
+/******************************************************************************
  *              NtQueryInformationThread  (NTDLL.@)
  */
 NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
@@ -2524,6 +2633,15 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         THREAD_BASIC_INFORMATION info;
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
+
+        if (ios_tbi_get( handle, &info ))
+        {
+            ios_srv_thrinfo_count( IOS_TI_BASIC_SELF );
+            ios_srv_thrinfo_count( IOS_TI_BASIC_CACHED );
+            if (data) memcpy( data, &info, min( length, sizeof(info) ));
+            if (ret_len) *ret_len = min( length, sizeof(info) );
+            return STATUS_SUCCESS;
+        }
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2549,9 +2667,13 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
                 else
                     info.TebBaseAddress = NULL;
             }
+            ios_srv_thrinfo_count( info.ClientId.UniqueThread == NtCurrentTeb()->ClientId.UniqueThread
+                                   ? IOS_TI_BASIC_SELF : IOS_TI_BASIC_OTHER );
+            ios_tbi_put( handle, &info );
             if (data) memcpy( data, &info, min( length, sizeof(info) ));
             if (ret_len) *ret_len = min( length, sizeof(info) );
         }
+        else ios_srv_thrinfo_count( IOS_TI_BASIC_OTHER );
         return status;
     }
 
@@ -2559,6 +2681,20 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
         ULONG_PTR affinity = 0;
+        THREAD_BASIC_INFORMATION info;
+
+        ios_srv_thrinfo_count( IOS_TI_AFFINITY );
+        /* only for the pseudo handle: a real handle would need the server's
+         * THREAD_QUERY_INFORMATION check, which GetCurrentThread() always
+         * passes and which the cached entry cannot stand in for. */
+        if (handle == GetCurrentThread() && ios_tbi_get( handle, &info ))
+        {
+            ios_srv_thrinfo_count( IOS_TI_AFFINITY_CACHED );
+            affinity = info.AffinityMask;
+            if (data) memcpy( data, &affinity, min( length, sizeof(affinity) ));
+            if (ret_len) *ret_len = min( length, sizeof(affinity) );
+            return STATUS_SUCCESS;
+        }
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2580,6 +2716,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         KERNEL_USER_TIMES kusrt;
         int unix_pid, unix_tid;
 
+        ios_srv_thrinfo_count( IOS_TI_TIMES );
         SERVER_START_REQ( get_thread_times )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2624,6 +2761,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     case ThreadAmILastThread:
     {
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        ios_srv_thrinfo_count( IOS_TI_AMILAST );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2641,6 +2779,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 
     case ThreadQuerySetWin32StartAddress:
     {
+        ios_srv_thrinfo_count( IOS_TI_START_ADDR );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2662,8 +2801,20 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
         GROUP_AFFINITY affinity;
 
+        THREAD_BASIC_INFORMATION info;
+
         memset( &affinity, 0, sizeof(affinity) );
         affinity.Group = 0; /* Wine only supports max 64 processors */
+
+        ios_srv_thrinfo_count( IOS_TI_AFFINITY );
+        if (handle == GetCurrentThread() && ios_tbi_get( handle, &info ))
+        {
+            ios_srv_thrinfo_count( IOS_TI_AFFINITY_CACHED );
+            affinity.Mask = info.AffinityMask;
+            if (data) memcpy( data, &affinity, min( length, sizeof(affinity) ));
+            if (ret_len) *ret_len = min( length, sizeof(affinity) );
+            return STATUS_SUCCESS;
+        }
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2692,6 +2843,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         ULONG terminated;
 
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        ios_srv_thrinfo_count( IOS_TI_TERMINATED );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2710,6 +2862,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
         if (!data) return STATUS_ACCESS_VIOLATION;
 
+        ios_srv_thrinfo_count( IOS_TI_SUSPEND );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2727,6 +2880,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
         len = length >= sizeof(*info) ? length - sizeof(*info) : 0;
         ptr = info ? (WCHAR *)(info + 1) : NULL;
 
+        ios_srv_thrinfo_count( IOS_TI_NAME );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2774,6 +2928,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     case ThreadPriorityBoost:
     {
         if (length != sizeof(ULONG)) return STATUS_INFO_LENGTH_MISMATCH;
+        ios_srv_thrinfo_count( IOS_TI_OTHER_CLASS );
         SERVER_START_REQ( get_thread_info )
         {
             req->handle = wine_server_obj_handle( handle );
@@ -2827,6 +2982,13 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
     unsigned int status;
 
     TRACE("(%p,%d,%p,%x)\n", handle, class, data, length);
+
+    /* ml951: any set at all invalidates every cached ThreadBasicInformation
+     * in the process.  Bumping unconditionally (rather than per class) keeps
+     * the rule "a set is a fence" — a new class that changes a cached field
+     * cannot be added here and silently leave stale caches behind. */
+    ios_srv_thrinfo_count( IOS_TI_SET );
+    ios_tbi_invalidate();
 
     switch (class)
     {

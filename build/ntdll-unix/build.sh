@@ -125,6 +125,20 @@ compile_one "$BUILD_DIR/nsi_unixlib_ios.c" "nsi_unixlib_ios"
 # iOS-Madeira 2026-09-10: controller state table behind the replacement
 # xinput1_x.dll (build/xinput). Plain C, no Wine headers.
 compile_one "$BUILD_DIR/xinput_ios.c" "xinput_ios"
+# MADEIRA 2026-09-15: dnsapi had NO unix side, so its DllMain printed "No
+# libresolv support" and every later DnsQuery_* went through a NULL unixlib
+# handle -- a host-side fault in __wine_unix_call_dispatcher that killed the
+# process (log n60).  dnsapi_unixlib_ios.c is upstream dlls/dnsapi/libresolv.c
+# with res_init/res_query/_res/h_errno rebound to /usr/lib/libresolv.9.dylib
+# through dlopen, so nothing new is added to the app's final link.
+compile_unixlib "$BUILD_DIR/dnsapi_unixlib_ios.c" "dnsapi_unixlib" "dnsapi" \
+    -I"$WINE_SRC/dlls/dnsapi"
+# wow64 merge (125hz): their winegstreamer_unixlib_ios.c decodes WMA through
+# libavcodec and needs toolchains/ffmpeg-ios, which this CI does not build yet.
+# The stub keeps the winegstreamer_unix_call_funcs symbols virtual_ios.c binds;
+# every call answers STATUS_NOT_IMPLEMENTED. Swap the real file back in (and add
+# -I"$REPO_ROOT/toolchains/ffmpeg-ios/include") once FFmpeg for iOS is built.
+compile_unixlib "$BUILD_DIR/winegstreamer_stub_ios.c" "winegstreamer_unixlib" "winegstreamer"
 
 for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
     name=$(basename "$src" .c)
@@ -173,7 +187,8 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/audio_null_ios.o" "$OBJ_DIR/nsi_unixlib_ios.o" "$OBJ_DIR/xinput_ios.o" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
-    "$OBJ_DIR/dwrite_unixlib.o" \
+    "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" \
+    "$OBJ_DIR/winegstreamer_unixlib.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

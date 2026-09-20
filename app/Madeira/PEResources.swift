@@ -15,9 +15,11 @@ enum PEResources {
     static let machineARM64: UInt16 = 0xaa64
     static let machineARM64EC: UInt16 = 0xa641
 
-    /// True for the machines this port can run (x86-64 through FEX, or native).
+    /// True for the machines this port can run (x86-64 through FEX, native, and
+    /// since the wow64 merge 32-bit x86 through the WoW64 guest window).
     static func isSupported(machine: UInt16) -> Bool {
         machine == machineAMD64 || machine == machineARM64 || machine == machineARM64EC
+            || machine == machineI386
     }
 
     static func machine(of url: URL) -> UInt16? {

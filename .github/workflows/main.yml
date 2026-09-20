@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: [main]
+    branches: [main, wow64]
     paths:
       - "app/**"
       - "build/**"
@@ -184,7 +184,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: wine/build-macos
-          key: wine-7817e22-${{ env.CACHE_V }}
+          key: wine-09146f2-${{ env.CACHE_V }}
 
       # NOTE: a plain `make` CANNOT succeed here. dlls/win32u/win32u.so is
       # the macOS HOST .so, and the fork's patched bitblt.c references
@@ -278,7 +278,7 @@ jobs:
             app/Madeira/libwin32u_unix.a
           # Source-hashed: the old key never changed when build/*-unix/*.c
           # was edited, so shim fixes silently shipped the cached archive.
-          key: wineunix-7817e22-${{ hashFiles('build/ntdll-unix/**/*.c', 'build/ntdll-unix/**/*.h', 'build/ntdll-unix/build.sh', 'build/win32u-unix/*.c', 'build/win32u-unix/*.h', 'build/win32u-unix/build.sh', 'build/xinput/*.h') }}-${{ env.CACHE_V }}
+          key: wineunix-09146f2-${{ hashFiles('build/ntdll-unix/**/*.c', 'build/ntdll-unix/**/*.h', 'build/ntdll-unix/build.sh', 'build/win32u-unix/*.c', 'build/win32u-unix/*.h', 'build/win32u-unix/build.sh', 'build/xinput/*.h') }}-${{ env.CACHE_V }}
 
       - name: Wine unix libs (ntdll, win32u)
         if: steps.wineunix.outputs.cache-hit != 'true'
@@ -307,7 +307,7 @@ jobs:
           # at MADEIRA_SCREEN_W/H instead of 1024x768) was silently skipped and
           # the device kept running the old server. Hash the sources, like the
           # wineunix and DXMT caches do.
-          key: wineserver-7817e22-${{ hashFiles('build/wineserver/*.c', 'build/wineserver/*.h', 'build/wineserver/build.sh', 'build/wineserver/*.py') }}-${{ env.CACHE_V }}
+          key: wineserver-09146f2-${{ hashFiles('build/wineserver/*.c', 'build/wineserver/*.h', 'build/wineserver/build.sh', 'build/wineserver/*.py') }}-${{ env.CACHE_V }}
 
       - name: Seed wineserver base archive
         if: steps.wsrv.outputs.cache-hit != 'true'
@@ -380,7 +380,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: FEX/build-ios
-          key: fex-053c385-caspalstub-${{ env.CACHE_V }}
+          key: fex-51f5444-caspalstub-${{ env.CACHE_V }}
 
       # FEX fork bug: IosLogUnimplementedCASPAL (Arm64.cpp) sits OUTSIDE
       # every #ifdef FEX_IOS_HOST in that file, yet calls Win32 APIs —
@@ -545,7 +545,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/dxmt-ios/shader-headers
-          key: shaders-b4b89f0-${{ env.CACHE_V }}
+          key: shaders-1f7acaa-${{ env.CACHE_V }}
 
       - name: Generate airconv shader headers
         if: steps.shaders.outputs.cache-hit != 'true'
@@ -585,7 +585,7 @@ jobs:
             app/Madeira/aarch64-windows
           # Hashes the unix-side build script and its in-place submodule
           # patches so a pacing change actually rebuilds libdxmt_combined.a.
-          key: dxmt-b4b89f0-${{ hashFiles('build/dxmt-ios/build.sh', 'build/dxmt-ios/*.py') }}-${{ env.CACHE_V }}
+          key: dxmt-1f7acaa-${{ hashFiles('build/dxmt-ios/build.sh', 'build/dxmt-ios/*.py') }}-${{ env.CACHE_V }}
 
       - name: DXMT
         if: steps.dxmt.outputs.cache-hit != 'true'
@@ -663,6 +663,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" "$P"
           TAG="${GITHUB_SHA:0:7}"
           if [ "${PAGEZERO_EXPERIMENT:-false}" = "true" ]; then TAG="${TAG}+pz"; fi
+          if [ "${GITHUB_REF_NAME:-}" = "wow64" ]; then TAG="${TAG}+wow64"; fi
           /usr/libexec/PlistBuddy -c "Add :MadeiraBuildCommit string ${TAG}" "$P" \
             || /usr/libexec/PlistBuddy -c "Set :MadeiraBuildCommit ${TAG}" "$P"
           /usr/libexec/PlistBuddy -c "Print" "$P" | grep -E "Version|Commit"

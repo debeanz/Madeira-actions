@@ -25,11 +25,19 @@
 #import <os/log.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+/* ml668: the gamepad slot's struct and button bits live in the app-facing
+ * header, because Swift includes the same file. Including it here is also the
+ * only thing that keeps the two sides' signatures honest — everything else in
+ * this file is reached through a bridging header the compiler never compares
+ * against these definitions. */
+#include "Winios.h"
 
 /* csops syscall — CS_DEBUGGED is the flag StikDebug JIT rides on. Declared by
  * hand for the same reason JITAllocator.c does: <sys/codesign.h> is not in the
@@ -322,11 +330,38 @@ static void *winios_freeze_super(void *arg) {
     return NULL;
 }
 
+/* ml981: WEDGED-THREAD TRIAGE MUST NOT DEPEND ON THE DESKTOP BEING UP.
+ *
+ * Sample every thread's stack every 20s from an app-side timer — it keeps
+ * firing when all wine threads are stuck (unlike the tree dump, which rides
+ * wine's event drain).  It used to be armed only from winios_ensure_compositor,
+ * i.e. only when explorer's desktop attaches: a title started DIRECTLY got no
+ * [thread-stacks] at all, so a hang in that mode had to be reconstructed from
+ * register dumps and nm.  Device log t85 (direct launch) has zero
+ * [thread-stacks] lines and t86 (same title, same wedge, via the desktop) has
+ * 697 — and t86's answered the question in one line:
+ *   port=0x1f9c3 "..." pc=Madeira`ios_verify_commit_zero+0x80 run=3 cpu=0
+ *   port=0x10013 "wine-x18-exc" pc=__psynch_mutexwait ... (on virtual_mutex)
+ * Arm it from the freeze detector's start instead, which runs in every mode. */
+static void winios_stack_timer_start(void) {
+    extern void ios_dump_all_thread_stacks(void);
+    static dispatch_source_t stack_timer;
+    if (stack_timer) return;
+    stack_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                      dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(stack_timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
+                              20 * NSEC_PER_SEC, NSEC_PER_SEC);
+    dispatch_source_set_event_handler(stack_timer, ^{ ios_dump_all_thread_stacks(); });
+    dispatch_resume(stack_timer);
+    dprintf(STDERR_FILENO, "[thread-stacks] 20s sampler armed rev=ml981\n");
+}
+
 void winios_freeze_watch_start(void) {
     static int started;
     pthread_t th, sup;
     if (started) return;
     started = 1;
+    winios_stack_timer_start();
     wfz_t0 = winios_now_mono();
     winios_bg_observe();
     wfz_gen = 1;
@@ -453,15 +488,73 @@ void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 #define MOUSEEVENTF_LEFTUP      0x0004
 #define MOUSEEVENTF_RIGHTDOWN   0x0008
 #define MOUSEEVENTF_RIGHTUP     0x0010
+/* ml663: a real mouse has five buttons and two wheels. These flags were never
+ * reproduced here because a touchscreen cannot produce them; a Bluetooth mouse
+ * can, and winios_drv_post_mouse passes dwFlags/mouseData straight through to
+ * send_hardware_message, so nothing else has to change to carry them. */
+#define MOUSEEVENTF_MIDDLEDOWN  0x0020
+#define MOUSEEVENTF_MIDDLEUP    0x0040
+#define MOUSEEVENTF_XDOWN       0x0080
+#define MOUSEEVENTF_XUP         0x0100
 #define MOUSEEVENTF_WHEEL       0x0800
+#define MOUSEEVENTF_HWHEEL      0x1000
 #define MOUSEEVENTF_ABSOLUTE    0x8000
+#define WINIOS_XBUTTON1         0x0001
+#define WINIOS_XBUTTON2         0x0002
+/* ml663 — KEYEVENTF_EXTENDEDKEY, for the callers that must say so themselves.
+ * driver_ios.c derives the scan code from the VK and sets this flag whenever
+ * MAPVK_VK_TO_VSC_EX returns an 0xE0xx code (arrows, nav cluster, right
+ * ctrl/alt, numpad divide) — so nearly every extended key is already correct
+ * without the app's help. The exceptions are the keys that SHARE a virtual-key
+ * with a non-extended twin and can only be told apart by the flag: numpad
+ * Enter (VK_RETURN + E0) is the one a keyboard actually produces. */
+#define KEYEVENTF_EXTENDEDKEY   0x0001
 
 extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, void *hwnd);
 extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
 extern void winios_dump_window_tree(void);
 extern void ios_dump_all_thread_stacks(void);
 
-#define WINIOS_RING_SIZE 256
+/* ml661 — THE RING IS DRAINED AT THE GAME'S FRAME RATE, NOT AT TOUCH RATE.
+ *
+ * The only consumer is winios_pProcessEvents, which runs inside the game's own
+ * message pump (message_ios.c process_driver_events, reached from PeekMessage
+ * and from GetAsyncKeyState's check_for_events). A game rendering at 15 fps
+ * drains ~15×/s; while it streams a level it can be a *tenth* of that, so the
+ * ring goes untouched for seconds at a time.
+ *
+ * The producer does not slow down to match. The aim stick is a CADisplayLink:
+ * it posts one relative MOUSEEVENTF_MOVE per display frame, 60–120/s, for as
+ * long as a thumb rests on it. So in a single 5-second stall the stick alone
+ * offers ~600 events into a 256-slot ring.
+ *
+ * The old policy was DROP-NEWEST ("if (next != tail)" and otherwise silently
+ * do nothing — the comment even claimed it dropped the oldest, which it never
+ * did). Once the stick had filled the ring, every subsequent event was thrown
+ * away, and the events being thrown away were the ones that matter: the key
+ * DOWN from the movement stick, the key UP that stops walking, the LEFTDOWN
+ * from a landscape button. That is the reported failure exactly — sticks and
+ * buttons go dead mid-fight, and come back when the frame rate recovers and
+ * the backlog finally drains. A half-dropped pair is worse still: a surviving
+ * DOWN whose UP was dropped leaves the key stuck on inside the game.
+ *
+ * Fix, in two parts:
+ *   1. Motion is COALESCED, not queued. Consecutive pure moves merge — relative
+ *      deltas sum, absolute positions keep the newest. That is lossless for the
+ *      game (a mouse that moved 300 counts over 5s is indistinguishable from
+ *      one 300-count report at the moment of the read) and it means the stick
+ *      can no longer fill anything: a whole stall collapses into one event.
+ *   2. Transitions are NEVER dropped. A key down/up or a button down/up always
+ *      gets a slot; if the ring is somehow still full, room is made by dropping
+ *      the oldest *move*, which is the only event class that can be lost
+ *      without the game ending up in a wrong state.
+ *
+ * A "pure move" is the only mergeable/droppable class: MOUSEEVENTF_MOVE with
+ * (optionally) ABSOLUTE and nothing else. Note post_touch_down deliberately
+ * posts MOVE|LEFTDOWN|ABSOLUTE as one event — the button bit makes it a
+ * transition, so it is never touched by either mechanism.
+ */
+#define WINIOS_RING_SIZE 1024
 #define WINIOS_EV_MOUSE 0
 #define WINIOS_EV_KEY   1
 #define KEYEVENTF_KEYUP 0x0002
@@ -477,17 +570,180 @@ static struct {
     unsigned int head;       /* producer cursor (Swift side) */
     unsigned int tail;       /* consumer cursor (Wine drain) */
     pthread_mutex_t lock;
+    /* ml661 diagnostics — see winios_q_report */
+    unsigned int pushed, coalesced, compactions, high_water;
+    unsigned int dropped_move, dropped_trans;
+    unsigned int keys_down;            /* driver-side held-key count */
+    unsigned int keydown_mask[8];      /* 256 vk bits: which are held */
+    /* ml663: bit0 left, bit1 right, bit2 middle, bit3 X1, bit4 X2. The three
+     * new bits exist for exactly one reason — winios_release_all_keys() below
+     * is the valve that un-sticks a button when the app loses the event that
+     * would have released it, and a button it does not track is a button it
+     * cannot un-stick. */
+    unsigned int btn_mask;
+    /* ml667: relative moves are the mouse-look signal and nothing counted them
+     * separately — "pushed" mixes them with absolute moves, keys and buttons,
+     * so a log could not say whether the camera stopped because the deltas
+     * stopped being produced or because they stopped being delivered. */
+    unsigned int rel_moves;
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
-static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
-    pthread_mutex_lock(&g_input_q.lock);
-    unsigned int next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
-    if (next != g_input_q.tail) {
-        g_input_q.buf[g_input_q.head] = (winios_input_event_t){type, x, y, flags, data};
-        g_input_q.head = next;
+static inline int winios_ev_is_pure_move(const winios_input_event_t *e) {
+    if (e->type != WINIOS_EV_MOUSE) return 0;
+    if (!(e->flags & MOUSEEVENTF_MOVE)) return 0;
+    /* any button / wheel bit makes it a transition */
+    return (e->flags & ~(unsigned)(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)) == 0;
+}
+
+/* Mergeable only into an identical KIND of move: relative into relative,
+ * absolute into absolute. Mixing the two would turn a delta into a position. */
+static inline int winios_ev_mergeable(const winios_input_event_t *a, const winios_input_event_t *b) {
+    return winios_ev_is_pure_move(a) && winios_ev_is_pure_move(b) && a->flags == b->flags;
+}
+
+static inline void winios_ev_merge(winios_input_event_t *dst, const winios_input_event_t *src) {
+    if (src->flags & MOUSEEVENTF_ABSOLUTE) {
+        dst->x = src->x; dst->y = src->y;      /* a position: newest wins */
+    } else {
+        long long x = (long long)dst->x + src->x;   /* a delta: they add */
+        long long y = (long long)dst->y + src->y;
+        dst->x = (int)(x < -30000 ? -30000 : (x > 30000 ? 30000 : x));
+        dst->y = (int)(y < -30000 ? -30000 : (y > 30000 ? 30000 : y));
     }
-    /* If buffer is full we drop the oldest event by simply not advancing —
-     * better than blocking the UI thread on a Wine event drain. */
+}
+
+/* Merge every run of consecutive pure moves already sitting in the ring.
+ * Only runs when the ring is full, so the O(n) rewrite is off the hot path.
+ * Caller holds the lock. */
+static winios_input_event_t g_q_scratch[WINIOS_RING_SIZE];
+static void winios_q_compact(void) {
+    unsigned int n = 0, i;
+    for (i = g_input_q.tail; i != g_input_q.head; i = (i + 1) % WINIOS_RING_SIZE) {
+        winios_input_event_t *s = &g_input_q.buf[i];
+        if (n && winios_ev_mergeable(&g_q_scratch[n - 1], s)) {
+            winios_ev_merge(&g_q_scratch[n - 1], s);
+            g_input_q.coalesced++;
+            continue;
+        }
+        g_q_scratch[n++] = *s;
+    }
+    memcpy(g_input_q.buf, g_q_scratch, n * sizeof(g_q_scratch[0]));
+    g_input_q.tail = 0;
+    g_input_q.head = n % WINIOS_RING_SIZE;
+    g_input_q.compactions++;
+}
+
+/* Last resort when the ring is full of UNmergeable events: evict the oldest
+ * pure move (alternating abs/rel moves defeat compaction but are still
+ * individually expendable). Returns 0 if the ring holds nothing but
+ * transitions — in which case the caller must not drop the newcomer either.
+ * Caller holds the lock. */
+static int winios_q_drop_oldest_move(void) {
+    unsigned int i, j;
+    for (i = g_input_q.tail; i != g_input_q.head; i = (i + 1) % WINIOS_RING_SIZE)
+        if (winios_ev_is_pure_move(&g_input_q.buf[i])) break;
+    if (i == g_input_q.head) return 0;
+    for (j = i; j != g_input_q.tail; ) {           /* close the gap backwards */
+        unsigned int p = (j + WINIOS_RING_SIZE - 1) % WINIOS_RING_SIZE;
+        g_input_q.buf[j] = g_input_q.buf[p];
+        j = p;
+    }
+    g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
+    g_input_q.dropped_move++;
+    return 1;
+}
+
+static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags, unsigned int data) {
+    winios_input_event_t e = { type, x, y, flags, data };
+    unsigned int next, depth;
+
+    pthread_mutex_lock(&g_input_q.lock);
+    g_input_q.pushed++;
+    if (type == WINIOS_EV_MOUSE && (flags & MOUSEEVENTF_MOVE) &&
+        !(flags & MOUSEEVENTF_ABSOLUTE))
+        g_input_q.rel_moves++;                                  /* ml667 */
+
+    /* Fast path: fold this move into the newest queued one. This is what keeps
+     * a 120Hz stick from ever occupying more than a single slot. */
+    if (g_input_q.head != g_input_q.tail) {
+        unsigned int prev = (g_input_q.head + WINIOS_RING_SIZE - 1) % WINIOS_RING_SIZE;
+        if (winios_ev_mergeable(&g_input_q.buf[prev], &e)) {
+            winios_ev_merge(&g_input_q.buf[prev], &e);
+            g_input_q.coalesced++;
+            goto done;
+        }
+    }
+
+    next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+    if (next == g_input_q.tail) {                  /* full — reclaim, don't drop */
+        winios_q_compact();
+        next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+    }
+    if (next == g_input_q.tail && winios_q_drop_oldest_move())
+        next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
+
+    if (next != g_input_q.tail) {
+        g_input_q.buf[g_input_q.head] = e;
+        g_input_q.head = next;
+    } else {
+        /* 1023 pending transitions and another one arriving. Physically
+         * impossible from ten fingers; log every occurrence if it ever is. */
+        if (winios_ev_is_pure_move(&e)) g_input_q.dropped_move++;
+        else {
+            g_input_q.dropped_trans++;
+            fprintf(stderr, "[input] OVERFLOW dropped transition type=%u x=%d flags=0x%x "
+                            "(total dropped_trans=%u)\n",
+                    e.type, e.x, e.flags, g_input_q.dropped_trans);
+            fflush(stderr);
+        }
+    }
+
+done:
+    depth = (g_input_q.head + WINIOS_RING_SIZE - g_input_q.tail) % WINIOS_RING_SIZE;
+    if (depth > g_input_q.high_water) g_input_q.high_water = depth;
+    pthread_mutex_unlock(&g_input_q.lock);
+}
+
+/* ml661 — one line naming the state of every input stage, so the next log
+ * says which one failed instead of leaving it to be inferred. Emitted from
+ * the drain at most once a second, and only when something is actually
+ * happening (queued work, held keys, or a non-zero drop count). */
+static void winios_q_report(unsigned int depth) {
+    static double next_at;
+    double now = CACurrentMediaTime();
+    unsigned int i, pushed, coalesced, hw, dm, dt, comp, keys, btns, rel;
+    char held[256];
+    int n = 0;
+
+    pthread_mutex_lock(&g_input_q.lock);
+    pushed = g_input_q.pushed; coalesced = g_input_q.coalesced;
+    hw = g_input_q.high_water; dm = g_input_q.dropped_move;
+    dt = g_input_q.dropped_trans; comp = g_input_q.compactions;
+    keys = g_input_q.keys_down; btns = g_input_q.btn_mask;
+    rel = g_input_q.rel_moves;
+    held[0] = 0;
+    for (i = 0; i < 256 && n < (int)sizeof(held) - 8; i++)
+        if (g_input_q.keydown_mask[i >> 5] & (1u << (i & 31)))
+            n += snprintf(held + n, sizeof(held) - n, "%s%02x", n ? "," : "", i);
+    pthread_mutex_unlock(&g_input_q.lock);
+
+    if (now < next_at) return;
+    if (!depth && !keys && !btns && !dm && !dt && !hw) return;
+    next_at = now + 1.0;
+    fprintf(stderr, "[input] ring depth=%u high=%u pushed=%u rel=%u coalesced=%u compact=%u "
+                    "dropped(move=%u trans=%u) drv_keys=%u[%s] drv_btn=0x%x\n",
+            depth, hw, pushed, rel, coalesced, comp, dm, dt, keys, held, btns);
+    fflush(stderr);
+}
+
+/* ml665 — the same two counters winios_q_report prints, but readable on
+ * demand so the app can attribute them to a measurement window of its own.
+ * Takes the ring lock; called once per 10 s window from the mouse queue, so
+ * the cost is not on any hot path. */
+void winios_q_stats(unsigned int *pushed, unsigned int *coalesced) {
+    pthread_mutex_lock(&g_input_q.lock);
+    if (pushed)    *pushed    = g_input_q.pushed;
+    if (coalesced) *coalesced = g_input_q.coalesced;
     pthread_mutex_unlock(&g_input_q.lock);
 }
 
@@ -495,9 +751,29 @@ static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags
  * Coordinates are in iOS view-local pixels; we scale to a fixed
  * 1024×768 logical surface inside winios_pProcessEvents to match
  * what DXMT swapchains use. */
+/* ml — THE POSITION SOURCE FOR DIRECT-LAUNCH MODE'S DRAWN CURSOR.
+ *
+ * These three carry the app's touch-to-mouse bridge and, until now, never
+ * touched the cursor layer at all — winios_pointer (below) is a SEPARATE
+ * entry point (the desktop trackpad, the relative aim-stick/hardware-mouse
+ * path) that already called winios_cursor_move/winios_cursor_advance on
+ * its own ABSOLUTE/relative branches. A direct-launch program's ordinary
+ * absolute tap-and-drag never went through winios_pointer, so it never
+ * moved a drawn cursor even in desktop mode. winios_cursor_move is cheap
+ * to call unconditionally (it no-ops with no layer/host to draw into,
+ * exactly like winios_pointer's own callers already rely on) and mode-
+ * correct on its own — see winios_cursor_host_layer — so no `#ifdef`/mode
+ * check belongs here.
+ *
+ * NOT covered: a program that warps the cursor itself (SetCursorPos,
+ * ClipCursor) without a touch in between — we have no signal for that and
+ * the drawn arrow will not follow it. Acceptable for now; the next touch
+ * (or a resumed drag) snaps it back, same as winios_cursor_advance's own
+ * drift note below. */
 void winios_post_touch_down(int x, int y) {
     fprintf(stderr, "[winios] post_touch_down x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_cursor_move(x, y);
 }
 
 void winios_post_touch_move(int x, int y) {
@@ -506,11 +782,13 @@ void winios_post_touch_move(int x, int y) {
         fprintf(stderr, "[winios] post_touch_move x=%d y=%d (n=%u)\n", x, y, cnt); fflush(stderr);
     }
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_cursor_move(x, y);
 }
 
 void winios_post_touch_up(int x, int y) {
     fprintf(stderr, "[winios] post_touch_up x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_cursor_move(x, y);
 }
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
@@ -523,13 +801,33 @@ unsigned int winios_input_key_events(void) { return g_winios_key_events; }
 unsigned int winios_input_ptr_events(void) { return g_winios_ptr_events; }
 unsigned int winios_input_keys_held(void)  { return g_winios_keys_held; }
 
-void winios_post_key(int vk, int down) {
-    fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr);
+/* ml663 — the general form. extra carries KEYEVENTF_* bits the CALLER knows and
+ * the driver cannot derive: in practice only KEYEVENTF_EXTENDEDKEY, and only for
+ * a key whose virtual-key code is shared with a non-extended twin (numpad Enter
+ * vs Enter). driver_ios.c ORs its own MapVirtualKey-derived extended bit on top,
+ * so passing 0 leaves every other extended key exactly as it behaves today.
+ *
+ * No driver change is required for this: winios_drv_post_key already takes the
+ * queued flags as its starting value rather than rebuilding them. */
+void winios_post_key_ex(int vk, int down, unsigned int extra) {
+    /* A hardware keyboard makes this a hot path in a way ten fingers never
+     * could (held WASD + a chord + autorepeat-free down/up pairs). Log the first
+     * few and then one in 64 — the drain and drv_post_key log the same events
+     * with the same thinning, so a transition is still traceable end to end. */
+    static unsigned cnt;
+    if (cnt++ < 16 || (cnt & 0x3f) == 0) {
+        fprintf(stderr, "[winios] post_key vk=0x%x down=%d extra=0x%x (n=%u)\n",
+                vk, down, extra, cnt);
+        fflush(stderr);
+    }
+    /* ml821 (this fork): input counters for [srv-req]. */
     __sync_fetch_and_add(&g_winios_key_events, 1);
     if (down) __sync_fetch_and_add(&g_winios_keys_held, 1);
     else if (g_winios_keys_held) __sync_fetch_and_sub(&g_winios_keys_held, 1);
-    winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP, 0);
+    winios_q_push_ev(WINIOS_EV_KEY, vk, 0, (down ? 0 : KEYEVENTF_KEYUP) | extra, 0);
 }
+
+void winios_post_key(int vk, int down) { winios_post_key_ex(vk, down, 0); }
 
 BOOL winios_pProcessEvents(DWORD mask) {
     static unsigned int cnt;
@@ -551,6 +849,7 @@ BOOL winios_pProcessEvents(DWORD mask) {
         }
     }
     BOOL drained = FALSE;
+    unsigned int depth = 0;
     for (;;) {
         winios_input_event_t e;
         pthread_mutex_lock(&g_input_q.lock);
@@ -560,12 +859,48 @@ BOOL winios_pProcessEvents(DWORD mask) {
         }
         e = g_input_q.buf[g_input_q.tail];
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
+        depth = (g_input_q.head + WINIOS_RING_SIZE - g_input_q.tail) % WINIOS_RING_SIZE;
+        /* ml661: the driver's own view of what is held. The app posts what it
+         * believes; THIS is what wine was actually told. A mismatch between the
+         * two ("[input] app held" vs "drv_keys_down") is the whole diagnosis. */
+        if (e.type == WINIOS_EV_KEY && e.x >= 0 && e.x < 256) {
+            unsigned int *w = &g_input_q.keydown_mask[e.x >> 5], b = 1u << (e.x & 31);
+            if (e.flags & KEYEVENTF_KEYUP) {
+                if (*w & b) { *w &= ~b; if (g_input_q.keys_down) g_input_q.keys_down--; }
+            } else if (!(*w & b)) { *w |= b; g_input_q.keys_down++; }
+        } else if (e.type == WINIOS_EV_MOUSE) {
+            if (e.flags & MOUSEEVENTF_LEFTDOWN)   g_input_q.btn_mask |= 1u;
+            if (e.flags & MOUSEEVENTF_LEFTUP)     g_input_q.btn_mask &= ~1u;
+            if (e.flags & MOUSEEVENTF_RIGHTDOWN)  g_input_q.btn_mask |= 2u;
+            if (e.flags & MOUSEEVENTF_RIGHTUP)    g_input_q.btn_mask &= ~2u;
+            if (e.flags & MOUSEEVENTF_MIDDLEDOWN) g_input_q.btn_mask |= 4u;
+            if (e.flags & MOUSEEVENTF_MIDDLEUP)   g_input_q.btn_mask &= ~4u;
+            /* X1/X2 share one flag pair and are told apart by mouseData. */
+            if (e.flags & MOUSEEVENTF_XDOWN)
+                g_input_q.btn_mask |= (e.data & WINIOS_XBUTTON2) ? 16u : 8u;
+            if (e.flags & MOUSEEVENTF_XUP)
+                g_input_q.btn_mask &= ~((e.data & WINIOS_XBUTTON2) ? 16u : 8u);
+        }
         pthread_mutex_unlock(&g_input_q.lock);
 
-        /* One write+flush per input event; with a stick driving mouse-look
-         * that is 60/s of real I/O. Same quiet gate as the pump log above. */
-        if (!quiet) {
-            fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        /* ml661: this loop runs INSIDE the game's message pump, so its own cost
+         * is frame time. A per-event fprintf+fflush with hundreds of coalesced
+         * moves behind it was paying for the stall it was meant to diagnose.
+         * Transitions still log every time — they are rare and they are the
+         * events worth tracing; moves log one in 64. */
+        /* ml821 (this fork): MADEIRA_QUIET silences the drain log entirely. */
+        if (quiet) {
+        } else if (e.type == WINIOS_EV_KEY || !winios_ev_is_pure_move(&e)) {
+            fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x q=%u\n",
+                    e.type, e.x, e.y, e.flags, depth);
+            fflush(stderr);
+        } else {
+            static unsigned mv;
+            if ((mv++ % 64) == 0) {
+                fprintf(stderr, "[winios] drain move x=%d y=%d flags=0x%x q=%u (n=%u)\n",
+                        e.x, e.y, e.flags, depth, mv);
+                fflush(stderr);
+            }
         }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
@@ -573,7 +908,48 @@ BOOL winios_pProcessEvents(DWORD mask) {
             winios_drv_post_mouse(e.x, e.y, e.flags, e.data, NULL);
         drained = TRUE;
     }
+    winios_q_report(depth);
     return drained;
+}
+
+/* ml661 — app-side release valve. Swift calls this when it decides the user
+ * cannot possibly still be holding anything (app resigned active, the control
+ * overlay was toggled away under a thumb, a gesture was cancelled): it posts a
+ * key-up for every key the DRIVER still believes is down. The app's own
+ * held-set is authoritative for intent, but this one closes the gap where the
+ * app's down got through and its up did not. */
+void winios_release_all_keys(void) {
+    unsigned int vks[64];
+    unsigned int i, n = 0, btns;
+
+    pthread_mutex_lock(&g_input_q.lock);
+    for (i = 0; i < 256 && n < 64; i++)
+        if (g_input_q.keydown_mask[i >> 5] & (1u << (i & 31))) vks[n++] = i;
+    btns = g_input_q.btn_mask;
+    pthread_mutex_unlock(&g_input_q.lock);
+
+    if (!n && !btns) return;
+    fprintf(stderr, "[input] release_all: %u key(s) + btn_mask=0x%x still down driver-side\n",
+            n, btns);
+    fflush(stderr);
+    for (i = 0; i < n; i++)
+        winios_q_push_ev(WINIOS_EV_KEY, (int)vks[i], 0, KEYEVENTF_KEYUP, 0);
+    if (btns & 1u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_LEFTUP, 0);
+    if (btns & 2u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_RIGHTUP, 0);
+    if (btns & 4u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_MIDDLEUP, 0);
+    if (btns & 8u)  winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_XUP, WINIOS_XBUTTON1);
+    if (btns & 16u) winios_q_push_ev(WINIOS_EV_MOUSE, 0, 0, MOUSEEVENTF_XUP, WINIOS_XBUTTON2);
+}
+
+/* ml661 — what the driver believes is held, for the app's [input] line. Bit i
+ * of the 8-word mask is vk i; returns the count. mask may be NULL. */
+int winios_held_keys(unsigned int mask[8]) {
+    int i, n;
+    pthread_mutex_lock(&g_input_q.lock);
+    if (mask) for (i = 0; i < 8; i++) mask[i] = g_input_q.keydown_mask[i];
+    n = (int)g_input_q.keys_down;
+    pthread_mutex_unlock(&g_input_q.lock);
+    return n;
 }
 
 /* ============================================================ *
@@ -721,18 +1097,7 @@ static void winios_ensure_compositor(void) {
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");
     fflush(stderr);
-    /* Wedged-thread triage: sample every thread's stack every 20s from
-     * an app-side timer — keeps firing even when all wine threads are
-     * stuck (unlike the tree dump, which rides wine's event drain). */
-    static dispatch_source_t stack_timer;
-    if (!stack_timer) {
-        stack_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                          dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-        dispatch_source_set_timer(stack_timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
-                                  20 * NSEC_PER_SEC, NSEC_PER_SEC);
-        dispatch_source_set_event_handler(stack_timer, ^{ ios_dump_all_thread_stacks(); });
-        dispatch_resume(stack_timer);
-    }
+    winios_stack_timer_start();
 }
 
 /* main thread only */
@@ -1294,6 +1659,74 @@ static int winios_game_mode(void) {
     return gm;
 }
 
+/* ml — DIRECT-LAUNCH CURSOR HOST.
+ *
+ * Desktop mode hosts the drawn cursor on g_compositor_view (above) — that
+ * view only exists in desktop mode, by winios_ensure_compositor's own
+ * gate. A directly-launched program has no such view: its presented
+ * surface is the app's own window-level CAMetalLayer (MetalHostView, added
+ * directly to the UIWindow above the entire SwiftUI tree — see
+ * ContentView.swift's file-top comment), so in that mode the cursor is
+ * hosted as a sublayer of THAT layer instead. Swift hands us its address
+ * once, right after registering the same layer with DXMT
+ * (MetalBackedView.didMoveToWindow) — see winios_set_game_layer, and
+ * Winios.h's doc comment for why this takes `void *` and not `CAMetalLayer
+ * *`.
+ *
+ * Positioning then needs only two numbers this file can get on its own:
+ * the layer's own `bounds` (which IS the current game rect in POINTS —
+ * MetalHostView.shared.frame is set to exactly GameSurfaceLayout.rect()
+ * converted to window coordinates on every apply, so the layer's LOCAL
+ * bounds are that rect's SIZE at local origin (0,0), independent of where
+ * the rect sits in the window) and the guest's logical resolution
+ * (winios_screen_size(), the same live source ContentView.swift's own
+ * touch-mapping and display code reads — see its guestSize()/mapTouch()).
+ * A drawable presented into a CAMetalLayer fills its bounds exactly
+ * (default contentsGravity is resize/stretch, and gameRect() already chose
+ * this rect to HAVE the guest's own aspect for every DisplayMode except
+ * Stretch, where stretching is the guest's own mapping too) — so
+ * guest-pixel -> layer-point is one uniform scale that is correct for
+ * every DisplayMode, in the normal view, the wide view and fullscreen,
+ * with no separate rect math to keep in sync with GameSurfaceLayout's. */
+static CALayer *g_game_layer;
+
+void winios_set_game_layer(void *metal_layer) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_game_layer = (__bridge CALayer *)metal_layer;
+    });
+}
+
+/* Implemented in IOSDisplayShim.m; declared there for Swift, not exported
+ * through a shared ObjC header this pure-C-safe file could include. Same
+ * "read the LIVE published size, not a launch-time constant" reasoning as
+ * every other caller — see winios_screen_size's own doc comment there. */
+extern void winios_screen_size(int *w, int *h);
+
+/* Cached once: MADEIRA_DESKTOP is fixed for a process's lifetime. */
+static int winios_cursor_desktop_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *dm = getenv("MADEIRA_DESKTOP");
+        mode = (dm && *dm == '1') ? 1 : 0;
+    }
+    return mode;
+}
+
+/* The layer the cursor draws into for the CURRENT mode: the desktop
+ * compositor in desktop mode (ensuring it exists first, same as every
+ * other desktop-mode caller in this file), or the game's own presented
+ * layer in direct-launch mode — NEVER the compositor there, which
+ * winios_ensure_compositor already refuses to create outside desktop mode
+ * (its own gate), so calling it in direct-launch mode is a harmless no-op
+ * left in place below rather than duplicating that mode check here. */
+static CALayer *winios_cursor_host_layer(void) {
+    if (winios_cursor_desktop_mode()) {
+        winios_ensure_compositor();
+        return g_compositor_view.layer;
+    }
+    return g_game_layer;
+}
+
 static UIImage *winios_cursor_image(void) {
     static UIImage *img;
     static dispatch_once_t once;
@@ -1325,40 +1758,105 @@ static UIImage *winios_cursor_image(void) {
 static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
 static CGPoint g_cursor_pos_px;
 
-/* main thread only */
+/* main thread only. Creates the layer at most once (process lifetime, like
+ * every other singleton layer in this file) and re-parents it onto
+ * whichever host is current — needed because a single app process can run
+ * a desktop session and a direct-launch session back to back, and the two
+ * modes host on different layers (see winios_cursor_host_layer above).
+ * Superlayer-equality check makes the re-parent a no-op on the hot path
+ * (called from every cursor move/set), not just on a genuine mode switch. */
 static void winios_ensure_cursor_layer(void) {
-    if (g_cursor_layer || !g_compositor_view) return;
-    UIImage *img = winios_cursor_image();
-    g_cursor_layer = [CALayer layer];
-    g_cursor_layer.zPosition = 10000;   /* above every window layer */
-    g_cursor_layer.anchorPoint = CGPointMake(0, 0);
-    g_cursor_layer.contents = (id)img.CGImage;
-    g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
-    g_cursor_layer.magnificationFilter = kCAFilterNearest;
-    [g_compositor_view.layer addSublayer:g_cursor_layer];
+    CALayer *host = winios_cursor_host_layer();
+    if (!host) return;
+    if (!g_cursor_layer) {
+        UIImage *img = winios_cursor_image();
+        g_cursor_layer = [CALayer layer];
+        g_cursor_layer.zPosition = 10000;   /* above every window/game layer */
+        g_cursor_layer.anchorPoint = CGPointMake(0, 0);
+        g_cursor_layer.contents = (id)img.CGImage;
+        g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
+        g_cursor_layer.magnificationFilter = kCAFilterNearest;
+        /* ml — VISIBILITY DEFAULT. Desktop mode's default here was always
+         * NO (a plain CALayer starts visible) — untouched, so an existing
+         * session's exact behaviour never changes (a move before the
+         * first WM_SETCURSOR already drew the builtin fallback arrow, and
+         * that stays true). Direct-launch mode starts HIDDEN instead: a
+         * game's first TOUCH (see winios_post_touch_down/move, which now
+         * call winios_cursor_move too — the position source for absolute
+         * taps/drags) can create this layer before the game has ever
+         * called SetCursor, and the spec is explicit that the cursor stays
+         * hidden until it does. winios_cursor_show below ensures this
+         * layer itself in direct-launch mode specifically so an early
+         * pSetCursor(NULL)/show(1) that arrives before any image is never
+         * lost to this ordering. */
+        g_cursor_layer.hidden = winios_cursor_desktop_mode() ? NO : YES;
+    }
+    if (g_cursor_layer.superlayer != host) {
+        [g_cursor_layer removeFromSuperlayer];
+        [host addSublayer:g_cursor_layer];
+    }
 }
 
 /* main thread only — place (and size) the cursor at its stored px pos,
  * honoring the wine cursor's hotspot when one is set */
 static void winios_cursor_place(void) {
     if (!g_cursor_layer) return;
+    if (winios_cursor_desktop_mode()) {
+        CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+        if (g_cur_w > 0) {
+            g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
+            g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
+                                                  g_desk_origin.y + (y - g_cur_hy) * g_px_to_pt);
+        } else {
+            g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
+                                                  g_desk_origin.y + y * g_px_to_pt);
+        }
+        return;
+    }
+    /* Direct-launch mode — see winios_set_game_layer's doc comment above
+     * for why g_game_layer's own bounds ARE the current game rect and no
+     * window-coordinate offset belongs here (these are LOCAL sublayer
+     * coordinates, origin at the layer's own top-left). */
+    if (!g_game_layer) return;
+    int gw = 0, gh = 0;
+    winios_screen_size(&gw, &gh);
+    if (gw <= 0) gw = 1024;
+    if (gh <= 0) gh = 768;
+    CGRect hb = g_game_layer.bounds;
+    if (hb.size.width <= 0 || hb.size.height <= 0) return;
+    CGFloat sx = hb.size.width / gw, sy = hb.size.height / gh;
+    /* Cursor GLYPH never shrinks past 1x (spec) even when sx/sy < 1 on a
+     * small live-view column, but the drawn POSITION still uses the true,
+     * unclamped sx/sy — or the arrow would drift off its real hotspot as
+     * the gap between "where it should be" and "how big it is drawn"
+     * grows. A few points of hotspot slop on a heavily shrunk view is the
+     * accepted trade for the glyph staying visible at all. */
+    CGFloat imgScale = MAX(1.0, MIN(sx, sy));
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
     if (g_cur_w > 0) {
-        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
-        g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
-                                              g_desk_origin.y + (y - g_cur_hy) * g_px_to_pt);
+        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * imgScale, g_cur_h * imgScale);
+        g_cursor_layer.position = CGPointMake((x - g_cur_hx) * sx, (y - g_cur_hy) * sy);
     } else {
-        g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
-                                              g_desk_origin.y + y * g_px_to_pt);
+        g_cursor_layer.position = CGPointMake(x * sx, y * sy);
     }
 }
 
 void winios_cursor_move(int x, int y) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
         winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
         g_cursor_pos_px = CGPointMake(x, y);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_cursor_place();
+        [CATransaction commit];
+    });
+}
+
+/* See winios_cursor_relayout's doc comment in Winios.h. */
+void winios_cursor_relayout(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_cursor_layer || winios_cursor_desktop_mode()) return;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         winios_cursor_place();
@@ -1414,12 +1912,77 @@ void winios_cursor_show(int show) {
             if (madeira_game_cursor_show) madeira_game_cursor_show( show );
             return;
         }
+        /* ml — direct-launch mode only: winios_drv_set_cursor calls
+         * show(1)/show(0) BEFORE winios_cursor_set for the very first
+         * cursor of a session (see its own ordering in driver_ios.c), so
+         * without ensuring the layer here that first show() call would
+         * arrive with no layer to act on, and — since a freshly created
+         * layer now starts HIDDEN in direct-launch mode (see
+         * winios_ensure_cursor_layer) — the cursor could end up stuck
+         * hidden even after a real, non-NULL SetCursor. Desktop mode is
+         * untouched: it never ensured the layer here before, and still
+         * doesn't — winios_cursor_move/winios_cursor_set already do that
+         * on the very next call in the exact same order they always have,
+         * so behaviour there is unchanged. */
+        if (!winios_cursor_desktop_mode()) winios_ensure_cursor_layer();
         if (g_cursor_layer) g_cursor_layer.hidden = !show;
     });
 }
 
 /* Swift trackpad engine → wine. Absolute desktop-pixel coords; the
  * engine owns the cursor position. */
+/* ml663 — advance the DRAWN cursor by a relative delta, clamped to the wine
+ * desktop. Mirrors what the wineserver does with the same event
+ * (update_desktop_cursor_pos: x = cursor.x + input->mouse.x, then clamp), so the
+ * arrow on screen and wine's own cursor stay at the same place.
+ *
+ * Deliberately NOT a second source of truth: it moves nothing in wine, it only
+ * draws. If the two ever drift, the next absolute event (or wine's own
+ * SetCursorPos reaching winios_cursor_move) snaps this back. */
+static void winios_cursor_advance(int dx, int dy) {
+    if (!dx && !dy) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
+        /* ml — desktop mode keeps reading MADEIRA_SCREEN_W/H exactly as it
+         * always did (that session's desktop size is a launch-time
+         * constant in practice — untouched, requirement is "desktop mode
+         * behaves exactly as before"). Direct-launch mode reuses the SAME
+         * clamp-and-advance logic (that is the whole point — this path
+         * already accumulates and clamps a position for winios_cursor_move,
+         * just needed somewhere to draw and the right resolution to clamp
+         * against) but asks winios_screen_size() for it, the live-published
+         * guest resolution a game may have changed via ChangeDisplaySettings
+         * — env vars are a launch-time hint only there. */
+        int desk_w, desk_h;
+        if (winios_cursor_desktop_mode()) {
+            const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
+            desk_w = dw ? atoi(dw) : 1024;
+            desk_h = dh ? atoi(dh) : 768;
+        } else {
+            winios_screen_size(&desk_w, &desk_h);
+        }
+        if (desk_w <= 0) desk_w = 1024;
+        if (desk_h <= 0) desk_h = 768;
+        CGFloat x = g_cursor_pos_px.x + dx, y = g_cursor_pos_px.y + dy;
+        if (x < 0) x = 0; else if (x > desk_w - 1) x = desk_w - 1;
+        if (y < 0) y = 0; else if (y > desk_h - 1) y = desk_h - 1;
+        g_cursor_pos_px = CGPointMake(x, y);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_cursor_place();
+        [CATransaction commit];
+    });
+}
+
+/* ml663 — set by the app while a hardware mouse is driving relative motion.
+ * The aim stick and the touch mouse-look path leave it off: in those modes the
+ * game has hidden the cursor and the extra main-queue hop per sample is pure
+ * cost (see the ml641 note below). A real mouse in a menu is the opposite case —
+ * there IS a visible arrow and it has to follow the hand. */
+static _Atomic int g_rel_cursor;
+void winios_cursor_track_relative(int on) { g_rel_cursor = on ? 1 : 0; }
+
 void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
     __sync_fetch_and_add(&g_winios_ptr_events, 1);   /* ml821 */
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, flags, data);
@@ -1428,7 +1991,122 @@ void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
      * top-left corner on every event. Relative mode is mouse-look, where the game
      * has hidden the cursor anyway — there is nothing to draw, and skipping this
      * also drops a dispatch_async to the main queue per touch sample. */
-    if ((flags & MOUSEEVENTF_MOVE) && (flags & MOUSEEVENTF_ABSOLUTE)) winios_cursor_move(x, y);
+    if (flags & MOUSEEVENTF_MOVE) {
+        if (flags & MOUSEEVENTF_ABSOLUTE) winios_cursor_move(x, y);
+        else if (g_rel_cursor) winios_cursor_advance(x, y);
+    }
+}
+
+/* ============================================================ *
+ * ml668 — the gamepad slots. See the long comment in Winios.h for why this
+ * is a state and not a queue, and why the reader uses a seqlock.
+ * ============================================================ */
+
+struct winios_gamepad_slot {
+    _Atomic unsigned int seq;          /* even = stable, odd = writer inside */
+    struct winios_gamepad st;
+};
+
+static struct winios_gamepad_slot g_pads[WINIOS_GAMEPAD_MAX];
+/* Serialises WRITERS only. Readers never take it — that is the point. The app
+ * publishes from one queue today, but a second producer (a future second pad
+ * source) must not be able to interleave two odd sequences on one slot. */
+static pthread_mutex_t g_pads_write_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned int g_pad_samples, g_pad_packets;
+
+/* Everything except `packet` — the identity a change is measured against. */
+static inline int winios_gamepad_same(const struct winios_gamepad *a,
+                                      const struct winios_gamepad *b) {
+    return a->buttons == b->buttons
+        && a->left_trigger == b->left_trigger && a->right_trigger == b->right_trigger
+        && a->lx == b->lx && a->ly == b->ly && a->rx == b->rx && a->ry == b->ry
+        && a->connected == b->connected;
+}
+
+void winios_gamepad_set_state(int index, const struct winios_gamepad *st) {
+    struct winios_gamepad_slot *slot;
+    struct winios_gamepad next;
+    unsigned int seq;
+
+    if (index < 0 || index >= WINIOS_GAMEPAD_MAX) return;
+    slot = &g_pads[index];
+
+    if (st) next = *st;
+    else { memset(&next, 0, sizeof(next)); }
+    next.reserved[0] = next.reserved[1] = next.reserved[2] = 0;
+
+    pthread_mutex_lock(&g_pads_write_lock);
+    atomic_fetch_add_explicit(&g_pad_samples, 1, memory_order_relaxed);
+    if (winios_gamepad_same(&next, &slot->st)) {
+        /* Nothing moved. Leaving the packet number alone is the CONTRACT: a
+         * game that re-polls and sees the same packet skips its own input
+         * processing entirely, which is most of what XInput's packet number is
+         * for. Bumping it here would make every poll look like a new report. */
+        pthread_mutex_unlock(&g_pads_write_lock);
+        return;
+    }
+    /* A packet number of 0 is indistinguishable from "never reported" to some
+     * engines, so the first change lands on 1 and it only ever grows. */
+    next.packet = slot->st.packet + 1;
+    if (!next.packet) next.packet = 1;
+
+    seq = atomic_load_explicit(&slot->seq, memory_order_relaxed);
+    atomic_store_explicit(&slot->seq, seq + 1, memory_order_relaxed);   /* odd */
+    atomic_thread_fence(memory_order_release);
+    slot->st = next;
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&slot->seq, seq + 2, memory_order_relaxed);   /* even */
+    atomic_fetch_add_explicit(&g_pad_packets, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&g_pads_write_lock);
+
+    {
+        /* One line per connect/disconnect edge, never per sample: this runs at
+         * 250 Hz and a log line per report would bury the rest of the session. */
+        static unsigned char was_connected[WINIOS_GAMEPAD_MAX];
+        if (was_connected[index] != next.connected) {
+            was_connected[index] = next.connected;
+            fprintf(stderr, "[winios] gamepad slot %d %s\n",
+                    index, next.connected ? "connected" : "disconnected");
+            fflush(stderr);
+        }
+    }
+}
+
+int winios_gamepad_get_state(int index, struct winios_gamepad *out) {
+    struct winios_gamepad_slot *slot;
+    struct winios_gamepad copy;
+    unsigned int s0, s1;
+    int tries;
+
+    if (index < 0 || index >= WINIOS_GAMEPAD_MAX) {
+        if (out) memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    slot = &g_pads[index];
+
+    /* Bounded, because an unbounded retry loop on a hot poll is a hang waiting
+     * for a scheduling accident. Four attempts is far more than a 16-byte copy
+     * can lose to a writer that only runs 250 times a second; if all four lose,
+     * report the pad as absent for this one poll rather than hand the game a
+     * torn sample — the next poll is a millisecond away. */
+    for (tries = 0; tries < 4; tries++) {
+        s0 = atomic_load_explicit(&slot->seq, memory_order_acquire);
+        if (s0 & 1u) continue;
+        copy = slot->st;
+        atomic_thread_fence(memory_order_acquire);
+        s1 = atomic_load_explicit(&slot->seq, memory_order_relaxed);
+        if (s0 != s1) continue;
+        if (!copy.connected) break;
+        if (out) *out = copy;
+        return 1;
+    }
+    if (out) memset(out, 0, sizeof(*out));
+    return 0;
+}
+
+void winios_gamepad_stats(unsigned int *samples, unsigned int *packets) {
+    if (samples) *samples = atomic_load_explicit(&g_pad_samples, memory_order_relaxed);
+    if (packets) *packets = atomic_load_explicit(&g_pad_packets, memory_order_relaxed);
 }
 
 /* ============================================================ *

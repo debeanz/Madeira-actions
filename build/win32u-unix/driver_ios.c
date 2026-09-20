@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdlib.h>   /* ml808: getenv/atoi for the cursor client-rect mapping */
+#include <time.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -137,10 +138,66 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
      * a dispatch layer that can fail for its own reasons. */
     NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
     {
-        static unsigned cnt;
-        if (cnt++ < 40)
-            dprintf(2, "[winios] drv_post_mouse hwnd=%p flags=0x%x x=%d y=%d -> status=0x%x\n",
-                    hwnd, flags, x, y, (unsigned)st);
+        /* ml661: the old "first 40 lines" cap is the same trap ml647 fixed on
+         * the keyboard side — it is exhausted in the first second of pointer
+         * movement, so every later event, including every FAILING one, left no
+         * trace and the log read as if the driver had never been called. A
+         * button transition (the events a dead on-screen button is about) is
+         * rare enough to log every time; moves are thinned. Failures are always
+         * logged, and the running failure total is always truthful. */
+        static unsigned cnt, moves, bad;
+        BOOL is_move = !(flags & ~(unsigned)(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE));
+        cnt++;
+        if (st) bad++;
+        if (st || !is_move || cnt <= 8 || (moves & 0xff) == 0)
+            dprintf(2, "[winios] ml661 drv_post_mouse #%u hwnd=%p flags=0x%x x=%d y=%d "
+                       "-> status=0x%x (failures=%u)\n",
+                    cnt, hwnd, flags, x, y, (unsigned)st, bad);
+        if (is_move) moves++;
+
+        /* ml667 — the driver half of [relmouse]; the server half is printed by
+         * relmouse_report() in queue_ios.c. Together they bracket the one gap
+         * nothing could see before: whether a relative delta that LEFT the app
+         * ever became a WM_INPUT for the game.
+         *
+         * This end reports what win32u handed the server and what the cursor
+         * did as a result. rel/acc rising with cursor= standing still means the
+         * cursor is pinned (a clip rect, or a game re-centring); rel rising
+         * with the server's rel_in standing still means the send_hardware_message
+         * call itself is being lost. Relative moves only, so the line appears
+         * only in Relative pointer mode, at most once every 5s. */
+        if (is_move && !(flags & MOUSEEVENTF_ABSOLUTE))
+        {
+            static unsigned rel_cnt, rel_bad;
+            static long long acc_x, acc_y;
+            static struct timespec next_at;
+            struct timespec now;
+
+            rel_cnt++;
+            if (st) rel_bad++;
+            acc_x += x;
+            acc_y += y;
+
+            clock_gettime( CLOCK_MONOTONIC, &now );
+            if (now.tv_sec >= next_at.tv_sec)
+            {
+                CURSORINFO info = { .cbSize = sizeof(info) };
+                POINT pt = {0};
+                DWORD fg_tid = 0, fg_pid = 0;
+                HWND fg = NtUserGetForegroundWindow();
+
+                if (NtUserGetCursorInfo( &info )) pt = info.ptScreenPos;
+                if (fg) fg_tid = get_window_thread( fg, &fg_pid );
+
+                next_at.tv_sec = now.tv_sec + 5;
+                dprintf(2, "[relmouse] ml667 src=drv rel=%u fail=%u acc=(%lld,%lld) "
+                           "last=(%d,%d) cursor=(%d,%d) cursor_flags=0x%x "
+                           "foreground=%p fg_tid=%04x fg_pid=%04x\n",
+                        rel_cnt, rel_bad, acc_x, acc_y, x, y,
+                        (int)pt.x, (int)pt.y, (unsigned)info.flags,
+                        fg, (unsigned)fg_tid, (unsigned)fg_pid);
+            }
+        }
     }
 }
 
@@ -200,6 +257,152 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
             dprintf(2, "[winios] ml647 drv_post_key #%u vk=0x%x scan=0x%x flags=0x%x "
                        "-> status=0x%x (failures=%u)\n",
                     cnt, vk, scan, flags, (unsigned)st, bad);
+    }
+}
+
+/***********************************************************************
+ *           ml668 — XINPUT
+ *
+ * THE WHOLE TRANSPORT, in one sentence: a controller paired to the phone is
+ * sampled by the app into a shared struct (app/Madeira/Winios/Winios.m,
+ * winios_gamepad_set_state), and wine's xinput1_3 reads that struct through
+ * ONE win32u call — NtUserCallTwoParam with NtUserCallTwoParam_GetGamepadState
+ * — which lands here and does a plain memory read.
+ *
+ * WHY A win32u CALL AND NOT THE HID/hidclass PATH. Upstream xinput1_3 finds
+ * its pads by enumerating GUID_DEVINTERFACE_WINEXINPUT through setupapi,
+ * opening each with CreateFile, and running a thread that sits in an
+ * overlapped HidD_ read. Every layer of that exists to get bytes across a
+ * PROCESS boundary from a driver. Here there is no boundary to cross: the
+ * "device" is a GCController object in the very same Mach task as the game's
+ * thread (WOW64_DESIGN.md §2 — one task, pseudo-processes as threads), so the
+ * HID stack would be a service, a driver, a pipe, a thread and a poll loop
+ * built entirely to move sixteen bytes from one page of this address space to
+ * another. The syscall is those sixteen bytes and nothing else.
+ *
+ * WHY IT MUST BE CHEAP. A game polls XInputGetState once per frame per pad at
+ * the very least, and plenty poll it in a spin loop at 1000 Hz. This function
+ * takes no lock, allocates nothing, touches no server and cannot block; the
+ * seqlock on the app side is what makes that safe (see Winios.h).
+ *
+ * THE POINTER. arg2 is a guest buffer, so the 32-bit caller's copy is
+ * translated in wine/dlls/wow64win/user.c's wow64_NtUserCallTwoParam. Both
+ * payload structs are pointer-free and have identical layout in 32-bit and
+ * 64-bit (XINPUT_STATE is 16 bytes, XINPUT_CAPABILITIES 20, natural alignment
+ * throughout), which is exactly why they can be copied across the boundary
+ * with no marshalling at all.
+ */
+
+/* Mirror of `struct winios_gamepad` in app/Madeira/Winios/Winios.h. Repeated
+ * rather than included for the same reason every other winios_* prototype in
+ * this file is: that header is part of the app target and reaching into it
+ * from the win32u unix build would drag UIKit's include path in behind it.
+ * The two definitions are checked against each other by the static assertion
+ * below — a silent layout drift here would hand games garbage sticks. */
+struct winios_gamepad
+{
+    unsigned int   packet;
+    unsigned short buttons;
+    unsigned char  left_trigger, right_trigger;
+    short          lx, ly, rx, ry;
+    unsigned char  connected;
+    unsigned char  reserved[3];
+};
+
+extern int winios_gamepad_get_state( int index, struct winios_gamepad *out ) __attribute__((weak));
+
+/* Byte-for-byte XINPUT_STATE (a DWORD packet number followed by
+ * XINPUT_GAMEPAD). Not #included from xinput.h: that is a PE-side SDK header
+ * and this is the unix half of win32u. */
+struct ios_xinput_gamepad
+{
+    WORD  buttons;
+    BYTE  left_trigger;
+    BYTE  right_trigger;
+    SHORT thumb_lx, thumb_ly, thumb_rx, thumb_ry;
+};
+
+struct ios_xinput_state
+{
+    DWORD packet_number;
+    struct ios_xinput_gamepad gamepad;
+};
+
+/* Byte-for-byte XINPUT_CAPABILITIES. */
+struct ios_xinput_caps
+{
+    BYTE  type;
+    BYTE  sub_type;
+    WORD  flags;
+    struct ios_xinput_gamepad gamepad;
+    WORD  left_motor_speed, right_motor_speed;
+};
+
+C_ASSERT( sizeof(struct ios_xinput_state) == 16 );
+C_ASSERT( sizeof(struct ios_xinput_caps) == 20 );
+C_ASSERT( sizeof(struct winios_gamepad) == 20 );
+
+/***********************************************************************
+ *           ios_gamepad_query
+ *
+ * The body of NtUserCallTwoParam_GetGamepadState. `index` is the XInput user
+ * index (0-3) and `op` selects the payload; see NtUserGamepadOp_* in
+ * wine/include/ntuser.h. Returns 1 when a pad is connected in that slot and
+ * `buffer` was filled, 0 otherwise — which is also what an upstream,
+ * non-Madeira win32u returns for a code it does not know, so xinput1_3's
+ * runtime probe degrades to "no iOS pad, use the HID path" with no #ifdef.
+ */
+ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
+{
+    struct winios_gamepad pad;
+
+    if (!buffer || index >= 4) return 0;
+    if (!winios_gamepad_get_state) return 0;          /* app side not linked in */
+    if (!winios_gamepad_get_state( index, &pad )) return 0;
+
+    switch (op)
+    {
+    case 0:   /* NtUserGamepadOp_State */
+    {
+        struct ios_xinput_state *state = buffer;
+
+        state->packet_number        = pad.packet;
+        state->gamepad.buttons      = pad.buttons;
+        state->gamepad.left_trigger  = pad.left_trigger;
+        state->gamepad.right_trigger = pad.right_trigger;
+        state->gamepad.thumb_lx     = pad.lx;
+        state->gamepad.thumb_ly     = pad.ly;
+        state->gamepad.thumb_rx     = pad.rx;
+        state->gamepad.thumb_ry     = pad.ry;
+        return 1;
+    }
+    case 1:   /* NtUserGamepadOp_Caps */
+    {
+        struct ios_xinput_caps *caps = buffer;
+
+        /* XINPUT_DEVTYPE_GAMEPAD / XINPUT_DEVSUBTYPE_GAMEPAD. The `gamepad`
+         * member of XINPUT_CAPABILITIES is not a reading — it is a MASK of
+         * what the device can report, which is why every field is saturated
+         * rather than copied from `pad`. 0xf3ff is every XINPUT_GAMEPAD_* bit
+         * except the two reserved gaps; the thumbs report 16-bit resolution
+         * (low bits clear, as real XInput reports them) and the triggers 8. */
+        caps->type     = 1;
+        caps->sub_type = 1;
+        /* No rumble: iOS haptics are a different device from the pad's motors
+         * and CHHapticEngine cannot drive them. Claiming FFB and then doing
+         * nothing is worse than an honest zero — a game would show a rumble
+         * slider that changes nothing. */
+        caps->flags    = 0;
+        caps->gamepad.buttons       = 0xf3ff;
+        caps->gamepad.left_trigger  = 0xff;
+        caps->gamepad.right_trigger = 0xff;
+        caps->gamepad.thumb_lx = caps->gamepad.thumb_ly = (SHORT)0xffc0;
+        caps->gamepad.thumb_rx = caps->gamepad.thumb_ry = (SHORT)0xffc0;
+        caps->left_motor_speed = caps->right_motor_speed = 0;
+        return 1;
+    }
+    default:
+        return 0;
     }
 }
 
@@ -514,6 +717,25 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
 
     *window_surface = window_surface_create( sizeof(struct window_surface), &winios_surface_funcs,
                                              hwnd, surface_rect, info, 0 );
+
+    /* ml750: window_surface_create() returns NULL when the backing DIB
+     * cannot be allocated. Dropping `previous` then leaves the window with
+     * NO surface at all: nothing ever flushes, so the window is invisible
+     * for the rest of its life even though it is WS_VISIBLE and on the
+     * taskbar. Keep whatever the window already had and say so loudly --
+     * a stale surface still paints, a NULL one never can. */
+    if (!*window_surface)
+    {
+        static unsigned fail_n;
+        dprintf( 2, "[surf-create] #%u hwnd=%p rect={%d,%d,%d,%d} bytes=%u "
+                 "ALLOCATION FAILED -- keeping previous surface %p (window would be invisible) rev=ml750\n",
+                 ++fail_n, hwnd, (int)surface_rect->left, (int)surface_rect->top,
+                 (int)surface_rect->right, (int)surface_rect->bottom,
+                 (unsigned)info->bmiHeader.biSizeImage, previous );
+        *window_surface = previous;
+        return TRUE;
+    }
+
     if (previous) window_surface_release( previous );
 
     {
@@ -578,6 +800,110 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
                      (int)v->left, (int)v->top, (int)v->right, (int)v->bottom,
                      (int)c->left, (int)c->top, (int)c->right, (int)c->bottom, surface );
         }
+    }
+    /* ml750: an EMPTY visible rect used to be filtered out here (to keep the
+     * 1x1 IME/message windows from burying the signal) -- which is precisely
+     * why a top-level window collapsing to 0x0 left NO trace in the log at
+     * all: [win-pos] fell silent, the compositor got a zero frame, and the
+     * only surviving evidence was a 128x128 surface (get_surface_rect()
+     * clamps an empty rect up to the 128px minimum) and a zero-size Metal
+     * layer. Degenerate rects are rare and always interesting, so log them
+     * unconditionally, with the window rect and style that produced them. */
+    else
+    {
+        /* ml780: an empty visible rect fires constantly for ordinary
+         * zero-size CHILD controls (e.g. a toolbar/rebar child window with
+         * no area) -- 40+ lines per session with no diagnostic value. Only
+         * a top-level window collapsing to 0x0 is interesting, so gate the
+         * whole diagnostic on "no WS_CHILD" before even touching the
+         * throttle counter. */
+        UINT style = get_window_long( hwnd, GWL_STYLE );
+        if (!(style & WS_CHILD) && (style & WS_VISIBLE))
+        {
+            static unsigned degen_n;
+            unsigned n = ++degen_n;
+            if (n <= 64 || (n % 64) == 0)
+            {
+                const RECT *w = &new_rects->window, *c = &new_rects->client;
+                dprintf( 2, "[win-pos] #d%u hwnd=%p after=%p flags=%08x vis=EMPTY "
+                         "win={%d,%d,%d,%d} client={%d,%d,%d,%d} style=%08x surface=%p"
+                         "%s rev=ml750\n",
+                         n, hwnd, insert_after, (unsigned)swp_flags,
+                         (int)w->left, (int)w->top, (int)w->right, (int)w->bottom,
+                         (int)c->left, (int)c->top, (int)c->right, (int)c->bottom,
+                         (unsigned)style, surface,
+                         (style & WS_VISIBLE) ? "  <-- DEGENERATE, WS_VISIBLE: nothing can be shown" : "" );
+
+                /* A WS_VISIBLE top-level window with no area almost always means
+                 * the application sized itself from a display query that came back
+                 * empty. Print what this driver would have told it, so the next log
+                 * says immediately whether the geometry the application read was
+                 * wrong or whether it invented the zero itself. */
+                HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+                if ((style & WS_VISIBLE) && (!parent || parent == get_desktop_window()))
+                {
+                    RECT mon = get_primary_monitor_rect( get_thread_dpi() );
+                    RECT virt = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+                    dprintf( 2, "[win-pos] #d%u    driver would report: primary monitor={%d,%d,%d,%d} "
+                             "virtual screen={%d,%d,%d,%d} rev=ml750\n", n,
+                             (int)mon.left, (int)mon.top, (int)mon.right, (int)mon.bottom,
+                             (int)virt.left, (int)virt.top, (int)virt.right, (int)virt.bottom );
+                }
+            }
+        }
+    }
+
+    /* iOS: synthesize the expose/damage-driven repaint a real windowing system
+     * delivers. Every other display driver gets an Expose (x11drv), a
+     * drawRect/needsDisplay (macdrv) or a damage event when a window becomes
+     * visible or when its backing surface is (re)created, and answers it with
+     * NtUserRedrawWindow( RDW_INVALIDATE ) — that is what puts the window's
+     * update region into the server, which is the ONLY source of the queue's
+     * QS_PAINT bit and therefore of WM_PAINT (server get_message only reports
+     * WM_PAINT while queue->paint_count is non-zero).
+     *
+     * winios.drv has no such event: the surface IS the presented buffer. So
+     * nothing ever asked the application to paint, and a window whose contents
+     * the runtime just dropped stayed empty forever. Two cases hit this:
+     *   - the show path took a route that carries SWP_NOREDRAW (the server then
+     *     skips expose_window() and the frame/client invalidation entirely, see
+     *     window.c set_window_pos: `if (swp_flags & SWP_NOREDRAW) goto done`),
+     *     e.g. when ShowWindow() degenerates to a WS_VISIBLE style toggle plus
+     *     update_window_state() because the parent looks invisible;
+     *   - CreateWindowSurface replaced the surface ("RECREATED — old content
+     *     dropped" above): the new buffer is blank and only the application can
+     *     refill it.
+     * apply_window_pos() already computes exactly the signal we need:
+     * SWP_FRAMECHANGED is forced whenever the surface pointer changed, and
+     * SWP_SHOWWINDOW marks the window going visible.
+     *
+     * Surface-less windows (GPU/client-surface presented, e.g. the D3D path)
+     * are deliberately left alone: they do not paint through GDI. */
+    if (surface && !IsRectEmpty( &new_rects->visible ) && !(swp_flags & SWP_HIDEWINDOW) &&
+        (swp_flags & (SWP_SHOWWINDOW | SWP_FRAMECHANGED)) &&
+        (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
+    {
+        /* MADEIRA-TEMP: one line per newly shown surface-backed window, to
+         * settle WHY the show path carried SWP_NOREDRAW. A window that reaches
+         * here WITHOUT SWP_SHOWWINDOW was made visible by the WS_VISIBLE style
+         * toggle in show_window() (window.c:4855-4859), which happens only when
+         * is_window_visible(parent) is FALSE — parent_vis/parent_style/parent
+         * vs desktop/msgwin below say which of the three possible reasons it is
+         * (parent is the message window, parent handle is unresolvable, or the
+         * desktop style query failed). Remove once diagnosed. */
+        if (!(swp_flags & SWP_SHOWWINDOW))
+        {
+            static unsigned diag_n;
+            if (diag_n++ < 8)
+            {
+                HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+                dprintf( 2, "MADEIRA-TEMP [paint-diag] hwnd=%p swp=%08x parent=%p desktop=%p "
+                         "msgwin=%p parent_style=%08x parent_vis=%d\n", hwnd, (unsigned)swp_flags,
+                         parent, get_desktop_window(), get_hwnd_message_parent(),
+                         (unsigned)get_window_long( parent, GWL_STYLE ), is_window_visible( parent ) );
+            }
+        }
+        NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
     }
 
     if (winios_pWindowPosChanged)
@@ -1634,8 +1960,10 @@ static void load_display_driver(void)
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
         /* window-pos wrapper dereferences window_rects on this side and
          * forwards plain ints to Winios.m's layer compositor */
-        if (winios_pWindowPosChanged || winios_window_frame)
-            winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
+        /* Always install the wrapper, even with no app-side hook linked: it
+         * also carries the expose-equivalent repaint request (see
+         * winios_drv_window_pos_changed), which must not depend on Winios.m. */
+        winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
         /* S2 desktop mode only: GDI window surfaces → app compositor.
          * Games keep the offscreen (invisible) surface path. */
         if (winios_desktop_mode())

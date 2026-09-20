@@ -62,6 +62,7 @@
 		A1000209 /* LauncherView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000209 /* LauncherView.swift */; };
 		A1000210 /* SteamCovers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000210 /* SteamCovers.swift */; };
 		A1000211 /* FileBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000211 /* FileBrowserView.swift */; };
+		A1000310 /* i386-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000310 /* i386-windows */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -131,6 +132,7 @@
 		A2000209 /* LauncherView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LauncherView.swift; sourceTree = "<group>"; };
 		A2000210 /* SteamCovers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCovers.swift; sourceTree = "<group>"; };
 		A2000211 /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
+		A2000310 /* i386-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "i386-windows"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -207,6 +209,7 @@
 				A2000033 /* aarch64-windows */,
 				A20000F1 /* legal */,
 				A2000080 /* arm64ec-windows */,
+				A2000310 /* i386-windows */,
 				A2000081 /* x86_64-vcruntime */,
 				A2000082 /* mono */,
 				A2000040 /* prefix-template.tar.gz */,
@@ -324,6 +327,7 @@
 				A1000032 /* aarch64-windows in Resources */,
 				A10000F1 /* legal in Resources */,
 				A1000080 /* arm64ec-windows in Resources */,
+				A1000310 /* i386-windows in Resources */,
 				A1000081 /* x86_64-vcruntime in Resources */,
 				A1000082 /* mono in Resources */,
 				A1000040 /* prefix-template.tar.gz in Resources */,

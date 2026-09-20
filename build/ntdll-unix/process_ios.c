@@ -71,6 +71,7 @@
 #include "winioctl.h"
 #include "ddk/ntddk.h"
 #include "unix_private.h"
+#include "ios_wow.h"
 #include "wine/condrv.h"
 #include "wine/server.h"
 #include "wine/debug.h"
@@ -423,13 +424,31 @@ struct ios_child_args {
     struct pe_image_info pe_info;
 };
 
+/* WOW64_DESIGN.md §2: the machine of the child's main image, published to
+ * wine_ios_child_main so it can reserve the child's [B, B+4G) guest window
+ * BEFORE allocating the child's TEB/PEB pair — those must live in the window
+ * (guest code reads TEB32->Self / TEB32->Peb as 32-bit guest addresses), and
+ * unix_init_startup_info, which is where the machine would otherwise first be
+ * known, runs long after the TEB exists.  The parent already has the image
+ * info in struct ios_child_args. */
+_Thread_local WORD ios_child_main_machine;
+
+/* Where this child currently is in wine_ios_child_main (which updates it).  A
+ * child that dies during bring-up used to leave no trace at all beyond a couple
+ * of dprintf lines, so a failed CreateProcess from the desktop looked like
+ * nothing happening; the thread entry below names the stage in one ERR. */
+_Thread_local const char *ios_child_boot_stage = "not started";
+
 static void *ios_child_thread_entry( void *arg )
 {
     struct ios_child_args *args = arg;
 
+    ios_child_main_machine = args->pe_info.machine;
+
     /* Use dprintf for early logging — ERR requires TEB which isn't set up yet */
-    dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, exe=%s\n",
-            args->socketfd, args->argc, args->argc > 1 ? args->argv[1] : "(none)");
+    dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, machine=0x%x, exe=%s\n",
+            args->socketfd, args->argc, args->pe_info.machine,
+            args->argc > 1 ? args->argv[1] : "(none)");
 
     /* Set up exit handling for this child thread */
     wine_ios_main_thread = pthread_self();
@@ -444,13 +463,47 @@ static void *ios_child_thread_entry( void *arg )
 
         dprintf(STDERR_FILENO, "[Wine child thread] calling wine_ios_child_main...\n");
         wine_ios_child_main( args->argc, args->argv, args->socketfd );
-        /* Should not return */
+        /* Should not return: every return is a bring-up failure. */
         dprintf(STDERR_FILENO, "[Wine child thread] wine_ios_child_main returned unexpectedly!\n");
+        ERR( "spawn_process: child %s (machine %04x) FAILED to boot at stage '%s'; "
+             "CreateProcess in the parent will report failure\n",
+             args->argc > 1 ? args->argv[1] : "?", args->pe_info.machine,
+             ios_child_boot_stage );
+
+        /* CRITICAL: hand the wineserver the EOF it is waiting for.
+         *
+         * NtCreateUserProcess blocks in NtWaitForSingleObject( process_info )
+         * until the new process either finishes init_process_done or DIES.  The
+         * server only learns a pseudo-process died when its side of the
+         * socketpair reaches EOF — and the only remaining reference to this
+         * child's end is args->socketfd (the parent closed socketfd[0] right
+         * after spawn_process returned).  Leaving it open therefore wedged the
+         * SPAWNER forever: a desktop double-click that failed anywhere in
+         * wine_ios_child_main produced no window, no error and no return from
+         * CreateProcess.  Closing it turns the same failure into a reported
+         * STATUS_INTERNAL_ERROR from NtCreateUserProcess. */
+        if (args->socketfd != -1)
+        {
+            close( args->socketfd );
+            args->socketfd = -1;
+        }
     } else {
         dprintf(STDERR_FILENO, "[Wine child thread] child exited with code %d\n", wine_ios_exit_code);
     }
 
     dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
+    /* WOW64_DESIGN.md §2: the pseudo-process is over — give its guest window
+     * back so the next 32-bit pseudo-process can adopt the slot (a launcher
+     * starting the real program is the normal shape of a 32-bit title).  Must
+     * run while this thread still resolves to that process (before the TEB TLS
+     * slot is cleared below).
+     *
+     * The ORDINARY exit already did this from process_exit_wrapper, keyed by
+     * the dying PEB; this call is the FALLBACK for a child that never got far
+     * enough to bind its window to a PEB — a boot failure, where the only way
+     * back to the slot is the owner-thread match in ios_wow_slot_current().
+     * It is a no-op once the window has been released. */
+    ios_wow_window_release_current();
     free( args->argv );
     free( args );
 
@@ -672,14 +725,19 @@ NTSTATUS wow64_wine_spawnvp( void *args )
         int   wait;
     } const *params32 = args;
 
-    ULONG *argv32 = ULongToPtr( params32->argv );
+    /* WOW64_DESIGN.md §2: the argv ARRAY is an embedded guest pointer, and so
+     * is every string in it — both need +B (the outer args block is the only
+     * pointer the WoW64 module converts). */
+    ULONG *argv32 = ios_wow_host_ptr( params32->argv );
     unsigned int i, count = 0;
     char **argv;
     NTSTATUS ret;
 
+    if (!argv32) return STATUS_INVALID_PARAMETER;
     while (argv32[count]) count++;
     argv = malloc( (count + 1) * sizeof(*argv) );
-    for (i = 0; i < count; i++) argv[i] = ULongToPtr( argv32[i] );
+    if (!argv) return STATUS_NO_MEMORY;
+    for (i = 0; i < count; i++) argv[i] = ios_wow_host_ptr( argv32[i] );
     argv[count] = NULL;
     ret = __wine_unix_spawnvp( argv, params32->wait );
     free( argv );
@@ -1380,19 +1438,18 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         if (ios_is_arm64ec_cur() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
             machine = ios_cur_image_info()->Machine;
     }
-    /* 2026-09-10: no WoW64 on this port. Refuse 32-bit images HERE, at
-     * CreateProcess time, so the spawner gets STATUS_INVALID_IMAGE_FORMAT →
-     * ERROR_BAD_EXE_FORMAT ("not a valid Win32 application"). The child-side
-     * check in load_main_exe stays as the backstop, but by then a process
-     * exists, and its immediate death surfaced in explorer as a baffling
-     * "invalid handle". */
-    if (!is_machine_64bit( machine ))
+#ifdef WINE_IOS
+    /* One line saying which machine the child will be created with and which
+     * PE farm its system DLLs will come from.  A 32-bit child routed to the
+     * 64-bit farm (or the other way round) is invisible otherwise, and it is
+     * the first thing to check when a spawn silently produces no window. */
     {
-        dprintf(2, "[spawn] REJECT %s: 32-bit image (machine 0x%x) — this port runs 64-bit x86 programs only\n",
-                debugstr_us(&path), machine);
-        status = STATUS_INVALID_IMAGE_FORMAT;
-        goto done;
+        extern const char *ios_pe_dir_for_machine( WORD machine );
+        ERR( "NtCreateUserProcess: child machine=%04x (image machine=%04x hybrid=%d) pe_dir=%s\n",
+             machine, pe_info.machine, (int)pe_info.is_hybrid,
+             ios_pe_dir_for_machine( machine ) );
     }
+#endif
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;
     env_size = get_env_size( params, &winedebug );
@@ -1520,6 +1577,13 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     if (!success)
     {
         if (!status) status = STATUS_INTERNAL_ERROR;
+#ifdef WINE_IOS
+        /* Name the failure at the boundary the caller sees.  Without this the
+         * only evidence a spawn failed was the absence of a window. */
+        ERR( "NtCreateUserProcess: %s (machine %04x) did not reach init_process_done; "
+             "returning %x — see the [Wine child] boot lines above for the stage\n",
+             debugstr_us(&path), machine, (unsigned)status );
+#endif
         goto done;
     }
 
@@ -2327,9 +2391,71 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     if (self)
     {
 #ifdef WINE_IOS
-        if (!handle) *exiting_flag = TRUE;
-        else if (*exiting_flag) exit_process( exit_code );
-        else abort_process( exit_code );
+        /* MADEIRA-TEMP: WOW64_DESIGN.md M1 exit-status observability. This is
+         * the one chokepoint every pseudo-process's own termination reaches
+         * exactly once (self == TRUE means the calling process is the one
+         * being terminated), so one generic line here covers every exe --
+         * not just the x86 test path -- with the image name and the decimal
+         * status the guest actually asked to exit with. */
+        {
+            PEB *peb = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+            RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+            const WCHAR *path = (pp && pp->ImagePathName.Buffer) ? pp->ImagePathName.Buffer : NULL;
+            unsigned int len = path ? pp->ImagePathName.Length / sizeof(WCHAR) : 0;
+            unsigned int base = 0, i, n = 0;
+            char name[64];
+
+            for (i = 0; i < len; i++) if (path[i] == '\\' || path[i] == '/') base = i + 1;
+            for (i = base; i < len && n < sizeof(name) - 1; i++) name[n++] = (char)path[i];
+            name[n] = 0;
+            ERR( "MADEIRA-EXIT: %s status=%d\n", n ? name : "?", (int)exit_code );
+            /* ml962: the [srv-stats] report is piggy-backed on the 10 s
+             * deadline being crossed at the end of some server call, so a run
+             * that dies before the first window -- which is every crash worth
+             * diagnosing -- produced no counters at all.  This is the one
+             * chokepoint each pseudo-process's own exit passes exactly once,
+             * so dump the window here too: per-kind traffic, the Nt* entry
+             * points, the select breakdown and the fastsync hit/miss and
+             * cache-learn lines. */
+            {
+                extern void ios_srv_stats_report_now(void);
+                ios_srv_stats_report_now();
+            }
+            /* Unbuffered duplicate: ERR goes through the debug channel, which a
+             * muted err: channel or a dying log pump can swallow.  Everything
+             * below is the teardown that used to end the log (and the app), so
+             * each step names itself on fd 2 with a plain write(2). */
+            extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+            dprintf( 2, "[Wine child exit] stage=madeira-exit exe=%s status=%d handle=%p "
+                        "exiting_flag=%d machine=%04x window=%p teb=%p peb=%p\n",
+                     n ? name : "?", (int)exit_code, handle, (int)*exiting_flag,
+                     ios_cur_image_info()->Machine, (void *)ios_wow_base(),
+                     NtCurrentTeb(), peb );
+        }
+        if (!handle)
+        {
+            dprintf( 2, "[Wine child exit] stage=mark-exiting (no teardown yet)\n" );
+            *exiting_flag = TRUE;
+        }
+        else if (*exiting_flag)
+        {
+            dprintf( 2, "[Wine child exit] stage=exit_process\n" );
+            exit_process( exit_code );
+            dprintf( 2, "[Wine child exit] stage=returned-from-exit_process (UNEXPECTED)\n" );
+        }
+        else
+        {
+            /* The loader_init-failure path: ntdll called
+             * NtTerminateProcess( GetCurrentProcess(), status ) with no
+             * preceding NtTerminateProcess( 0, ... ), so exiting_flag is still
+             * FALSE.  abort_process() used to _exit() here, which on iOS ends
+             * the whole Mach task — every other pseudo-process, the UI, the log.
+             * It now performs the same per-pseudo-process teardown as
+             * exit_process (thread_ios.c). */
+            dprintf( 2, "[Wine child exit] stage=abort_process\n" );
+            abort_process( exit_code );
+            dprintf( 2, "[Wine child exit] stage=returned-from-abort_process (UNEXPECTED)\n" );
+        }
 #else
         if (!handle) process_exiting = TRUE;
         else if (process_exiting) exit_process( exit_code );
@@ -2791,6 +2917,31 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                 ret = wine_server_call( req );
                 if (!ret && !is_machine_64bit( reply->machine ) && is_machine_64bit( native_machine ))
                     val = reply->peb + 0x1000;
+            }
+            SERVER_END_REQ;
+            if (!ret) *(ULONG_PTR *)info = val;
+        }
+        break;
+
+    /* iOS-Madeira (WOW64_DESIGN.md §2): the single source of truth for B, the
+     * host address of guest 0 for a 32-bit pseudo-process.  0 when the target
+     * has no guest window.  wow64.dll and the FEX WoW64 module each read this
+     * once at process init; nothing else may invent a B. */
+    case ProcessWineIosWowGuestBase:
+        len = sizeof(ULONG_PTR);
+        if (size != len) return STATUS_INFO_LENGTH_MISMATCH;
+        if (handle == GetCurrentProcess()) *(ULONG_PTR *)info = ios_wow_base();
+        else
+        {
+            ULONG_PTR val = 0;
+
+            /* pseudo-processes share one address space, so the registry is
+             * keyed by PEB and a handle resolves through the server. */
+            SERVER_START_REQ( get_process_info )
+            {
+                req->handle = wine_server_obj_handle( handle );
+                ret = wine_server_call( req );
+                if (!ret) val = ios_wow_base_for_peb( wine_server_get_ptr( reply->peb ) );
             }
             SERVER_END_REQ;
             if (!ret) *(ULONG_PTR *)info = val;
