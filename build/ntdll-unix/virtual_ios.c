@@ -13329,6 +13329,7 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
     size_t map_size, host_size;
     int prot = PROT_READ | PROT_WRITE;
     unsigned int flags = MAP_FIXED;
+    int mmap_errno = 0;
 
     assert( start < view->size );
     assert( start + size <= view->size );
@@ -13442,7 +13443,11 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
             return STATUS_SUCCESS;
         }
 
-        switch (errno)
+        /* ml853: hold on to the mmap errno. dprintf() is allowed to clobber
+         * errno, and every branch below wants to report it. */
+        mmap_errno = errno;
+
+        switch (mmap_errno)
         {
         case EINVAL:  /* file offset is not page-aligned, fall back to read() */
             break;
@@ -13450,6 +13455,8 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
         case ENODEV:  /* filesystem doesn't support mmap(), fall back to read() */
             if (vprot & VPROT_WRITE)
             {
+                dprintf(2, "[vmem-nommap] ml853 shared-writable mmap errno=%d (%s) addr=%p size=0x%zx fd=%d\n",
+                        mmap_errno, strerror(mmap_errno), map_addr, map_size, fd);
                 ERR( "shared writable mmap not supported, broken filesystem?\n" );
                 return STATUS_NOT_SUPPORTED;
             }
@@ -13464,14 +13471,26 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
             }
             break;
         default:
+            dprintf(2, "[vmem-mmap-fail] ml853 errno=%d (%s) addr=%p size=0x%zx host=%p/0x%zx "
+                       "off=0x%llx fd=%d flags=0x%x prot=0x%x\n",
+                    mmap_errno, strerror(mmap_errno), map_addr, map_size, host_addr, host_size,
+                    (unsigned long long)offset, fd, flags, prot);
             ERR( "mmap error %s, range %p-%p, unix_prot %#x\n",
-                 strerror(errno), map_addr, map_addr + map_size, prot );
+                 strerror(mmap_errno), map_addr, map_addr + map_size, prot );
             return STATUS_NO_MEMORY;
         }
     }
 
     if (vprot & VPROT_WRITE)
     {
+        /* ml853: this return is why Undertale would not start, and nothing said
+         * so — see the [img-shared] comment in map_image_into_view. Images now
+         * fall back before they ever get here, but NtMapViewOfSection's own
+         * writable SEC_COMMIT sections still land on it, so say it out loud. */
+        dprintf(2, "[vmem-unaligned] ml853 shared mapping %p-%p not host-page granular: "
+                   "map=%p/0x%zx host=%p/0x%zx off=0x%llx host_page=0x%lx fd=%d\n",
+                map_addr, map_addr + map_size, map_addr, map_size, host_addr, host_size,
+                (unsigned long long)offset, (unsigned long)(host_page_mask + 1), fd);
         ERR( "unaligned shared mapping %p-%p not supported\n", map_addr, map_addr + map_size );
         return STATUS_INVALID_PARAMETER;
     }
@@ -14684,31 +14703,96 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if ((sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) &&
             (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE))
         {
+            /* ml853: a SHARED|WRITE section on a 16KB-page host.
+             *
+             * Undertale.exe (i386, SectionAlignment=0x1000, 5 sections) died
+             * exactly here on its ".mydata" section: reject #8 -> c000007b ->
+             * Windows error 193, with nothing in the log saying why. The four
+             * failure returns in map_file_into_view_ex all report through ERR()
+             * on this file's DEFAULT debug channel, `virtual`, and the app boots
+             * with setenv("WINEDEBUG", "err+all,err-virtual", 1) — see
+             * app/Madeira/WineProcessBridge.m. That is the "dbg-channel table
+             * copied: 1 entries" the child prints. So the branch that fired
+             * printed nothing, and anything we want to see here must be a
+             * dprintf(2), as elsewhere in this file.
+             *
+             * MAP_SHARED is not merely failing here, it is impossible: mmap
+             * needs the address, the length AND the file offset to be HOST page
+             * granular. Host pages are 16KB while this image's sections — and
+             * `pos`, the cursor walking the wineserver's shared temp file in
+             * SectionAlignment steps — are 4KB granular. Rather than fire a
+             * mapping that cannot work, decide up front.
+             *
+             * We are deliberately STRICTER than map_file_into_view_ex's own gate,
+             * which waives the length check for a section reaching the end of the
+             * view (it would let a 0x1000 tail through). MAP_FIXED rounds that
+             * length up to a whole 16KB page, so it would replace memory past the
+             * end of the view and read past the end of the temp file —
+             * build_shared_mapping in build/wineserver/mapping_ios.c grows that
+             * file to the 4KB-rounded total — which SIGBUSes on first touch.
+             *
+             * The fallback maps the section PRIVATE from the image file, the same
+             * path every ordinary writable section already takes below. The
+             * initial bytes are identical, because build_shared_mapping seeds the
+             * temp file by pread()ing those very offsets. What is given up is
+             * cross-process coherence of later writes — which only means anything
+             * when two pseudo-processes map the same image. A game has one
+             * instance, and not one of the 1257 PE files shipped in
+             * app/Madeira/{i386,arm64ec,aarch64}-windows has a shared section at
+             * all, so no builtin can take this path. */
+            BOOL shared_possible = (shared_fd != -1 &&
+                                    !(sec[i].VirtualAddress & host_page_mask) &&
+                                    !(map_size & host_page_mask) &&
+                                    !((UINT_PTR)pos & host_page_mask));
+            NTSTATUS shared_status = STATUS_INVALID_PARAMETER;
+
             TRACE_(module)( "%s mapping shared section %.8s at %p off %x (%x) size %lx (%lx) flags %x\n",
                             debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
                             sec[i].Characteristics );
-            if (map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
-                                    VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE ) != STATUS_SUCCESS)
+
+            if (shared_possible)
+                shared_status = map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
+                                                    VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE );
+
+            /* The shared file's layout is fixed by the section table, so this
+             * cursor advances whether or not we mapped from it — a second shared
+             * section must still land at its own offset. */
+            pos += map_size;
+
+            if (shared_status == STATUS_SUCCESS)
             {
-                ERR_(module)( "Could not map %s shared section %.8s\n", debugstr_us(nt_name), sec[i].Name );
-                do { IOS_IMG_FAIL(8); goto done; } while (0);
+                /* check if the import directory falls inside this section */
+                if (imports && imports->VirtualAddress >= sec[i].VirtualAddress &&
+                    imports->VirtualAddress < sec[i].VirtualAddress + map_size)
+                {
+                    UINT_PTR base = imports->VirtualAddress & ~host_page_mask;
+                    UINT_PTR end = base + ROUND_SIZE( imports->VirtualAddress, imports->Size, host_page_mask );
+                    if (end > sec[i].VirtualAddress + map_size) end = sec[i].VirtualAddress + map_size;
+                    if (end > base)
+                        map_file_into_view( view, shared_fd, base, end - base,
+                                            pos - map_size + (base - sec[i].VirtualAddress),
+                                            VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY, FALSE );
+                }
+                continue;
             }
 
-            /* check if the import directory falls inside this section */
-            if (imports && imports->VirtualAddress >= sec[i].VirtualAddress &&
-                imports->VirtualAddress < sec[i].VirtualAddress + map_size)
+            /* Falls through to the ordinary private mapping below. The import
+             * directory needs no separate WRITECOPY hole there: the whole
+             * section is private already. */
             {
-                UINT_PTR base = imports->VirtualAddress & ~host_page_mask;
-                UINT_PTR end = base + ROUND_SIZE( imports->VirtualAddress, imports->Size, host_page_mask );
-                if (end > sec[i].VirtualAddress + map_size) end = sec[i].VirtualAddress + map_size;
-                if (end > base)
-                    map_file_into_view( view, shared_fd, base, end - base,
-                                        pos + (base - sec[i].VirtualAddress),
-                                        VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY, FALSE );
+                static unsigned shared_fallbacks;
+                if (shared_fallbacks++ < 32)
+                    dprintf(2, "[img-shared] ml853 %s section %.8s va=0x%x map=0x%lx raw=0x%lx+0x%lx "
+                               "pos=0x%llx shared_fd=%d host_page=0x%lx status=0x%x -> PRIVATE copy (%s)\n",
+                            nt_name ? debugstr_us(nt_name) : "?", sec[i].Name,
+                            (unsigned)sec[i].VirtualAddress, (unsigned long)map_size,
+                            (unsigned long)file_start, (unsigned long)file_size,
+                            (unsigned long long)(pos - map_size), shared_fd,
+                            (unsigned long)(host_page_mask + 1), (unsigned)shared_status,
+                            shared_possible ? "MAP_SHARED attempted and failed"
+                                            : "not host-page granular, MAP_SHARED impossible");
             }
-            pos += map_size;
-            continue;
         }
 
         TRACE_(module)( "mapping %s section %.8s at %p off %x size %x virt %x flags %x\n",
