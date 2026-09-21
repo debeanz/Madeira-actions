@@ -6178,6 +6178,39 @@ skip_reclaim_band: ;
                         uint64_t rsp = 0;
                         unsigned char code[16];
                         mach_vm_size_t g = 0;
+                        /* ml855: a 32-bit guest's RIP is a GUEST address — its bytes live at
+                         * B + rip, not at rip. Reading it as a host address is why Celeste's
+                         * fatal "Unimplemented instruction in entry block: 1C00419" printed
+                         * "x86 @rip UNREADABLE" and told us nothing about whether FEX had met
+                         * an opcode it lacks or had been sent into data.
+                         *
+                         * We are on the Mach exception SERVER thread here (this block is
+                         * inside ios_mach_exception_thread), so ios_wow_base() is useless: it
+                         * resolves per CALLER via ios_jit_current_peb(), and this bare pthread
+                         * publishes no TEB and owns no window, so it returns 0. Two sources
+                         * that do work from here: x19, which FEX's 32-bit backend pins to the
+                         * window base (the faulting thread's own state, fetched above), and
+                         * the window registry keyed by the faulting thread's PEB. Take x19
+                         * only if it has the shape of a base, and let the registry override
+                         * it — on a 64-bit thread x19 is just a callee-saved register and
+                         * could coincidentally look 4GB-aligned. */
+                        uint64_t wow_b = 0;
+                        {
+                            uint64_t x19 = state.__x[19];
+                            void *peb_r = NULL;
+                            mach_vm_size_t gp = 0;
+
+                            if (!(x19 & 0xffffffffull) && x19 >= 0x100000000ull) wow_b = x19;
+                            if (thread_teb &&
+                                mach_vm_read_overwrite( mach_task_self(),
+                                    (mach_vm_address_t)(thread_teb + offsetof(TEB, Peb)),
+                                    sizeof(peb_r), (mach_vm_address_t)&peb_r, &gp ) == KERN_SUCCESS &&
+                                gp == sizeof(peb_r) && peb_r)
+                            {
+                                ULONG_PTR reg = ios_wow_base_for_peb( peb_r );
+                                if (reg) wow_b = (uint64_t)reg;
+                            }
+                        }
 
                         if (rsp_n < 12 && st28 > 0x100000 &&
                             mach_vm_read_overwrite( mach_task_self(),
@@ -6187,23 +6220,64 @@ skip_reclaim_band: ;
                                 (mach_vm_address_t)(st28 + 0x40), 8,
                                 (mach_vm_address_t)&rsp, &g ) == KERN_SUCCESS)
                         {
+                            /* A 32-bit guest RIP is below 4GB, where iOS maps nothing, so the
+                             * magnitude alone settles the namespace — but only once we know a
+                             * window exists at all. With no window there is nothing to
+                             * translate and the original identity read is the right answer. */
+                            int is32 = (wow_b && cs[0] && cs[0] < 0x100000000ull);
+                            uint64_t rip_host = is32 ? wow_b + cs[0] : cs[0];
+
                             rsp_n++;
+                            /* "rsp_hi32=ZERO (looks truncated)" is a 64-bit heuristic and is
+                             * vacuous for a 32-bit guest, whose ESP is *supposed* to have a
+                             * zero high half — it read as a finding in the Celeste log and is
+                             * not one. Say what is actually true for each case. */
                             dprintf( STDERR_FILENO,
-                                     "[rsp-trunc] x28=%p guest_rip=%p rsp=%p rsp_hi32=%s\n",
+                                     "[rsp-trunc] x28=%p guest_rip=%p rsp=%p %s\n",
                                      (void *)st28, (void *)cs[0], (void *)rsp,
-                                     (rsp >> 32) ? "set (64-bit)" : "ZERO (looks truncated)" );
+                                     is32 ? "32-bit guest (high half of esp is zero BY DESIGN — not truncation)"
+                                          : ((rsp >> 32) ? "rsp_hi32=set (64-bit)"
+                                                         : "rsp_hi32=ZERO (looks truncated)") );
                             g = 0;
                             if (cs[0] && mach_vm_read_overwrite( mach_task_self(),
-                                    (mach_vm_address_t)cs[0], sizeof(code),
+                                    (mach_vm_address_t)rip_host, sizeof(code),
                                     (mach_vm_address_t)code, &g ) == KERN_SUCCESS &&
                                 g == sizeof(code))
+                            {
+                                /* Classify the bytes. The question this answers is the one the
+                                 * Celeste ILL could not: did FEX meet an opcode it lacks, or was
+                                 * it sent into data? All-zero or all-0xff is data; ASCII is data;
+                                 * mixed bytes are at least plausible as code. */
+                                int all0 = 1, allf = 1, ascii = 1, bi;
+                                for (bi = 0; bi < 16; bi++)
+                                {
+                                    if (code[bi] != 0x00) all0 = 0;
+                                    if (code[bi] != 0xff) allf = 0;
+                                    if (code[bi] < 0x09 || code[bi] > 0x7e) ascii = 0;
+                                }
                                 dprintf( STDERR_FILENO,
-                                         "[rsp-trunc]   x86 @rip: %02x %02x %02x %02x %02x %02x %02x %02x"
-                                         " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                         "[rsp-trunc]   x86 @rip (%s%p): %02x %02x %02x %02x %02x %02x %02x %02x"
+                                         " %02x %02x %02x %02x %02x %02x %02x %02x  <== %s\n",
+                                         is32 ? "guest, read at host " : "host ", (void *)rip_host,
                                          code[0],code[1],code[2],code[3],code[4],code[5],code[6],code[7],
-                                         code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15] );
+                                         code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15],
+                                         all0 ? "ALL ZERO — this is DATA, control went somewhere wrong"
+                                         : allf ? "ALL 0xFF — this is DATA/unwritten, control went somewhere wrong"
+                                         : ascii ? "ASCII text — this is DATA, control went somewhere wrong"
+                                         : "mixed bytes — plausible x86" );
+                                /* FEX spills State.rip only at block boundaries, so mid-block it
+                                 * is STALE (ml854: one log claimed 0x114128a0 against a true eip
+                                 * of 0x7a67174f). Never let these bytes be read as "the opcode
+                                 * FEX refused" without that caveat attached. */
+                                dprintf( STDERR_FILENO,
+                                         "[rsp-trunc]   NOTE rip comes from FEX's spilled State.rip, which is written at "
+                                         "BLOCK BOUNDARIES only — mid-block it is stale, so these bytes may be at a rip "
+                                         "the guest has already left rev=ml855\n" );
+                            }
                             else
-                                dprintf( STDERR_FILENO, "[rsp-trunc]   x86 @rip UNREADABLE\n" );
+                                dprintf( STDERR_FILENO,
+                                         "[rsp-trunc]   x86 @rip UNREADABLE (tried %s%p, wow_b=%p)\n",
+                                         is32 ? "guest->host " : "host ", (void *)rip_host, (void *)wow_b );
 
                             /* iOS-Madeira ml333: is the guest code we EXECUTE the guest code that was
                              * LOADED?
@@ -6222,6 +6296,18 @@ skip_reclaim_band: ;
                              * they differ, it is (a); if they agree but both differ from the file,
                              * it is (b). Either answer names the bug; silence is impossible because
                              * the translate result is printed even when it is an identity. */
+                            /* ml855: only meaningful for a 64-bit guest. ios_jit_translate_addr
+                             * maps a PE address to its executable pool copy in the HOST
+                             * namespace; handed a 32-bit guest RIP it identity-translates and
+                             * reports "NO pool copy for this address", which is true but says
+                             * nothing — exactly the misleading line the Celeste log carried.
+                             * A 32-bit guest is executed from FEX's translation cache, not from
+                             * a pool copy, so there is no second view to compare against. */
+                            if (is32)
+                                dprintf( STDERR_FILENO,
+                                         "[guest-code] rev=ml855 32-bit guest rip %p: no pool copy exists by design "
+                                         "(FEX translates; the bytes above ARE the guest's own)\n", (void *)cs[0] );
+                            else
                             {
                                 extern void *ios_jit_translate_addr( void *addr );
                                 unsigned char pcode[16];
@@ -11544,6 +11630,18 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  *
  * Handler for SIGILL.
  */
+/* ml855: three different fault paths can carry the same underlying corruption,
+ * and Celeste proved it by dying a different way on each of two runs — once as
+ * an unreadable-address AV, once through the [esr-class] permission branch into
+ * an illegal instruction. A probe wired to only one of them is a probe that
+ * mostly does not fire, so ios_wow32_frame_probe (defined below, with the full
+ * rationale) is called from all three. Budget is PER SITE so a storm on one path
+ * — the permission branch repeats — cannot starve the fatal one. */
+#ifdef WINE_IOS
+enum { IOS_WOW32_PROBE_BUS, IOS_WOW32_PROBE_ESR, IOS_WOW32_PROBE_ILL, IOS_WOW32_PROBE_SITES };
+static void ios_wow32_frame_probe( const ucontext_t *ctx, const void *fault_addr, int site );
+#endif
+
 static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_ILLEGAL_INSTRUCTION };
@@ -11617,6 +11715,15 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             ERR("ILL diag: x6=0x%llx x10=0x%llx x11=0x%llx (pc==x11? %d pc==x10? %d)\n",
                 (unsigned long long)x6, (unsigned long long)x10, (unsigned long long)x11,
                 x11 == pc, x10 == pc);
+            /* ml855: FEX emits HLT #0 for an instruction it cannot translate, and that is
+             * how Celeste run 3 died — after being sent into Mono's GC data at guest
+             * 0x1C00419. si_addr here is the HOST pc of the HLT, not a guest address, so the
+             * probe will take its "not inside the window" path and report the guest frame
+             * without claiming the fault address means anything. */
+#ifdef WINE_IOS
+            ios_wow32_frame_probe( (const ucontext_t *)sigcontext, siginfo->si_addr,
+                                   IOS_WOW32_PROBE_ILL );
+#endif
             /* FEX inline L1 exit-dispatch reads {L1Ptr, L1Mask} at STATE+0xa0
              * and the entry pair {host, guest} at L1Ptr + (rip & mask)<<?.
              * Dump the entry for x6 so a torn pair is visible at crash time.
@@ -12124,16 +12231,16 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
  * it lands on one of those, an earlier call with the same method succeeded and
  * the field changed underneath Mono, which is a very different bug from a
  * pointer that was always wrong. */
-static void ios_wow32_frame_probe( const ucontext_t *ctx, const void *fault_addr )
+static void ios_wow32_frame_probe( const ucontext_t *ctx, const void *fault_addr, int site )
 {
-    static int probes;
+    static int probes[IOS_WOW32_PROBE_SITES];
     ULONG_PTR b_reg = (ULONG_PTR)REGn_sig( 19, (ucontext_t *)ctx );
     ULONG_PTR b_api = ios_wow_base();
     ULONG_PTR b, fault = (ULONG_PTR)fault_addr;
     unsigned guest_fault, want_klass;
     int r, found = 0;
 
-    if (probes++ >= 4) return;
+    if (site < 0 || site >= IOS_WOW32_PROBE_SITES || probes[site]++ >= 2) return;
 
     /* A window base is 4GB-aligned and above iOS's __PAGEZERO. Prefer x19 (the
      * register the faulting code actually addressed through); fall back to the
@@ -12874,7 +12981,8 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 /* ml854: we are on the faulting thread and about to lose it —
                  * this is the only place the 32-bit guest's own frame is still
                  * reachable. See ios_wow32_frame_probe. */
-                ios_wow32_frame_probe( (const ucontext_t *)sigcontext, siginfo->si_addr );
+                ios_wow32_frame_probe( (const ucontext_t *)sigcontext, siginfo->si_addr,
+                                       IOS_WOW32_PROBE_BUS );
 #endif
                 goto bus_fatal;
             }
@@ -12926,6 +13034,12 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                             (a_dfsc & 0x3c) == 0x08 ? "access-flag" : "other",
                             *(uint32_t *)(uintptr_t)PC_sig(bus_ctx), siginfo->si_addr, pc, mis_n);
                     rec = vrec;
+                    /* ml855: this branch is fatal too — Celeste run 3 came through here on a
+                     * store-release to a non-writable page. Same thread, same ucontext, so the
+                     * guest frame is just as reachable as on the unreadable-address path. */
+#ifdef WINE_IOS
+                    ios_wow32_frame_probe( bus_ctx, siginfo->si_addr, IOS_WOW32_PROBE_ESR );
+#endif
                     goto bus_fatal;
                 }
             }
