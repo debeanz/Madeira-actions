@@ -12073,6 +12073,151 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
  *
  * Handler for SIGBUS.
  */
+#ifdef WINE_IOS
+/* ml854: at a fatal AV inside a 32-bit guest window, recover the guest's own
+ * stack frame and print it.
+ *
+ * Celeste (i386, .NET/FNA) dies with c0000005 reading guest 0x40030 from
+ * libmono-2.0-x86.dll's mono_method_get_context_general. Disassembling the
+ * shipped wine-mono 11.0.0 x86 build pins the instruction exactly:
+ *
+ *   +0x131710  push esi                     <- prologue
+ *   +0x131711  mov  ecx, [esp+8]            <- arg1, a MonoMethod *
+ *   +0x131729  mov  edx, [ecx+8]            <- method->klass
+ *   +0x13174c  push 0
+ *   +0x13174e  push ecx
+ *   +0x13174f  push dword ptr [edx+0x28]    <- FAULTS: m_class_get_image(klass)
+ *
+ * so method->klass held fault-0x28, an address in the permanently PROT_NONE
+ * low guest region. What we cannot see is whether the MonoMethod itself is
+ * real (one clobbered field) or whether ecx was never a MonoMethod at all.
+ *
+ * The existing reporters cannot answer that. [av-detail] (ml613) and
+ * [x86_live] both read the ARM64EC CPU area, which a 32-bit target — running
+ * its 64-bit half on the aarch64 farm — does not have; the log shows them
+ * printing regs=0 and RIP=0 at this very fault. [x86_live]'s register NAMES
+ * are ARM64EC SRA labels, so its "R11"/"R13" are just host x5/x20 and mean
+ * nothing here. And FEX's spilled ThreadState is only written at block
+ * boundaries, so mid-block it is stale (this log: it claims RIP 0x114128a0
+ * while the true eip is 0x7a67174f) — reading it would fabricate a plausible
+ * but wrong answer with nothing to flag it.
+ *
+ * bus_handler, by contrast, runs ON the faulting thread with its ucontext.
+ * FEX's 32-bit backend keeps the window base in x19 and forms addresses as
+ * x19 + zext32(reg), so the guest's 4-byte-aligned ESP is the low half of
+ * some host register. Rather than hard-code which one, try them all and let
+ * the frame prove itself: at the faulting push, exactly three dwords are on
+ * the stack above the incoming arguments, so
+ *
+ *   [esp+0x00]=ecx(method)  [esp+0x04]=0  [esp+0x08]=saved esi
+ *   [esp+0x0c]=return addr  [esp+0x10]=arg1(method)  [esp+0x14]=arg2(==1)
+ *
+ * Three cheap invariants (dword 1 == 0, dword 5 == 1, dword 0 == dword 4)
+ * reject a wrong register, and re-reading method->klass confirms the frame
+ * against the fault itself. A wrong guess self-reports instead of inventing
+ * a MonoMethod. Every read goes through mach_vm_read_overwrite, so a bad
+ * candidate cannot fault us inside a fault handler.
+ *
+ * The return address is the other half of the prize: all nine callers of this
+ * function live in mono/mini/mini-generic-sharing.c, and four of them are a
+ * second or third call passing the same register in the same function — so if
+ * it lands on one of those, an earlier call with the same method succeeded and
+ * the field changed underneath Mono, which is a very different bug from a
+ * pointer that was always wrong. */
+static void ios_wow32_frame_probe( const ucontext_t *ctx, const void *fault_addr )
+{
+    static int probes;
+    ULONG_PTR b_reg = (ULONG_PTR)REGn_sig( 19, (ucontext_t *)ctx );
+    ULONG_PTR b_api = ios_wow_base();
+    ULONG_PTR b, fault = (ULONG_PTR)fault_addr;
+    unsigned guest_fault, want_klass;
+    int r, found = 0;
+
+    if (probes++ >= 4) return;
+
+    /* A window base is 4GB-aligned and above iOS's __PAGEZERO. Prefer x19 (the
+     * register the faulting code actually addressed through); fall back to the
+     * API, which is reliable here only because we are on the guest thread. */
+    b = (!(b_reg & 0xffffffffull) && b_reg >= 0x100000000ull) ? b_reg : b_api;
+    if (!b || fault < b || fault - b >= 0x100000000ull)
+    {
+        ERR("[wow-frame] ml854 not a 32-bit window fault (x19=0x%llx api=0x%llx addr=%p) — no probe\n",
+            (unsigned long long)b_reg, (unsigned long long)b_api, fault_addr);
+        return;
+    }
+    guest_fault = (unsigned)(fault - b);
+    want_klass  = guest_fault - 0x28;   /* the value edx held, from the encoding */
+
+    ERR("[wow-frame] ml854 B=0x%llx (x19=0x%llx api=0x%llx) guest_fault=0x%08x assumed edx=0x%08x\n",
+        (unsigned long long)b, (unsigned long long)b_reg, (unsigned long long)b_api,
+        guest_fault, want_klass);
+
+    for (r = 0; r <= 28 && !found; r++)
+    {
+        unsigned esp = (unsigned)REGn_sig( r, (ucontext_t *)ctx );
+        unsigned d[6];
+        mach_vm_size_t got = 0;
+
+        if (esp < 0x10000 || esp > 0xfffff000u || (esp & 3)) continue;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(b + esp),
+                                    sizeof(d), (mach_vm_address_t)d, &got ) != KERN_SUCCESS
+            || got != sizeof(d)) continue;
+        if (d[1] != 0 || d[5] != 1 || d[0] != d[4] || d[0] < 0x10000) continue;
+
+        {
+            unsigned m[6];           /* the MonoMethod: flags/iflags, token, klass,
+                                      * signature, name, bitfields */
+            unsigned klass_now = 0;
+            char nm[48];
+            mach_vm_size_t g2 = 0;
+            int have_m, have_name = 0;
+
+            found = 1;
+            have_m = (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(b + d[0]),
+                                              sizeof(m), (mach_vm_address_t)m, &g2 ) == KERN_SUCCESS
+                      && g2 == sizeof(m));
+            ERR("[wow-frame]   esp=0x%08x from host x%d | [esp]=0x%08x +4=0x%08x +8=0x%08x "
+                "ret=0x%08x arg1=0x%08x arg2=0x%08x  FRAME-OK\n",
+                esp, r, d[0], d[1], d[2], d[3], d[4], d[5]);
+            if (!have_m)
+            {
+                ERR("[wow-frame]   method=0x%08x UNREADABLE — ecx was never a MonoMethod; "
+                    "the bad pointer is the method itself, not its klass field\n", d[0]);
+                return;
+            }
+            klass_now = m[2];
+            have_name = (m[4] >= 0x10000 &&
+                         mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(b + m[4]),
+                                                 sizeof(nm) - 1, (mach_vm_address_t)nm,
+                                                 &g2 ) == KERN_SUCCESS);
+            if (have_name) { nm[sizeof(nm) - 1] = 0; nm[g2 < sizeof(nm) ? g2 : sizeof(nm) - 1] = 0; }
+            ERR("[wow-frame]   method=0x%08x flags=0x%04x iflags=0x%04x token=0x%08x klass=0x%08x "
+                "signature=0x%08x name=0x%08x bits=0x%08x name=\"%s\"\n",
+                d[0], m[0] & 0xffff, m[0] >> 16, m[1], m[2], m[3], m[4], m[5],
+                have_name ? nm : "<unreadable>");
+            /* The discriminator. Three outcomes, and they point three different
+             * ways: klass still bad -> the field really holds it, hunt the
+             * writer; klass now sane -> nothing was ever stored wrong and the
+             * LOAD or the register was, hunt the read path; method junk ->
+             * handled above. */
+            if (klass_now == want_klass)
+                ERR("[wow-frame]   VERDICT klass field still reads 0x%08x — the STORED field is "
+                    "wrong (signature/name %s) rev=ml854\n", klass_now,
+                    (m[3] >= 0x10000 && m[4] >= 0x10000)
+                        ? "look sane, so the object is real and ONE field was clobbered"
+                        : "ALSO look wrong, so the whole object is suspect");
+            else
+                ERR("[wow-frame]   VERDICT klass now reads 0x%08x, NOT 0x%08x — nothing wrong was "
+                    "ever stored; the guest LOAD or its register was wrong rev=ml854\n",
+                    klass_now, want_klass);
+        }
+    }
+    if (!found)
+        ERR("[wow-frame] ml854 no host register's low half validated as ESP — FRAME-MISMATCH "
+            "(frame shape or FEX's 32-bit register mapping differs from the assumption)\n");
+}
+#endif  /* WINE_IOS */
+
 static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
@@ -12725,6 +12870,12 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 rec = vrec;
                 ERR("BUS->AV: unreadable target addr=%p pc=%p rw=%d rev=ml420\n",
                     siginfo->si_addr, pc, (int)vrec.ExceptionInformation[0]);
+#ifdef WINE_IOS
+                /* ml854: we are on the faulting thread and about to lose it —
+                 * this is the only place the 32-bit guest's own frame is still
+                 * reachable. See ios_wow32_frame_probe. */
+                ios_wow32_frame_probe( (const ucontext_t *)sigcontext, siginfo->si_addr );
+#endif
                 goto bus_fatal;
             }
             /* ============================================== 2026-09-23
