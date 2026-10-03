@@ -2370,6 +2370,7 @@ enum ReportService {
     static func send(_ d: Draft) async throws -> Bool {
         guard isConfigured else { throw Failure.notConfigured }
         let id = UUID().uuidString.lowercased()
+        let title = String(d.game.title.prefix(120))
         let version = ContentView.appVersionText
         let device = GameLogSaver.deviceModel
 
@@ -2383,10 +2384,11 @@ enum ReportService {
                 + "\n"
             if let note = d.note { header += "What happened: \(note)\n" }
             if let log = GameLogSaver.buildLog(title: d.game.title, exe: d.game.exe, header: header),
-               let gz = gzip(log) {
+               let path = logPath(title: title, id: id).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
                 do {
-                    try await post("/storage/v1/object/logs/\(id).txt.gz", body: gz,
-                                   contentType: "application/gzip", headers: ["x-upsert": "false"])
+                    // Plain text, so a downloaded log opens with a double-click.
+                    try await post("/storage/v1/object/logs/" + path, body: log,
+                                   contentType: "text/plain", headers: ["x-upsert": "false"])
                     hasLog = true
                 } catch {
                     hasLog = false   // the report still goes; the site shows no log
@@ -2401,7 +2403,7 @@ enum ReportService {
         }
         var row: [String: Any] = [
             "id": id,
-            "game": String(d.game.title.prefix(120)),
+            "game": title,
             "rating": d.rating,
             "issues": d.issues,
             "description": String(d.text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2000)),
@@ -2447,33 +2449,40 @@ enum ReportService {
         }
     }
 
-    /// gzip around Foundation's raw DEFLATE (.zlib there is RFC 1951 with no
-    /// header): a log shrinks about tenfold, and Windows opens .gz itself.
-    static func gzip(_ data: Data) -> Data? {
-        guard let deflated = try? (data as NSData).compressed(using: .zlib) as Data else { return nil }
-        var out = Data([0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03])
-        out.append(deflated)
-        var crc = crc32(data).littleEndian
-        var size = UInt32(truncatingIfNeeded: data.count).littleEndian
-        withUnsafeBytes(of: &crc) { out.append(contentsOf: $0) }
-        withUnsafeBytes(of: &size) { out.append(contentsOf: $0) }
-        return out
-    }
-
-    private static let crcTable: [UInt32] = (0..<256).map { (i: Int) -> UInt32 in
-        var c = UInt32(i)
-        for _ in 0..<8 { c = (c & 1) != 0 ? (0xEDB8_8320 ^ (c >> 1)) : (c >> 1) }
-        return c
-    }
-
-    static func crc32(_ data: Data) -> UInt32 {
-        let table = crcTable
-        var c: UInt32 = 0xFFFF_FFFF
-        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
-            for b in buf { c = table[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8) }
+    /// ml864: where a report's log goes in the logs bucket — a folder per game,
+    /// named like its page on the site, and a plain-text file whose name sorts by
+    /// date and says which game and which report:
+    ///   untitled-goose-game/2026-10-03 12.16 Untitled Goose Game 84f5d6f0-….txt
+    /// schema.sql's upload policy accepts exactly this shape, so the title keeps
+    /// only Storage's safe characters (accents folded, curly quotes straightened).
+    static func logPath(title: String, id: String, at date: Date = Date()) -> String {
+        let key = gameKey(title)
+        let spaced = title.folding(options: [.diacriticInsensitive, .widthInsensitive], locale: nil)
+            .replacingOccurrences(of: "\u{2018}", with: "'")
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{2013}", with: "-")
+            .replacingOccurrences(of: "\u{2014}", with: "-")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined(separator: " ")
+        var kept = ""
+        for u in spaced.unicodeScalars where logNameCharacters.contains(u) {
+            kept.unicodeScalars.append(u)
         }
-        return c ^ 0xFFFF_FFFF
+        var name = kept.split(separator: " ").joined(separator: " ")
+        name = String(name.prefix(100)).trimmingCharacters(in: .whitespaces)
+        if name.isEmpty { name = "Game" }
+        return "\(key.isEmpty ? "other" : key)/\(logStamp.string(from: date)) \(name) \(id).txt"
     }
+
+    private static let logNameCharacters = CharacterSet(charactersIn:
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._()&',!+-")
+
+    private static let logStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH.mm"
+        return f
+    }()
 }
 
 /// ml863: the Report Compatibility form. The game, build, device, iOS and the
