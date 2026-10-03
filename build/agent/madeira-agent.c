@@ -66,14 +66,16 @@
 #define DEVCHANGE_PATH L"C:\\madeira\\devchange.txt"   /* ml875 */
 
 /* ml797: programs we started, so their exit can be reported (the app's
- * Games tab turns "Resume" back into "Play"). ml878: and the programs THEY
- * start, each tagged with the pid the app knows its family by (see
- * adopt_descendants). */
+ * Games tab turns "Resume" back into "Play"). ml878: plus, once such a program
+ * has ended cleanly, what it left running for the game (see root_exited). */
 static HANDLE g_child_handle[32];
 static DWORD  g_child_pid[32];
 static DWORD  g_child_kill_at[32];   /* ml799: tick when a hard kill is due, 0 = none */
-static DWORD  g_child_root[32];      /* ml878: the family's pid as the app knows it */
-static DWORD  g_child_code[32];      /* ml878: first non-zero exit code in the family so far */
+static DWORD  g_child_root[32];      /* ml878: the pid the app knows it by (its own, for a program we started) */
+static BOOL   g_child_orphan[32];    /* ml878: started by a program of ours that has ended cleanly */
+static BOOL   g_child_window[32];    /* ml878: orphan with a visible window at the last look */
+static BOOL   g_child_had_window[32];/* ml878: orphan ever seen with a visible window */
+static int    g_child_misses[32];    /* ml878: looks in a row its family showed no sign of a game */
 static int    g_child_n;
 
 static void agent_log( const char *fmt, ... );   /* defined below; reap_children logs */
@@ -135,22 +137,55 @@ static void append_text_file( const WCHAR *path, const char *text )
 /* ml878: A LAUNCHER'S GAME IS PART OF THE LAUNCHER'S ENTRY.
  *
  * Prince of Persia: The Two Thrones refuses to run unless its launcher,
- * PrinceOfPersia.exe, starts it, and a launcher may well exit once the game is
- * up. We only knew the program we started, so its exit read as "the game
- * ended" (the app went back to the Games tab with the game still running),
- * Force close never reached the game, and the game's message boxes were not
- * relayed (is_child_pid).
+ * PrinceOfPersia.exe, starts it, and a launcher may exit once it has started
+ * the game. We only knew the program we started, so its exit read as "the game
+ * ended": the app went back to the Games tab with the game still running, and
+ * Force close and the dialog relay (is_child_pid) never reached the game.
  *
- * So every process whose parent is one we track joins that one's FAMILY: same
- * root (the pid the app was given), closed and relayed with it. exit.txt gets
- * "pid=<root> code=<c>" once the whole family is gone, c being the first
- * non-zero exit code among its members (0 if none), so a game that crashes
- * under a launcher that then exits cleanly still reads as a crash.
+ * Built so that NO OTHER GAME CHANGES BEHAVIOUR (user rule): while a program we
+ * started runs, nothing here runs; when it ends with a non-zero code it is
+ * reported at once, exactly as before, and whatever it left running is not
+ * ours. Only when it ends CLEANLY does the agent look (one process snapshot)
+ * for what it started. Those programs become ORPHANS of its entry if one of
+ * them looks like the game -- started less than ORPHAN_YOUNG_MS ago (still
+ * loading) or showing a window -- and the exit report waits for them. An old,
+ * windowless helper (a crash reporter started with the game) never qualifies,
+ * so it cannot hold the report back: with nothing that qualifies, the report
+ * goes out at once, as before.
+ *
+ * While orphans run (watch_orphans, once a second): what they start joins too,
+ * Force close reaches them, their dialogs are relayed. The report goes out when
+ * a windowed orphan exits non-zero (its code: the game crashed), when the last
+ * orphan is gone, or when for ORPHAN_MISSES looks in a row none qualifies (code
+ * 0: only helpers are left; they keep running, untracked, as before).
  *
  * A parent id only names a parent while that pid cannot have been reused: we
  * hold a handle to every tracked process, which keeps its pid, and a candidate
- * created BEFORE that process cannot be its child. Several passes, because a
- * grandchild can be listed before its parent has joined. */
+ * created BEFORE its parent cannot be its child. */
+#define ORPHAN_YOUNG_MS 60000   /* the app's own first-frame wait */
+#define ORPHAN_MISSES   3
+
+static void remove_child( int i )
+{
+    g_child_n--;
+    g_child_handle[i] = g_child_handle[g_child_n];
+    g_child_pid[i] = g_child_pid[g_child_n];
+    g_child_kill_at[i] = g_child_kill_at[g_child_n];
+    g_child_root[i] = g_child_root[g_child_n];
+    g_child_orphan[i] = g_child_orphan[g_child_n];
+    g_child_window[i] = g_child_window[g_child_n];
+    g_child_had_window[i] = g_child_had_window[g_child_n];
+    g_child_misses[i] = g_child_misses[g_child_n];
+}
+
+static void report_exit( DWORD root, DWORD code )
+{
+    char line[96];
+    snprintf( line, sizeof(line), "pid=%lu code=%ld\r\n", (unsigned long)root, (long)(int)code );
+    append_text_file( EXIT_PATH, line );
+    agent_log( "%s", line );
+}
+
 static ULONGLONG process_start_time( HANDLE h )
 {
     FILETIME created, exited, kernel, user;
@@ -158,15 +193,29 @@ static ULONGLONG process_start_time( HANDLE h )
     return ((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime;
 }
 
-static void adopt_descendants( void )
+static BOOL is_young( HANDLE h )
+{
+    ULONGLONG start = process_start_time( h ), now;
+    FILETIME ft;
+
+    if (!start) return FALSE;
+    GetSystemTimeAsFileTime( &ft );
+    now = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return now >= start && now - start < (ULONGLONG)ORPHAN_YOUNG_MS * 10000;   /* 100 ns units */
+}
+
+/* Every live process whose parent is the ending program `root` (still listed:
+ * its handle is open) or, with root == 0, any orphan, joins as an orphan of
+ * that one's entry. Several passes: a grandchild can be listed first. */
+static int adopt_children( DWORD root )
 {
     PROCESSENTRY32W pe;
     HANDLE snap, h;
     BOOL added = TRUE;
-    int i, pass;
+    int i, pass, joined = 0;
 
     snap = CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
-    if (snap == INVALID_HANDLE_VALUE) return;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
     for (pass = 0; added && pass < 4; pass++)
     {
         added = FALSE;
@@ -175,10 +224,13 @@ static void adopt_descendants( void )
         do
         {
             ULONGLONG parent_start, start;
+            DWORD family;
 
             if (g_child_n >= 32) break;
             if (is_child_pid( pe.th32ProcessID )) continue;
-            for (i = 0; i < g_child_n; i++) if (g_child_pid[i] == pe.th32ParentProcessID) break;
+            for (i = 0; i < g_child_n; i++)
+                if (g_child_pid[i] == pe.th32ParentProcessID &&
+                    (g_child_orphan[i] || (root && g_child_pid[i] == root))) break;
             if (i == g_child_n) continue;
             h = OpenProcess( SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
                              FALSE, pe.th32ProcessID );
@@ -190,59 +242,185 @@ static void adopt_descendants( void )
                 CloseHandle( h );   /* older than the parent: an earlier owner of that pid started it */
                 continue;
             }
+            family = g_child_root[i];
             g_child_handle[g_child_n] = h;
             g_child_pid[g_child_n] = pe.th32ProcessID;
             g_child_kill_at[g_child_n] = 0;
-            g_child_root[g_child_n] = g_child_root[i];
-            g_child_code[g_child_n] = g_child_code[i];
+            g_child_root[g_child_n] = family;
+            g_child_orphan[g_child_n] = TRUE;
+            g_child_window[g_child_n] = FALSE;
+            g_child_had_window[g_child_n] = FALSE;
+            g_child_misses[g_child_n] = 0;
+            if (g_child_kill_at[i])
+            {
+                /* the user already asked to close this game: this part too */
+                EnumWindows( close_windows_proc, (LPARAM)pe.th32ProcessID );
+                g_child_kill_at[g_child_n] = GetTickCount() + CLOSE_GRACE_MS;
+                if (!g_child_kill_at[g_child_n]) g_child_kill_at[g_child_n] = 1;
+            }
             g_child_n++;
+            joined++;
             added = TRUE;
-            agent_log( "pid=%lu %ls, started by pid=%lu, joins the family of pid=%lu",
+            agent_log( "pid=%lu %ls, started by pid=%lu, stays with pid=%lu's entry",
                        (unsigned long)pe.th32ProcessID, pe.szExeFile,
-                       (unsigned long)pe.th32ParentProcessID, (unsigned long)g_child_root[i] );
+                       (unsigned long)pe.th32ParentProcessID, (unsigned long)family );
         } while (Process32NextW( snap, &pe ));
     }
     CloseHandle( snap );
+    return joined;
+}
+
+static BOOL CALLBACK mark_window_proc( HWND hwnd, LPARAM lp )
+{
+    DWORD pid = 0;
+    int i;
+
+    if (!IsWindowVisible( hwnd )) return TRUE;
+    GetWindowThreadProcessId( hwnd, &pid );
+    for (i = 0; i < g_child_n; i++)
+        if (g_child_orphan[i] && g_child_pid[i] == pid) g_child_window[i] = g_child_had_window[i] = TRUE;
+    return TRUE;
+}
+
+static void mark_orphan_windows( void )
+{
+    int i;
+    for (i = 0; i < g_child_n; i++) g_child_window[i] = FALSE;
+    EnumWindows( mark_window_proc, 0 );
+}
+
+/* Does anything of `root`'s orphans look like the game? Call after mark_orphan_windows. */
+static BOOL orphans_look_like_game( DWORD root, int *count )
+{
+    BOOL live = FALSE;
+    int i;
+
+    *count = 0;
+    for (i = 0; i < g_child_n; i++)
+    {
+        if (!g_child_orphan[i] || g_child_root[i] != root) continue;
+        (*count)++;
+        if (g_child_window[i] || is_young( g_child_handle[i] )) live = TRUE;
+    }
+    return live;
+}
+
+/* Stop tracking `root`'s orphans; they keep running, as untracked programs did before ml878. */
+static void release_orphans( DWORD root )
+{
+    int i = 0;
+    while (i < g_child_n)
+    {
+        if (g_child_orphan[i] && g_child_root[i] == root)
+        {
+            CloseHandle( g_child_handle[i] );
+            remove_child( i );
+            continue;
+        }
+        i++;
+    }
+}
+
+/* A program the app started has ended (entry i, handle still open). */
+static void root_exited( int i, DWORD code )
+{
+    DWORD root = g_child_pid[i];
+    int joined = 0, count;
+
+    if (!code) joined = adopt_children( root );   /* before the handle closes: the pid stays ours */
+    CloseHandle( g_child_handle[i] );
+    remove_child( i );
+    if (!joined)
+    {
+        report_exit( root, code );   /* every program that started nothing: as before ml878 */
+        return;
+    }
+    mark_orphan_windows();
+    if (!orphans_look_like_game( root, &count ))
+    {
+        agent_log( "pid=%lu ended cleanly; what it left running (%d) is not a game -- reported as before", (unsigned long)root, count );
+        release_orphans( root );
+        report_exit( root, code );
+        return;
+    }
+    agent_log( "pid=%lu ended cleanly while %d program(s) it started run on: its exit is reported when they are done",
+               (unsigned long)root, count );
+}
+
+/* An orphan has ended (entry i, handle still open). */
+static void orphan_exited( int i, DWORD code )
+{
+    DWORD root = g_child_root[i], pid = g_child_pid[i];
+    BOOL had_window = g_child_had_window[i];
+    int count;
+
+    adopt_children( 0 );   /* what it started on its way out (a bootstrapper's game) */
+    CloseHandle( g_child_handle[i] );
+    remove_child( i );
+    agent_log( "pid=%lu (of pid=%lu's entry) ended, code %ld", (unsigned long)pid, (unsigned long)root, (long)(int)code );
+    if (had_window && code)
+    {
+        release_orphans( root );   /* the game itself crashed: report it now, whatever is left */
+        report_exit( root, code );
+        return;
+    }
+    mark_orphan_windows();
+    if (!orphans_look_like_game( root, &count ))
+    {
+        release_orphans( root );
+        report_exit( root, 0 );
+    }
+}
+
+/* Once a second; does nothing (no snapshot) unless orphans exist. */
+static void watch_orphans( void )
+{
+    DWORD roots[32];
+    int i, j, n = 0, count, misses;
+
+    for (i = 0; i < g_child_n; i++)
+    {
+        if (!g_child_orphan[i]) continue;
+        for (j = 0; j < n; j++) if (roots[j] == g_child_root[i]) break;
+        if (j == n) roots[n++] = g_child_root[i];
+    }
+    if (!n) return;
+    adopt_children( 0 );
+    mark_orphan_windows();
+    for (j = 0; j < n; j++)
+    {
+        BOOL live = orphans_look_like_game( roots[j], &count );
+
+        misses = 0;
+        for (i = 0; i < g_child_n; i++)
+            if (g_child_orphan[i] && g_child_root[i] == roots[j] && g_child_misses[i] > misses)
+                misses = g_child_misses[i];
+        misses = live ? 0 : misses + 1;
+        for (i = 0; i < g_child_n; i++)
+            if (g_child_orphan[i] && g_child_root[i] == roots[j]) g_child_misses[i] = misses;
+        if (misses >= ORPHAN_MISSES)
+        {
+            agent_log( "pid=%lu's entry: %d program(s) left, none with a window -- reported as ended",
+                       (unsigned long)roots[j], count );
+            release_orphans( roots[j] );
+            report_exit( roots[j], 0 );
+        }
+    }
 }
 
 static void reap_children( void )
 {
-    int i = 0, j;
+    int i = 0;
     while (i < g_child_n)
     {
         if (WaitForSingleObject( g_child_handle[i], 0 ) == WAIT_OBJECT_0)
         {
-            DWORD code = 0, family, root = g_child_root[i];
-            int others = 0;
-            char line[96];
+            DWORD code = 0;
 
-            /* ml878: what it started on its way out joins the family first
-             * (its pid is still ours to compare with: we hold its handle). */
-            adopt_descendants();
             GetExitCodeProcess( g_child_handle[i], &code );
-            CloseHandle( g_child_handle[i] );
-            family = g_child_code[i] ? g_child_code[i] : code;
-            for (j = 0; j < g_child_n; j++)
-            {
-                if (j == i || g_child_root[j] != root) continue;
-                if (!g_child_code[j]) g_child_code[j] = family;
-                others++;
-            }
-            if (others)
-                agent_log( "pid=%lu ended (code %ld); %d more program(s) of pid=%lu's family still running",
-                           (unsigned long)g_child_pid[i], (long)(int)code, others, (unsigned long)root );
-            else
-            {
-                snprintf( line, sizeof(line), "pid=%lu code=%ld\r\n", (unsigned long)root, (long)(int)family );
-                append_text_file( EXIT_PATH, line );
-                agent_log( "%s", line );
-            }
-            g_child_n--;
-            g_child_handle[i] = g_child_handle[g_child_n];
-            g_child_pid[i] = g_child_pid[g_child_n];
-            g_child_kill_at[i] = g_child_kill_at[g_child_n];
-            g_child_root[i] = g_child_root[g_child_n];
-            g_child_code[i] = g_child_code[g_child_n];
+            if (g_child_orphan[i]) orphan_exited( i, code );
+            else root_exited( i, code );
+            i = 0;   /* ml878: entries may have joined or left */
             continue;
         }
         if (g_child_kill_at[i] && hardkill_enabled() && (LONG)(GetTickCount() - g_child_kill_at[i]) >= 0)
@@ -416,8 +594,11 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
             g_child_handle[g_child_n] = pi.hProcess;
             g_child_pid[g_child_n] = pi.dwProcessId;
             g_child_kill_at[g_child_n] = 0;
-            g_child_root[g_child_n] = pi.dwProcessId;   /* ml878: a family of its own */
-            g_child_code[g_child_n] = 0;
+            g_child_root[g_child_n] = pi.dwProcessId;   /* ml878: its own entry */
+            g_child_orphan[g_child_n] = FALSE;
+            g_child_window[g_child_n] = FALSE;
+            g_child_had_window[g_child_n] = FALSE;
+            g_child_misses[g_child_n] = 0;
             g_child_n++;
         }
         else CloseHandle( pi.hProcess );
@@ -449,7 +630,7 @@ static void handle_request( void )
         BOOL ok = FALSE;
         int i, members = 0;
         g_close_posted = 0;
-        /* ml878: the whole family, so a launcher's game is closed with it. */
+        /* ml878: and its orphans (a launcher's game), which carry its pid as root. */
         for (i = 0; i < g_child_n; i++)
             if (g_child_root[i] == kpid || g_child_pid[i] == kpid)
             {
@@ -990,7 +1171,7 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
         if (GetFileAttributesW( REQUEST_PATH ) != INVALID_FILE_ATTRIBUTES) handle_request();
         if (GetFileAttributesW( DEVCHANGE_PATH ) != INVALID_FILE_ATTRIBUTES) handle_devchange();   /* ml875 */
         if (GetFileAttributesW( DIALOG_ANSWER_PATH ) != INVALID_FILE_ATTRIBUTES) handle_dialog_answer();   /* ml876 */
-        if (g_child_n && polls % 5 == 0) adopt_descendants();   /* ml878: once a second */
+        if (g_child_n && polls % 5 == 0) watch_orphans();   /* ml878: once a second, a no-op without orphans */
         if (g_child_n || g_dialog) relay_dialogs();
         if (g_child_n) reap_children();
     }
