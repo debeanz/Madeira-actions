@@ -401,7 +401,9 @@
     if (r.arch) m.push(meta("chip", r.arch === "x86" ? "32-bit" : "64-bit"));
     if (typeof st.resolution === "string" && /^\d{2,5}x\d{2,5}$/.test(st.resolution)) m.push(meta("screen", st.resolution.replace("x", "×")));
     if (typeof st.frameCap === "string" && frameCapText(st.frameCap)) m.push(meta("gauge", frameCapText(st.frameCap)));
-    if (st.x86MemoryOrdering === false) m.push(meta("bolt", "x86 memory-ordering off"));
+    // The app's "Skip x86 memory-ordering emulation" switch (the game's own, else
+    // Settings'). Reports carry x86MemoryOrdering = !skip: false means it was On.
+    if (st.x86MemoryOrdering === false) m.push(meta("bolt", "Skip x86 memory-ordering emulation: On"));
     if (r.has_log) m.push(meta("doc", "Log sent"));
 
     var desc = String(r.description || "").trim();
