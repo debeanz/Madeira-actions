@@ -3001,25 +3001,29 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    Toggle(isOn: $touchControls.visible) {
-                        Label("Touch controller overlay", systemImage: "gamecontroller")
+                    // ml865: the same Off / Xbox / Custom switch as the game
+                    // toolbar's controller button.
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("Touch controls", systemImage: "gamecontroller")
+                        Picker("Touch controls", selection: $touchControls.choice) {
+                            ForEach(TouchControlsChoice.allCases) { c in
+                                Text(c.title).tag(c)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        Text(touchControls.choice.blurb)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    // ml831: what the on-screen controls send. Each choice keeps
-                    // its own layout; the editor below edits the chosen one.
-                    Picker("Send to game as", selection: $touchControls.mode) {
-                        Text("Keyboard & mouse").tag(TouchControlsMode.keyboardMouse)
-                        Text("Xbox controller (XInput)").tag(TouchControlsMode.xbox)
-                    }
-                    Text("Xbox mode shows a controller layout that the game reads as player 1, alongside any physical controller.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
                     Button {
-                        touchControls.visible = true
-                        touchControls.ensureDefaultLayout()
+                        touchControls.choice = .custom
                         touchControls.editing = true
                         desktopFullScreen = true
                     } label: {
-                        Label("Open layout editor", systemImage: "rectangle.and.hand.point.up.left")
+                        Label("Edit Custom Layout", systemImage: "pencil")
                     }
                 }
 
@@ -5295,9 +5299,57 @@ struct ControlFace {
     }
 }
 
-/// ml831: what the on-screen controls send to the game.
+/// ml831: which on-screen layout is up. ml865: `xbox` is the fixed preset and
+/// `custom` the player's own layout — any mix of keys, mouse buttons and
+/// controller inputs. `custom` keeps the raw value "keyboardMouse" it had when
+/// it held only keys, so saved files read the same in every build.
 enum TouchControlsMode: String, Codable, CaseIterable {
-    case keyboardMouse, xbox
+    case custom = "keyboardMouse", xbox
+}
+
+/// ml865: the three-way switch behind the game toolbar's controller button and
+/// Settings: no on-screen controls, the Xbox preset, or the custom layout.
+enum TouchControlsChoice: String, CaseIterable, Identifiable {
+    case off, xbox, custom
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .off:    return "Off"
+        case .xbox:   return "Xbox"
+        case .custom: return "Custom"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .off:    return "nosign"
+        case .xbox:   return "gamecontroller"
+        case .custom: return "square.grid.2x2"
+        }
+    }
+
+    /// The toolbar's confirmation after a switch.
+    var toast: String {
+        switch self {
+        case .off:    return "Touch controls off"
+        case .xbox:   return "Xbox controller"
+        case .custom: return "Custom layout"
+        }
+    }
+
+    /// One line under the Settings picker.
+    var blurb: String {
+        switch self {
+        case .off:
+            return "No on-screen controls. The screen works as a trackpad, and a physical controller still works."
+        case .xbox:
+            return "A ready-made Xbox controller layout. Games read it as player 1, alongside any physical controller."
+        case .custom:
+            return "Your own layout: any mix of controller buttons, keys and mouse buttons. While it has controller buttons, games also see an Xbox controller."
+        }
+    }
 }
 
 /// One on-screen control.
@@ -5317,26 +5369,34 @@ final class TouchControlsModel: ObservableObject {
     static let shared = TouchControlsModel()
     static let baseDiameter: CGFloat = 64
 
-    /// The ACTIVE mode's layout; everything reads this. ml831: the other mode's
-    /// layout waits in `stashed`.
+    /// The ACTIVE layout; everything reads this. ml865: in Xbox mode it is the
+    /// fixed preset, and the custom layout waits in `customStash`.
     @Published var controls: [TouchControl] = [] { didSet { save() } }
     @Published var visible = false              { didSet { save(); pushPadConnected() } }
-    /// ml831: what the controls send. Each mode keeps its own layout.
-    @Published var mode: TouchControlsMode = .keyboardMouse {
+    /// ml831: which layout is up. ml865: the Xbox preset or the custom layout;
+    /// only the custom one is the player's, and only it is edited.
+    @Published var mode: TouchControlsMode = .custom {
         didSet {
             guard !loading, mode != oldValue else { return }
-            // Stash BEFORE assigning `controls`: its didSet saves, and save()
-            // reads `stashed` as the other mode's layout.
-            let incoming = stashed
-            stashed = controls
             selected = nil
-            controls = incoming                     // saves
-            ensureDefaultLayout()                   // seeds (and saves) if empty
+            editing = false
+            if mode == .xbox {
+                // Stash BEFORE assigning `controls`: its didSet saves, and save()
+                // reads `customStash` as the custom layout in Xbox mode.
+                customStash = controls
+                controls = Self.defaultLayout(.xbox)
+            } else {
+                controls = customStash              // saves
+                ensureDefaultLayout()               // seeds (and saves) if empty
+            }
             pushPadConnected()
         }
     }
     @Published var fullScreen = false           // transient; overlay belongs to the desktop
-    @Published var editing = false              // transient, never persisted
+    /// Transient, never persisted. ml865: the editor can give a custom layout its
+    /// first controller button or take its last away; the pad follows when
+    /// editing ends, not per edit.
+    @Published var editing = false              { didSet { if oldValue && !editing { pushPadConnected() } } }
     @Published var selected: UUID?              // transient
     /// ml827: the loading / "Closing game…" panel is up (ContentView.showLaunchOverlay).
     /// The controls, toolbar and performance HUD wait for the game's first frame.
@@ -5345,19 +5405,45 @@ final class TouchControlsModel: ObservableObject {
     /// "Close <game>"; nil in a Windows desktop session or between games.
     @Published var gameTitle: String? = nil     // transient
 
+    /// ml865: Off / Xbox / Custom as one value — the toolbar's controller panel
+    /// and the Settings picker both set this.
+    var choice: TouchControlsChoice {
+        get { visible ? (mode == .xbox ? .xbox : .custom) : .off }
+        set {
+            guard newValue != choice else { return }
+            switch newValue {
+            case .off:
+                editing = false
+                visible = false
+            case .xbox:
+                mode = .xbox
+                visible = true
+            case .custom:
+                mode = .custom
+                visible = true
+                ensureDefaultLayout()
+            }
+            LogStore.shared.log("[controls] ml865 touch controls: \(newValue.rawValue)")
+        }
+    }
+
     private var loading = false
-    /// ml831: the inactive mode's layout (not published; nothing draws it).
-    private var stashed: [TouchControl] = []
+    /// ml865: the custom layout while the Xbox preset is up (not published;
+    /// nothing draws it).
+    private var customStash: [TouchControl] = []
+    /// ml865: the editable Xbox layout of ml831–ml864. The preset is fixed now,
+    /// but this is written back untouched so an older build still finds it.
+    private var legacyPad: [TouchControl]?
     private static var url: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("madeira-controls.json")
     }
 
-    /// ml831: `controls` is ALWAYS the keyboard & mouse layout, so an older build
-    /// keeps it. New fields are Optional: synthesized decoding ignores defaults,
-    /// and a failed decode would silently empty the layout. `mode` is the raw
-    /// string, so an unknown future mode reads as keyboard & mouse instead of
-    /// failing the whole file.
+    /// ml831: `controls` is ALWAYS the custom (once keyboard & mouse) layout, so
+    /// an older build keeps it. New fields are Optional: synthesized decoding
+    /// ignores defaults, and a failed decode would silently empty the layout.
+    /// `mode` is the raw string, so an unknown future mode reads as the custom
+    /// layout instead of failing the whole file.
     private struct Saved: Codable {
         var controls: [TouchControl]
         var visible: Bool
@@ -5369,12 +5455,16 @@ final class TouchControlsModel: ObservableObject {
         loading = true
         if let d = try? Data(contentsOf: Self.url),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
-            let m = s.mode.flatMap { TouchControlsMode(rawValue: $0) } ?? .keyboardMouse
-            let pad = s.padControls ?? []
-            mode     = m
-            controls = m == .xbox ? pad : s.controls
-            stashed  = m == .xbox ? s.controls : pad
-            visible  = s.visible
+            let m = s.mode.flatMap { TouchControlsMode(rawValue: $0) } ?? .custom
+            mode      = m
+            legacyPad = s.padControls
+            if m == .xbox {
+                customStash = s.controls
+                controls    = Self.defaultLayout(.xbox)
+            } else {
+                controls = s.controls
+            }
+            visible = s.visible
         }
         loading = false
         // ml831: next turn, so GamepadBridge.shared is never first touched from
@@ -5384,9 +5474,8 @@ final class TouchControlsModel: ObservableObject {
 
     private func save() {
         guard !loading else { return }
-        let pad = mode == .xbox
-        let s = Saved(controls: pad ? stashed : controls, visible: visible,
-                      mode: mode.rawValue, padControls: pad ? controls : stashed)
+        let s = Saved(controls: mode == .xbox ? customStash : controls, visible: visible,
+                      mode: mode.rawValue, padControls: legacyPad)
         guard let d = try? JSONEncoder().encode(s) else { return }
         // ml835: coalesce. A drag or resize in the editor changes `controls` on
         // every touch sample, and an atomic file write per sample made the editor
@@ -5412,11 +5501,13 @@ final class TouchControlsModel: ObservableObject {
 
     /// ml831: the touch pad is connected while the Xbox layout is switched on,
     /// not only while playing — engines enumerate pads behind the loading panel.
-    /// Transient states (editor, loading panel, leaving full screen) only zero
-    /// the input (ControlsInputView.releaseAll).
+    /// ml865: also while a custom layout with controller buttons is on; a
+    /// keys-only layout never shows games a controller (some then switch their
+    /// prompts, or ignore the keyboard). Transient states (editor, loading panel,
+    /// leaving full screen) only zero the input (ControlsInputView.releaseAll).
     private func pushPadConnected() {
         guard !loading else { return }
-        let on = mode == .xbox && visible
+        let on = visible && (mode == .xbox || controls.contains { $0.action.isPad })
         if Thread.isMainThread {
             GamepadBridge.shared.setTouchPadConnected(on)
         } else {
@@ -5437,7 +5528,7 @@ final class TouchControlsModel: ObservableObject {
 
     private static func defaultLayout(_ mode: TouchControlsMode) -> [TouchControl] {
         switch mode {
-        case .keyboardMouse:
+        case .custom:
             return [
                 TouchControl(nx: 0.16, ny: 0.72, scale: 1.35, action: .joystickWASD),
                 TouchControl(nx: 0.84, ny: 0.72, scale: 1.05, action: .mouseLeft),
@@ -6579,10 +6670,12 @@ struct TouchControlsOverlay: View {
     /// layout editor is open; fades a few seconds after the last interaction.
     @State private var chromeVisible = true
     @State private var chromeHideWork: DispatchWorkItem?
-    /// ml861: the ⋯ dropdown (Save Log, Close <game>). The toolbar stays up
-    /// while it is open.
-    @State private var menuOpen = false
-    private var chromeShown: Bool { chromeVisible || m.editing || menuOpen }
+    /// ml861: the ⋯ dropdown (Save Log, Close <game>). ml865: or the controller
+    /// button's panel (Off / Xbox / Custom) — one at a time, in the same place.
+    /// The toolbar stays up while either is open.
+    private enum ToolbarMenu { case game, controls }
+    @State private var openMenu: ToolbarMenu? = nil
+    private var chromeShown: Bool { chromeVisible || m.editing || openMenu != nil }
     /// ml858: what the toolbar's Save Log did ("Saved: Celeste (…)"), shown under
     /// the toolbar for a few seconds.
     @State private var logToast: String? = nil
@@ -6654,13 +6747,19 @@ struct TouchControlsOverlay: View {
                         .padding(.trailing, geo.safeAreaInsets.trailing + 12)
                     // ml861: the ⋯ dropdown, right under the toolbar. Its rect goes
                     // out as "menu" so ControlsWindow routes taps on it to SwiftUI
-                    // instead of letting them fall through to the game.
-                    if menuOpen {
-                        gameMenu
-                            .background { ChromeRectReporter(slot: "menu") }
-                            .padding(.top, geo.safeAreaInsets.top + 10 + 56 + 8)
-                            .padding(.trailing, geo.safeAreaInsets.trailing + 12)
-                            .transition(.opacity)
+                    // instead of letting them fall through to the game. ml865: the
+                    // controller panel uses the same place and slot.
+                    if let menu = openMenu {
+                        Group {
+                            switch menu {
+                            case .game:     gameMenu
+                            case .controls: controlsMenu
+                            }
+                        }
+                        .background { ChromeRectReporter(slot: "menu") }
+                        .padding(.top, geo.safeAreaInsets.top + 10 + 56 + 8)
+                        .padding(.trailing, geo.safeAreaInsets.trailing + 12)
+                        .transition(.opacity)
                     }
                     // ml858: Save Log's result, just under the toolbar (56 pt tall:
                     // 44 pt buttons + 6 pt padding each side). Takes no touches, and
@@ -6679,7 +6778,10 @@ struct TouchControlsOverlay: View {
                             .transition(.opacity)
                     }
                     if m.editing, let i = m.index(of: m.selected) {
+                        // ml865: a fresh panel per control, so it opens on that
+                        // control's tab.
                         MappingPanel(control: m.controls[i], screen: geo.size)
+                            .id(m.controls[i].id)
                     }
                 }
             }
@@ -6702,10 +6804,10 @@ struct TouchControlsOverlay: View {
             // top max(safe area + 72 pt, 16% of the height). Taps elsewhere
             // still reach the game and leave the toolbar alone.
             .onReceive(NotificationCenter.default.publisher(for: .madeiraSurfaceTap)) { note in
-                // ml861: a tap on the game closes an open ⋯ menu, as a tap outside
+                // ml861: a tap on the game closes an open menu, as a tap outside
                 // any menu does.
-                if menuOpen {
-                    withAnimation(.easeInOut(duration: 0.18)) { menuOpen = false }
+                if openMenu != nil {
+                    withAnimation(.easeInOut(duration: 0.18)) { openMenu = nil }
                     showChrome()
                     return
                 }
@@ -6718,7 +6820,7 @@ struct TouchControlsOverlay: View {
         .ignoresSafeArea()
         .onAppear { showChrome() }
         .onChange(of: m.fullScreen) { _, on in
-            menuOpen = false            // ml861: never reopen into a stale menu
+            openMenu = nil              // ml861: never reopen into a stale menu
             if on { showChrome() }
         }
         // ml827: the 4 s auto-hide ran out during the load; show the toolbar
@@ -6744,11 +6846,11 @@ struct TouchControlsOverlay: View {
             // ml861: the ✕ only leaves the game view to browse Madeira (the game
             // keeps running); saving a log and closing the game live in here.
             glassButton("ellipsis", dim: false) {
-                menuOpen.toggle()
+                openMenu = openMenu == .game ? nil : .game
             }
+            // ml865: Off / Xbox / Custom. Dim while the controls are off.
             glassButton("gamecontroller", dim: !m.visible) {
-                m.visible.toggle()
-                if m.visible { m.ensureDefaultLayout() }
+                openMenu = openMenu == .controls ? nil : .controls
             }
             // Performance overlay on/off. Same UserDefaults key as the
             // Settings toggle, so the two stay in sync.
@@ -6760,7 +6862,8 @@ struct TouchControlsOverlay: View {
             glassButton("keyboard") {
                 MetalBackedView.toggleKeyboard()
             }
-            if m.visible {
+            // ml865: only the custom layout is edited; the Xbox preset is fixed.
+            if m.choice == .custom {
                 glassButton(m.editing ? "checkmark" : "pencil",
                             steam: m.editing, primary: m.editing) {
                     m.editing.toggle()
@@ -6769,7 +6872,6 @@ struct TouchControlsOverlay: View {
                 if m.editing {
                     glassButton("plus", steam: true) {
                         var c = TouchControl()
-                        if m.mode == .xbox { c.action = .pad(PadInput.a.rawValue) }   // ml831
                         // Stagger, so repeated adds do not stack invisibly.
                         c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
                         c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
@@ -6824,13 +6926,75 @@ struct TouchControlsOverlay: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    /// One ⋯ row. Picking it closes the menu and restarts the toolbar's
+    /// ml865: the controller button's panel — Off, the Xbox preset or the custom
+    /// layout, and the custom layout's editor. Opaque like the ⋯ menu (ml822).
+    private var controlsMenu: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Touch controls")
+                .font(.system(size: 12, weight: .semibold))
+                .tracking(0.6)
+                .textCase(.uppercase)
+                .foregroundStyle(Color.white.opacity(0.5))
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+            HStack(spacing: 8) {
+                ForEach(TouchControlsChoice.allCases) { c in choiceTile(c) }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 12)
+            Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+            menuRow("Edit Custom Layout", system: "pencil") {
+                m.choice = .custom
+                m.editing = true
+            }
+        }
+        .frame(width: 300)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.95)))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    /// One of Off / Xbox / Custom. Picking one closes the panel and says what
+    /// is up now under the toolbar.
+    private func choiceTile(_ c: TouchControlsChoice) -> some View {
+        let on = m.choice == c
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.easeInOut(duration: 0.18)) { openMenu = nil }
+            showChrome()
+            guard !on else { return }
+            withAnimation(.easeInOut(duration: 0.22)) { m.choice = c }
+            showLogToast(c.toast, for: 1.6)
+        } label: {
+            VStack(spacing: 6) {
+                Image(systemName: c.icon)
+                    .font(.system(size: 20, weight: .medium))
+                Text(c.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(on ? Color.white : Color.white.opacity(0.72))
+            .frame(maxWidth: .infinity)
+            .frame(height: 66)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(on ? SteamPalette.accent : Color(red: 0.12, green: 0.15, blue: 0.20)))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.white.opacity(on ? 0.18 : 0.08), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// One menu row. Picking it closes the menu and restarts the toolbar's
     /// hide timer, which the open menu had been holding off.
     private func menuRow(_ title: String, system: String, destructive: Bool = false,
                          _ action: @escaping () -> Void) -> some View {
         Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            withAnimation(.easeInOut(duration: 0.18)) { menuOpen = false }
+            withAnimation(.easeInOut(duration: 0.18)) { openMenu = nil }
             showChrome()
             action()
         } label: {
@@ -7080,9 +7244,15 @@ struct MappingPanel: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
-    /// 0 keyboard, 1 controller. ml831: opens on the controller tab in Xbox mode;
-    /// the keyboard tab stays for mixed layouts (an Esc key beside the pad).
-    @State private var tab = TouchControlsModel.shared.mode == .xbox ? 1 : 0
+    /// 0 keyboard, 1 controller. ml865: opens on the tab of the control's own
+    /// input — a custom layout mixes both (an Esc key beside the pad).
+    @State private var tab: Int
+
+    init(control: TouchControl, screen: CGSize) {
+        self.control = control
+        self.screen = screen
+        _tab = State(initialValue: control.action.isPad ? 1 : 0)
+    }
 
 
     var body: some View {

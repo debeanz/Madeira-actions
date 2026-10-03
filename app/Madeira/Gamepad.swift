@@ -24,8 +24,9 @@ import UIKit
 //   replacement xinput1_x.dll (build/xinput) serves to the game. The game
 //   sees a wired Xbox 360 controller; rumble requests come back through
 //   the same table and drive the pad's haptics. The on-screen touch
-//   controls in Xbox mode feed the same slot 0 through setTouchPad; this
-//   bridge merges both and is the slot's only writer (ml831).
+//   controls' controller buttons (the Xbox preset, or a custom layout's)
+//   feed the same slot 0 through setTouchPad; this bridge merges both and
+//   is the slot's only writer (ml831).
 //
 //   Keyboard & mouse — for games without pad support. Buttons map to a
 //   ControlAction (the touch overlay's vocabulary: a VK code, a mouse
@@ -507,9 +508,10 @@ final class GamepadBridge: ObservableObject {
     }
 
     /// ml831: whether the touch pad reports a connected controller (the
-    /// touch side keeps it up while mode == .xbox && visible, not just while
-    /// a finger is down, so engines that enumerate pads at startup see it).
-    /// false also zeroes the stored touch input.
+    /// touch side keeps it up while the Xbox preset — ml865: or a custom layout
+    /// with controller buttons — is on, not just while a finger is down, so
+    /// engines that enumerate pads at startup see it). false also zeroes the
+    /// stored touch input.
     func setTouchPadConnected(_ connected: Bool) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { self.setTouchPadConnected(connected) }
