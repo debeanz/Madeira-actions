@@ -1727,6 +1727,16 @@ struct ContentView: View {
                 GameLogSaver.save(title: "Desktop", exe: nil, done: done)
             }
         }
+        // ml861: the toolbar ⋯ menu's "Close <game>". forceCloseGame marks the
+        // close as requested, so the exit lands on the restart advice (ml856),
+        // never on the crash offer (ml859).
+        .onReceive(NotificationCenter.default.publisher(for: .madeiraCloseGame)) { _ in
+            forceCloseGame()
+        }
+        // ml861: which game the toolbar ⋯ menu can close.
+        .onChange(of: launcherSession, initial: true) { _, s in
+            if case .playing(let t) = s { touchControls.gameTitle = t } else { touchControls.gameTitle = nil }
+        }
     }
 
     /// The games' Metal host and the desktop compositor are visible only on
@@ -2214,9 +2224,12 @@ struct ContentView: View {
                 launchingGame = nil
                 desktopFullScreen = false
                 selectedTab = .games
-                // ml859: a crash (non-zero exit) gets the Save Log offer first;
-                // a clean quit or a force close (both exit 0) gets the restart advice.
-                if code != 0 {
+                // ml859: a crash (non-zero exit) gets the Save Log offer first; a
+                // clean quit gets the restart advice. A close the USER asked for
+                // (Force close / the toolbar's Close) is never a crash, whatever the
+                // code: the agent's fallback for a game that ignores WM_CLOSE is
+                // TerminateProcess(…, 1) (madeira-agent.c), which reports 1.
+                if code != 0 && !done.quitRequested {
                     offerCrashLog(gameID: gameID, headline: "\(title) crashed")
                 } else {
                     recommendRestartAfterGame()   // ml856
@@ -5281,6 +5294,9 @@ final class TouchControlsModel: ObservableObject {
     /// ml827: the loading / "Closing game…" panel is up (ContentView.showLaunchOverlay).
     /// The controls, toolbar and performance HUD wait for the game's first frame.
     @Published var launchPanelUp = false        // transient
+    /// ml861: the Games-tab game being played, for the toolbar ⋯ menu's
+    /// "Close <game>"; nil in a Windows desktop session or between games.
+    @Published var gameTitle: String? = nil     // transient
 
     private var loading = false
     /// ml831: the inactive mode's layout (not published; nothing draws it).
@@ -5611,11 +5627,16 @@ enum ControlsGeometry {
 /// for the camera and sat above any control placed near the top.
 enum ControlsChrome {
     static var toolbar: CGRect = .null
+    /// ml861: the toolbar's ⋯ dropdown while it is open (.null when closed).
+    /// Without it here, its rows sit outside the toolbar rect and every tap on
+    /// them would fall through to the game.
+    static var menu: CGRect = .null
     /// ml833: only the toolbar. The perf HUD takes no touches (its pacing pill
     /// is gone), so taps on it fall through to the game surface and a top-band
     /// tap there still shows the toolbar; camera swipes work over it again.
     static func contains(_ p: CGPoint) -> Bool {
-        !toolbar.isNull && toolbar.insetBy(dx: -6, dy: -6).contains(p)
+        (!toolbar.isNull && toolbar.insetBy(dx: -6, dy: -6).contains(p))
+            || (!menu.isNull && menu.insetBy(dx: -6, dy: -6).contains(p))
     }
 }
 
@@ -6495,6 +6516,9 @@ extension Notification.Name {
     /// ml858: the save finished; userInfo["name"] is the file's name without .txt,
     /// absent when there was no log to save.
     static let madeiraLogSaved = Notification.Name("MadeiraLogSaved")
+    /// ml861: the toolbar ⋯ menu's "Close <game>": the same force close as the
+    /// Games tab's ⋯ → Force close.
+    static let madeiraCloseGame = Notification.Name("MadeiraCloseGame")
 }
 
 struct TouchControlsOverlay: View {
@@ -6506,7 +6530,10 @@ struct TouchControlsOverlay: View {
     /// layout editor is open; fades a few seconds after the last interaction.
     @State private var chromeVisible = true
     @State private var chromeHideWork: DispatchWorkItem?
-    private var chromeShown: Bool { chromeVisible || m.editing }
+    /// ml861: the ⋯ dropdown (Save Log, Close <game>). The toolbar stays up
+    /// while it is open.
+    @State private var menuOpen = false
+    private var chromeShown: Bool { chromeVisible || m.editing || menuOpen }
     /// ml858: what the toolbar's Save Log did ("Saved: Celeste (…)"), shown under
     /// the toolbar for a few seconds.
     @State private var logToast: String? = nil
@@ -6576,6 +6603,16 @@ struct TouchControlsOverlay: View {
                         }
                         .padding(.top, geo.safeAreaInsets.top + 10)
                         .padding(.trailing, geo.safeAreaInsets.trailing + 12)
+                    // ml861: the ⋯ dropdown, right under the toolbar. Its rect goes
+                    // out as "menu" so ControlsWindow routes taps on it to SwiftUI
+                    // instead of letting them fall through to the game.
+                    if menuOpen {
+                        gameMenu
+                            .background { ChromeRectReporter(slot: "menu") }
+                            .padding(.top, geo.safeAreaInsets.top + 10 + 56 + 8)
+                            .padding(.trailing, geo.safeAreaInsets.trailing + 12)
+                            .transition(.opacity)
+                    }
                     // ml858: Save Log's result, just under the toolbar (56 pt tall:
                     // 44 pt buttons + 6 pt padding each side). Takes no touches, and
                     // sits outside the measured toolbar rect, so taps reach the game.
@@ -6610,11 +6647,19 @@ struct TouchControlsOverlay: View {
             // double-tap-and-hold on it (TouchControlButton).
             .onPreferenceChange(ControlsChromeRectsKey.self) { rects in
                 ControlsChrome.toolbar = rects["toolbar"] ?? .null
+                ControlsChrome.menu = rects["menu"] ?? .null   // ml861: absent when closed
             }
             // ml833: only a surface tap in the TOP band shows the toolbar: the
             // top max(safe area + 72 pt, 16% of the height). Taps elsewhere
             // still reach the game and leave the toolbar alone.
             .onReceive(NotificationCenter.default.publisher(for: .madeiraSurfaceTap)) { note in
+                // ml861: a tap on the game closes an open ⋯ menu, as a tap outside
+                // any menu does.
+                if menuOpen {
+                    withAnimation(.easeInOut(duration: 0.18)) { menuOpen = false }
+                    showChrome()
+                    return
+                }
                 guard let p = note.userInfo?["location"] as? CGPoint,
                       p.y < max(geo.safeAreaInsets.top + 72, geo.size.height * 0.16)
                 else { return }
@@ -6623,7 +6668,10 @@ struct TouchControlsOverlay: View {
         }
         .ignoresSafeArea()
         .onAppear { showChrome() }
-        .onChange(of: m.fullScreen) { _, on in if on { showChrome() } }
+        .onChange(of: m.fullScreen) { _, on in
+            menuOpen = false            // ml861: never reopen into a stale menu
+            if on { showChrome() }
+        }
         // ml827: the 4 s auto-hide ran out during the load; show the toolbar
         // when the game appears.
         .onChange(of: m.launchPanelUp) { _, up in if !up { showChrome() } }
@@ -6644,6 +6692,11 @@ struct TouchControlsOverlay: View {
                 NotificationCenter.default.post(
                     name: Notification.Name("MadeiraExitFullScreen"), object: nil)
             }
+            // ml861: the ✕ only leaves the game view to browse Madeira (the game
+            // keeps running); saving a log and closing the game live in here.
+            glassButton("ellipsis", dim: false) {
+                menuOpen.toggle()
+            }
             glassButton("gamecontroller", dim: !m.visible) {
                 m.visible.toggle()
                 if m.visible { m.ensureDefaultLayout() }
@@ -6657,12 +6710,6 @@ struct TouchControlsOverlay: View {
             // pointer panel's ⌨ button and the touch-overlay action).
             glassButton("keyboard") {
                 MetalBackedView.toggleKeyboard()
-            }
-            // ml858: save this game's log to Documents/logs without leaving it —
-            // the moment a slowdown is happening is the moment worth saving.
-            glassButton("doc.text") {
-                showLogToast("Saving log…")
-                NotificationCenter.default.post(name: .madeiraSaveLog, object: nil)
             }
             if m.visible {
                 glassButton(m.editing ? "checkmark" : "pencil",
@@ -6697,6 +6744,56 @@ struct TouchControlsOverlay: View {
         .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .stroke(m.editing ? SteamPalette.border : Color.white.opacity(0.10), lineWidth: 1))
         .animation(.easeInOut(duration: 0.22), value: m.editing)
+    }
+
+    /// ml861: the ⋯ dropdown. Opaque like the toolbar panel — no glass or
+    /// material over the game (ml822). "Close <game>" only while a Games-tab game
+    /// is playing; in a Windows desktop session there is no game to close.
+    private var gameMenu: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            menuRow("Save Log", system: "doc.text") {
+                showLogToast("Saving log…")
+                NotificationCenter.default.post(name: .madeiraSaveLog, object: nil)
+            }
+            if let title = m.gameTitle {
+                Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+                menuRow("Close \(title)", system: "xmark.octagon", destructive: true) {
+                    NotificationCenter.default.post(name: .madeiraCloseGame, object: nil)
+                }
+            }
+        }
+        .frame(width: 280)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.95)))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    /// One ⋯ row. Picking it closes the menu and restarts the toolbar's
+    /// hide timer, which the open menu had been holding off.
+    private func menuRow(_ title: String, system: String, destructive: Bool = false,
+                         _ action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.easeInOut(duration: 0.18)) { menuOpen = false }
+            showChrome()
+            action()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: system)
+                    .frame(width: 22)
+                Text(title)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: 16, weight: .medium))
+            .foregroundStyle(destructive ? SteamPalette.danger : Color.white)
+            .padding(.horizontal, 16)
+            .frame(height: 48)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     /// `steam`: ml833, the layout editor's own buttons (done, add) — solid
