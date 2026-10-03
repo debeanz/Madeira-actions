@@ -473,6 +473,7 @@ final class MetalBackedView: UIView {
         guard trackpadMode else {
             guard directFinger == nil, let t = touches.first else { return }   // ml881: one mouse finger
             directFinger = t
+            GameDialogs.shared.noteDialogTouch()   // ml882: the user is working the window
             let (x, y) = mapTouch(t)
             winios_post_touch_down(x, y)
             return
@@ -1905,6 +1906,7 @@ struct ContentView: View {
         let exePath = GameLibrary.windowsPath(exe)
         launchingGame = game
         firstFrameSeen = false
+        GameDialogs.shared.launchStarted()   // ml882
         closingGame = false          // ml816: never carry a stale closing panel in
         currentWatch?.done = true    // ml818: and never a previous game's watchdog
         currentWatch = nil
@@ -2309,8 +2311,15 @@ struct ContentView: View {
                 // (Force close / the toolbar's Close) is never a crash, whatever the
                 // code: the agent's fallback for a game that ignores WM_CLOSE is
                 // TerminateProcess(…, 1) (madeira-agent.c), which reports 1.
-                if code != 0 && !done.quitRequested {
-                    offerCrashLog(gameID: gameID, headline: "\(title) crashed")
+                // ml882: and a game that ended before it ever drew -- without the
+                // user working a window it showed (a launcher's Quit) -- did not
+                // start, whatever its exit code: Prince of Persia's launcher quit
+                // cleanly (0) without starting the game and got only the restart
+                // advice, so the user had to dig the log out by hand.
+                let neverStarted = !firstFrameSeen && !GameDialogs.shared.touchedSinceLaunch
+                if (code != 0 || neverStarted) && !done.quitRequested {
+                    offerCrashLog(gameID: gameID, headline: code != 0 ? "\(title) crashed"
+                                                                     : "\(title) closed before it started")
                 } else {
                     recommendRestartAfterGame()   // ml856
                 }
@@ -2436,6 +2445,7 @@ struct ContentView: View {
             logStore.log("Games: screen \(screenW)x\(screenH) (Settings → Screen resolution)")
             launchingGame = game
             firstFrameSeen = false
+            GameDialogs.shared.launchStarted()   // ml882
             desktopFullScreen = true
             // Let the loading screen actually reach the display before the
             // JIT pool allocation freezes the process.

@@ -263,6 +263,13 @@ final class GameDialogs: ObservableObject {
     private let lock = NSLock()
     private var windowsShowing = false
 
+    /// ml882: main thread. Whether the user has touched a dialog window since
+    /// the current game was launched -- a launcher closed with its own Quit
+    /// button ended on purpose, so it is not offered as a failed start.
+    private(set) var touchedSinceLaunch = false
+    func launchStarted() { touchedSinceLaunch = false }
+    func noteDialogTouch() { touchedSinceLaunch = true }
+
     private init() {}
 
     /// Main thread (Winios.m's overlay, via madeira_game_dialog_windows).

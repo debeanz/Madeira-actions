@@ -327,12 +327,15 @@ static void ios_log_registry_miss( enum request req )
     for (i = n = 0; i < len && n < sizeof(name) - 1; i++)
         name[n++] = (w[i] >= 0x20 && w[i] < 0x7f) ? (char)w[i] : '?';
     name[n] = 0;
+    /* ml882: stderr, like the other server diagnostics ([srv-own]): ws_log's
+     * file stops reaching the session log shortly after the server starts, so
+     * 0.1.147 printed these where nobody could read them. */
     if (req == REQ_open_key)
-        ws_log( "[reg-miss] ml881 #%d pid %04x key \"%s\" under handle %#x", logged,
-                current->process->id, name, current->req.open_key_request.parent );
+        fprintf( stderr, "[reg-miss] ml881 #%d pid %04x key \"%s\" under handle %#x\n", logged,
+                 current->process->id, name, current->req.open_key_request.parent );
     else
-        ws_log( "[reg-miss] ml881 #%d pid %04x value \"%s\" in key handle %#x", logged,
-                current->process->id, name, current->req.get_key_value_request.hkey );
+        fprintf( stderr, "[reg-miss] ml881 #%d pid %04x value \"%s\" in key handle %#x\n", logged,
+                 current->process->id, name, current->req.get_key_value_request.hkey );
 }
 
 /* call a request handler */

@@ -211,9 +211,35 @@ static HWND WINAPI ios_NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *cla
                                              DWORD flags, HINSTANCE client_instance, const WCHAR *class,
                                              BOOL ansi )
 {
-    return NtUserCreateWindowEx( ex_style, class_name, version, window_name, style, x, y, cx, cy,
-                                 parent, menu, instance, params, flags, client_instance,
-                                 ios_wow_atom( class, "NtUserCreateWindowEx" ), ansi );
+    const WCHAR *atom = ios_wow_atom( class, "NtUserCreateWindowEx" );
+    HWND ret;
+
+    /* ml882: and for that 32-bit caller pass NO class rather than the atom.
+     * `class` only feeds the TRACE and CREATESTRUCT.lpszClass; with NULL,
+     * win32u puts the class NAME there (NtUserGetClassName), which is what
+     * every 32-bit window got before ml878 (B + atom was never IS_INTRESOURCE).
+     * With the atom, every window Prince of Persia's launcher created from an
+     * atom class -- COM's apartment window above all -- had two of its 32-bit
+     * callbacks fault (reads at guest 0x81/0x82) and failed with "error 0",
+     * so its COM was unusable (0.1.143-0.1.147; pop3.exe's COM window, made
+     * before ml878, was fine). 64-bit callers keep upstream's atom. */
+    if (atom != class) class = NULL;
+    ret = NtUserCreateWindowEx( ex_style, class_name, version, window_name, style, x, y, cx, cy,
+                                parent, menu, instance, params, flags, client_instance, class, ansi );
+    if (!ret && ios_wow_base())
+    {
+        static int logged;
+        char name[96];
+        unsigned int i, n = class_name ? class_name->Length / sizeof(WCHAR) : 0;
+
+        for (i = 0; i < n && i < sizeof(name) - 1; i++)
+            name[i] = (class_name->Buffer[i] >= 0x20 && class_name->Buffer[i] < 0x7f) ? (char)class_name->Buffer[i] : '?';
+        name[i] = 0;
+        if (__atomic_add_fetch( &logged, 1, __ATOMIC_RELAXED ) <= 16)
+            dprintf( 2, "[wow-cw] ml882 a 32-bit CreateWindowEx failed: class \"%s\" style %#x parent %p error %u\n",
+                     name, (unsigned int)style, parent, (unsigned int)RtlGetLastWin32Error() );
+    }
+    return ret;
 }
 
 static HANDLE WINAPI ios_NtUserGetProp( HWND hwnd, const WCHAR *str )
