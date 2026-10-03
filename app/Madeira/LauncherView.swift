@@ -2271,6 +2271,8 @@ enum GameLogSaver {
 /// and will not send.
 enum ReportService {
     static let projectURL = ""
+    /// The project's publishable key (sb_publishable_…) or legacy anon key —
+    /// public by design; supabase/schema.sql on main fixes what it allows.
     static let anonKey = ""
     static let siteURL = "https://debeanz.github.io/Madeira-actions/"
 
@@ -2428,7 +2430,12 @@ enum ReportService {
         var request = URLRequest(url: url, timeoutInterval: 90)
         request.httpMethod = "POST"
         request.setValue(anonKey, forHTTPHeaderField: "apikey")
-        request.setValue("Bearer \(anonKey)", forHTTPHeaderField: "Authorization")
+        // A publishable key (sb_publishable_…) goes on apikey alone: it isn't a
+        // JWT, and Supabase rejects one sent as a Bearer token. A legacy anon key
+        // wants both.
+        if !anonKey.hasPrefix("sb_") {
+            request.setValue("Bearer \(anonKey)", forHTTPHeaderField: "Authorization")
+        }
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         let (data, response) = try await URLSession.shared.upload(for: request, from: body)
