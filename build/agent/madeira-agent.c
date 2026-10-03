@@ -921,7 +921,33 @@ static void handle_devchange( void )
 #endif
 static HWND g_dialog;   /* the dialog the app was told about; NULL = none */
 
-struct dialog_info { char text[4096]; char buttons[1024]; };
+/* ml879: in a game session a dialog is now SHOWN (the app's dialog overlay,
+ * driver_ios.c winios_game_CreateWindowSurface), so the alert is only a
+ * convenience: offered ("simple=1") for message-box-like dialogs -- text plus
+ * enabled push buttons -- whose buttons are easier to hit as an iOS alert than
+ * with the pointer. Anything richer (a launcher: pictures, trees, lists, combo
+ * boxes, check boxes, progress bars, owner-drawn or disabled buttons) is used
+ * through the window itself. One exception is offered for any dialog: a
+ * DISABLED button that starts the game ("force=<id> <label>"; launch/play/start
+ * in a few languages). Launchers of the era grey it out when their hardware
+ * check does not know the GPU -- Prince of Persia: The Two Thrones' "Launch
+ * Game !" next to "Unsupported card -- Apple A17 Pro GPU" -- and pressing it
+ * anyway (WM_COMMAND/BN_CLICKED, which no MFC/Win32 handler re-checks against
+ * the disabled state) is what the user asks for. */
+struct dialog_info { char text[4096]; char buttons[1024]; char force[1024]; BOOL complex; int enabled_buttons; };
+
+static BOOL starts_game( const WCHAR *label )
+{
+    static const WCHAR *const words[] = { L"launch", L"play", L"start", L"lancer", L"jouer", L"spielen",
+                                          L"jugar", L"iniciar", L"avvia", L"gioca" };
+    WCHAR lower[256];
+    unsigned int i;
+
+    lstrcpynW( lower, label, ARRAYSIZE(lower) );
+    CharLowerW( lower );
+    for (i = 0; i < ARRAYSIZE(words); i++) if (wcsstr( lower, words[i] )) return TRUE;
+    return FALSE;
+}
 
 static BOOL CALLBACK find_dialog_proc( HWND hwnd, LPARAM lp )
 {
@@ -962,34 +988,61 @@ static BOOL CALLBACK dialog_child_proc( HWND child, LPARAM lp )
 {
     struct dialog_info *info = (struct dialog_info *)lp;
     WCHAR cls[32], label[1024];
-    LONG kind;
+    LONG style, kind;
     int i, j;
 
     if (!IsWindowVisible( child ) || !GetClassNameW( child, cls, ARRAYSIZE(cls) )) return TRUE;
+    style = GetWindowLongW( child, GWL_STYLE );
     label[0] = 0;
     GetWindowTextW( child, label, ARRAYSIZE(label) );
-    if (!label[0]) return TRUE;
     if (!lstrcmpiW( cls, L"Static" ))
-        append_lines( info->text, sizeof(info->text), "text=", label );
-    else if (!lstrcmpiW( cls, L"Button" ))
     {
-        kind = GetWindowLongW( child, GWL_STYLE ) & BS_TYPEMASK;
-        if (kind != BS_PUSHBUTTON && kind != BS_DEFPUSHBUTTON && kind != BS_OWNERDRAW) return TRUE;
-        if (!IsWindowEnabled( child )) return TRUE;   /* ml878: greyed out in the game too */
-        for (i = j = 0; label[i]; i++)   /* "&Yes" -> "Yes", "&&" -> "&" */
+        /* ml879: an icon or a picture, not text: its "text" is a resource id,
+         * 0xffff + ordinal, which read as "ÿh" in the alert */
+        kind = style & SS_TYPEMASK;
+        if (kind == SS_ICON || kind == SS_BITMAP || kind == SS_ENHMETAFILE || label[0] == 0xffff) return TRUE;
+        if (label[0]) append_lines( info->text, sizeof(info->text), "text=", label );
+        return TRUE;
+    }
+    if (lstrcmpiW( cls, L"Button" ))
+    {
+        info->complex = TRUE;   /* a list, tree, combo or edit box, a progress bar, a custom control */
+        return TRUE;
+    }
+    kind = style & BS_TYPEMASK;
+    if (kind != BS_PUSHBUTTON && kind != BS_DEFPUSHBUTTON && kind != BS_OWNERDRAW)
+    {
+        info->complex = TRUE;   /* check box, radio button, group box */
+        return TRUE;
+    }
+    if (kind == BS_OWNERDRAW) info->complex = TRUE;   /* a skinned launcher's button */
+    for (i = j = 0; label[i]; i++)   /* "&Yes" -> "Yes", "&&" -> "&" */
+    {
+        if (label[i] == '&')
         {
-            if (label[i] == '&')
-            {
-                if (label[i + 1] != '&') continue;
-                i++;
-            }
-            label[j++] = label[i];
+            if (label[i + 1] != '&') continue;
+            i++;
         }
-        label[j] = 0;
+        label[j++] = label[i];
+    }
+    label[j] = 0;
+    if (!label[0])
+    {
+        info->complex = TRUE;
+        return TRUE;
+    }
+    {
+        char key[32];
+        snprintf( key, sizeof(key), "%s=%d ", IsWindowEnabled( child ) ? "button" : "force", GetDlgCtrlID( child ) );
+        if (IsWindowEnabled( child ))
         {
-            char key[32];
-            snprintf( key, sizeof(key), "button=%d ", GetDlgCtrlID( child ) );
+            info->enabled_buttons++;
             append_lines( info->buttons, sizeof(info->buttons), key, label );
+        }
+        else
+        {
+            info->complex = TRUE;   /* ml878: greyed out in the game too */
+            if (starts_game( label )) append_lines( info->force, sizeof(info->force), key, label );
         }
     }
     return TRUE;
@@ -1026,10 +1079,12 @@ static void relay_dialogs( void )
     /* ml878: seq= makes every announcement new to the app, which skips a file
      * it has already read: the same dialog shown again after a dialog over it
      * closed must not look like the copy it saw before. */
-    snprintf( out, sizeof(out), "hwnd=0x%llx\r\nseq=%u\r\n", (unsigned long long)(ULONG_PTR)hwnd, ++seq );
+    snprintf( out, sizeof(out), "hwnd=0x%llx\r\nseq=%u\r\nsimple=%d\r\n", (unsigned long long)(ULONG_PTR)hwnd,
+              ++seq, !info.complex && info.enabled_buttons > 0 );
     append_lines( out, sizeof(out), "title=", title );
     strncat( out, info.text, sizeof(out) - strlen( out ) - 1 );
     strncat( out, info.buttons, sizeof(out) - strlen( out ) - 1 );
+    strncat( out, info.force, sizeof(out) - strlen( out ) - 1 );   /* ml879 */
     write_text_file( DIALOG_TMP_PATH, out );
     MoveFileExW( DIALOG_TMP_PATH, DIALOG_PATH, MOVEFILE_REPLACE_EXISTING );
     agent_log( "dialog 0x%llx from pid %lu, shown in the app:\n%s", (unsigned long long)(ULONG_PTR)hwnd,

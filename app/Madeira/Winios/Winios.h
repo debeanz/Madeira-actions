@@ -103,6 +103,15 @@ void winios_set_compositor_hidden(int hidden);
  * a layer over the desktop. */
 void winios_process_exited(void *peb);
 
+/* ml879: game sessions show their dialog windows (launchers, setup windows,
+ * message boxes) in a transparent overlay inside the game's Metal host view.
+ * Swift registers that view (MetalHostView.shared); IOSDisplayShim reports
+ * each window DXMT presents to, which then never gets an overlay layer. The
+ * overlay calls madeira_game_dialog_windows(count) (Swift, @_cdecl) on the
+ * main thread whenever the number of dialog windows on screen changes. */
+void winios_set_game_host_view(void *view);
+void winios_game_window_presents(void *hwnd);
+
 /* ml789: Start -> "Exit desktop" progress, reported by ntdll-unix through weak
  * calls. stage 1 = `wineboot --end-session` was spawned by ExitWindowsEx,
  * 2 = that wineboot exited with code 0 (every program is closed), 3 = it

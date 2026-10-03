@@ -999,6 +999,67 @@ static void winios_apply_contents_rect(NSNumber *key, CALayer *l) {
 }
 static UIView *g_compositor_view;
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
+
+/* ml879: GAME SESSIONS SHOW THEIR DIALOGS. The driver gives a game session's
+ * dialog windows (launchers, setup windows, message boxes) a presented surface
+ * (driver_ios.c winios_game_CreateWindowSurface), and every layer path below
+ * then works unchanged once winios_ensure_compositor has somewhere to put the
+ * layers: in game mode that is a TRANSPARENT overlay inside the game's Metal
+ * host view -- no backdrop, untouchable, sized to the host, which already IS
+ * the aspect-fit virtual screen, so a dialog sits exactly where the trackpad
+ * pointer's clicks land. Nothing is created until a dialog appears. */
+static int winios_game_mode(void);
+static UIView *g_game_host_view;          /* MetalHostView.shared, from Swift (unretained) */
+static NSMutableSet<NSNumber *> *g_d3d_hwnds;   /* game mode: windows DXMT presents to */
+static int g_game_dialogs_reported = -1;
+extern void madeira_game_dialog_windows(int count) __attribute__((weak_import));
+
+static void winios_layout_compositor(void);
+
+/* The host is resized by Swift (rotation, each game's own resolution) without
+ * telling this file, so the overlay re-places its layers itself whenever its
+ * size or the virtual screen size changes. */
+static CGRect g_game_layout_bounds;
+static int g_game_layout_w, g_game_layout_h;
+
+static void winios_game_relayout_if_needed(void) {
+    if (!winios_game_mode() || !g_compositor_view) return;
+    CGRect b = g_compositor_view.bounds;
+    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
+    int w = dw ? atoi(dw) : 0, h = dh ? atoi(dh) : 0;
+    if (CGRectEqualToRect(b, g_game_layout_bounds) && w == g_game_layout_w && h == g_game_layout_h) return;
+    g_game_layout_bounds = b;
+    g_game_layout_w = w;
+    g_game_layout_h = h;
+    winios_layout_compositor();
+}
+
+@interface WiniosGameOverlayView : UIView
+@end
+
+@implementation WiniosGameOverlayView
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    winios_game_relayout_if_needed();
+}
+@end
+
+/* main thread only: tell Swift how many dialog windows are on screen in a game
+ * session (it drops the loading screen while there are any, so the pointer and
+ * the dialog can be used). */
+static void winios_report_game_dialogs(void) {
+    if (!winios_game_mode()) return;
+    int n = 0;
+    for (NSNumber *key in g_layers) {
+        CALayer *l = g_layers[key];
+        if (!l.hidden && l.contents) n++;
+    }
+    if (n == g_game_dialogs_reported) return;
+    g_game_dialogs_reported = n;
+    fprintf(stderr, "[game-dialog] ml879 %d dialog window(s) on screen\n", n);
+    fflush(stderr);
+    if (madeira_game_dialog_windows) madeira_game_dialog_windows(n);
+}
 static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt */
 static CGPoint g_desk_origin;            /* desktop (0,0) in view pt (letterbox offset) */
 static CGRect g_comp_frame;              /* presentation area (window coords), from Swift */
@@ -1015,6 +1076,8 @@ static void winios_layout_compositor(void) {
     if (!g_compositor_view) return;
     UIWindow *win = g_compositor_view.superview ? (UIWindow *)g_compositor_view.superview : nil;
     CGRect frame = g_comp_frame_set ? g_comp_frame : (win ? win.bounds : g_compositor_view.frame);
+    /* ml879: the game overlay fills the Metal host, which is the virtual screen */
+    if (winios_game_mode() && g_compositor_view.superview) frame = g_compositor_view.superview.bounds;
     g_compositor_view.frame = frame;
 
     const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
@@ -1070,6 +1133,27 @@ void winios_set_compositor_hidden(int hidden) {
 /* main thread only */
 static void winios_ensure_compositor(void) {
     if (g_compositor_view) return;
+    /* ml879: a game session gets the transparent dialog overlay instead (see
+     * g_game_host_view above); only dialog windows ever reach here in it. */
+    if (winios_game_mode()) {
+        if (!g_game_host_view) return;
+        g_layers = [NSMutableDictionary new];
+        g_px_rects = [NSMutableDictionary new];
+        g_surf_sizes = [NSMutableDictionary new];
+        g_compositor_view = [[WiniosGameOverlayView alloc] initWithFrame:g_game_host_view.bounds];
+        g_compositor_view.userInteractionEnabled = NO;  /* the trackpad is the game view's */
+        g_compositor_view.clipsToBounds = YES;
+        g_compositor_view.opaque = NO;
+        g_compositor_view.backgroundColor = UIColor.clearColor;
+        g_compositor_view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        g_compositor_view.layer.zPosition = 1000;       /* above the host's own Metal layer */
+        g_compositor_view.hidden = g_comp_hidden;
+        [g_game_host_view addSubview:g_compositor_view];
+        winios_layout_compositor();
+        fprintf(stderr, "[game-dialog] ml879 overlay attached to the game view\n");
+        fflush(stderr);
+        return;
+    }
     /* desktop mode only — games render via DXMT's Metal layer and the
      * compositor backdrop would cover it (2026-07-06 Thumper regression) */
     const char *dm = getenv("MADEIRA_DESKTOP");
@@ -1141,7 +1225,46 @@ static void winios_remove_layer_now(NSNumber *key) {
 static void winios_remove_layer(HWND hwnd) {
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_remove_layer_now(@((uintptr_t)hwnd));
+        winios_report_game_dialogs();   /* ml879 */
     });
+}
+
+/* ml879: Swift hands over the game's Metal host view (MetalHostView.shared),
+ * the overlay's parent in a game session. Any thread. */
+void winios_set_game_host_view(void *view) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *v = (__bridge UIView *)view;
+        if (g_game_host_view == v) return;
+        g_game_host_view = v;
+        if (g_compositor_view && winios_game_mode() && v) {
+            [g_compositor_view removeFromSuperview];
+            g_compositor_view.frame = v.bounds;
+            [v addSubview:g_compositor_view];
+            winios_layout_compositor();
+        }
+    });
+}
+
+/* ml879: IOSDisplayShim, game mode: DXMT now presents to `hwnd`. That window's
+ * pixels are the game's own, so it never gets an overlay layer even if it is a
+ * dialog (a game whose D3D window is a #32770). Any thread. */
+void winios_game_window_presents(void *hwnd) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSNumber *key = @((uintptr_t)hwnd);
+        if (!g_d3d_hwnds) g_d3d_hwnds = [NSMutableSet new];
+        if ([g_d3d_hwnds containsObject:key]) return;
+        [g_d3d_hwnds addObject:key];
+        if (g_layers[key]) {
+            winios_remove_layer_now(key);
+            fprintf(stderr, "[game-dialog] ml879 hwnd=%p presents through DXMT: overlay layer dropped\n", hwnd);
+            fflush(stderr);
+            winios_report_game_dialogs();
+        }
+    });
+}
+
+static BOOL winios_game_d3d_window(NSNumber *key) {
+    return winios_game_mode() && [g_d3d_hwnds containsObject:key];
 }
 
 /* Called from process_exit_wrapper (ntdll-unix) on the dying pseudo-
@@ -1157,6 +1280,7 @@ void winios_process_exited(void *peb) {
         fprintf(stderr, "[winios] process peb=%p exited: removed %lu orphaned layer(s), %lu remain\n",
                 peb, (unsigned long)dead.count, (unsigned long)g_layers.count);
         fflush(stderr);
+        winios_report_game_dialogs();   /* ml879 */
     });
 }
 
@@ -1261,6 +1385,7 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
     void *owner = ios_jit_current_peb();   /* wine thread: the window's process */
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (winios_game_d3d_window(@((uintptr_t)hwnd))) return;   /* ml879 */
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         CALayer *l = winios_layer_for(hwnd, true);
@@ -1276,6 +1401,7 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
+        winios_report_game_dialogs();   /* ml879 */
     });
 }
 
@@ -1612,6 +1738,7 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         fflush(stderr);
     }
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (winios_game_d3d_window(@((uintptr_t)hwnd))) return;   /* ml879 */
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         CALayer *l = winios_layer_for(hwnd, true);
@@ -1635,6 +1762,7 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         }
         CGDataProviderRelease(dp);
         CGColorSpaceRelease(cs);
+        winios_report_game_dialogs();   /* ml879: its first pixels */
     });
 }
 

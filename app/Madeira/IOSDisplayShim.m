@@ -149,6 +149,8 @@ static int madeira_desktop_mode(void) {
 // Winios.m compositor: per-window CAMetalLayer inside the window's
 // compositor layer (desktop mode only).
 extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
+// ml879: Winios.m, game mode: the dialog overlay skips windows DXMT presents to.
+extern void winios_game_window_presents(void *hwnd) __attribute__((weak_import));
 
 // A window whose rect is degenerate (0x0) hands the compositor a zero frame,
 // so the CAMetalLayer it makes for that window is 0x0 too -- and DXMT then
@@ -252,6 +254,9 @@ static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_d
         NSLog(@"[madeira-display] view_create_metal_view called before layer registered!");
         return NULL;
     }
+    // ml879: this window's pixels are DXMT's from now on; the game-session
+    // dialog overlay must never draw its GDI surface over them.
+    if (winios_game_window_presents) winios_game_window_presents((void *)v);
     return (macdrv_metal_view)CFBridgingRetain(layer);
 }
 

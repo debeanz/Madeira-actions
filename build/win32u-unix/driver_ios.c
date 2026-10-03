@@ -64,6 +64,8 @@ extern void winios_pWindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
 
 static struct user_driver_funcs winios_user_driver;
 static int winios_desktop_mode(void);   /* ml808: used by winios_drv_post_mouse below */
+static BOOL winios_game_dialog_window( HWND hwnd );   /* ml879 */
+static BOOL winios_is_dialog_class( HWND hwnd );      /* ml879 */
 
 /* C bridge for Winios.m to inject mouse input without pulling in Wine
  * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
@@ -99,8 +101,23 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
         int sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
         int sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
 
+        /* ml879: not when the foreground window is a dialog shown in the game
+         * overlay: the overlay draws it at its real screen position, so the
+         * pointer must stay in plain screen coordinates to land where it is
+         * drawn (a launcher wider than half the screen was squeezed). This
+         * runs for every pointer move of every game, so the class is read
+         * once per foreground window, not per move (a benign race between the
+         * threads that drain input can only make it read again). */
+        static HWND class_fg;
+        static BOOL class_fg_dialog;
+
+        if (fg != class_fg)
+        {
+            class_fg_dialog = fg && winios_is_dialog_class( fg );
+            class_fg = fg;
+        }
         memset( &r, 0, sizeof(r) );
-        if (fg && get_window_rects( fg, COORDS_SCREEN, &r, get_thread_dpi() ))
+        if (fg && !class_fg_dialog && get_window_rects( fg, COORDS_SCREEN, &r, get_thread_dpi() ))
         {
             int cw = r.client.right - r.client.left, ch = r.client.bottom - r.client.top;
             /* Ignore the 1x1 message/IME windows that also take focus. */
@@ -683,10 +700,52 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
     return TRUE;
 }
 
+/* ml879: LAUNCHER AND SETUP WINDOWS IN A GAME SESSION.
+ *
+ * A game session (Games tab, no desktop) shows only what DXMT presents; every
+ * GDI window keeps upstream's offscreen surface, which nothing ever reads. So a
+ * game's launcher or setup dialog -- Prince of Persia: The Two Thrones'
+ * configuration utility, the setup dialogs of Tomb Raider and Hitman era
+ * titles -- was drawn into memory and never shown.
+ *
+ * Dialogs are now the one exception: a top-level "#32770" window, or a popup a
+ * dialog owns (a combo box's drop-down list, a menu, a tooltip), gets the same
+ * presented surface the desktop compositor uses, and Winios.m shows it in a
+ * transparent overlay on the game view. EVERY OTHER WINDOW keeps the offscreen
+ * surface exactly as before, so a game's own window is untouched (a game whose
+ * D3D window is itself a dialog is excluded on the app side when DXMT starts
+ * presenting to it, see winios_game_window_presents).
+ *
+ * ios_game_dialog_surfaces counts the live ones; while it is non-zero,
+ * message_ios.c's wait_message polls driver input every 16 ms the way desktop
+ * mode always does, because a dialog's modal loop otherwise sleeps in
+ * GetMessage with the user's taps queued in the app-side ring. */
+volatile LONG ios_game_dialog_surfaces;
+
+static BOOL winios_is_dialog_class( HWND hwnd )
+{
+    return get_class_long( hwnd, GCW_ATOM, FALSE ) == 0x8002;   /* "#32770" = MAKEINTATOM(32770) */
+}
+
+static BOOL winios_game_dialog_window( HWND hwnd )
+{
+    HWND owner = hwnd;
+    int depth;
+
+    if (!hwnd || (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD)) return FALSE;
+    for (depth = 0; owner && depth < 3; depth++)
+    {
+        if (winios_is_dialog_class( owner )) return TRUE;
+        owner = get_window_relative( owner, GW_OWNER );
+    }
+    return FALSE;
+}
+
 static void winios_surface_destroy( struct window_surface *surface )
 {
     /* Layer teardown happens on pDestroyWindow, not here — surfaces are
      * recreated on every resize and dropping the layer would flicker. */
+    if (!winios_desktop_mode()) InterlockedDecrement( &ios_game_dialog_surfaces );   /* ml879 */
 }
 
 static const struct window_surface_funcs winios_surface_funcs =
@@ -737,6 +796,7 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     }
 
     if (previous) window_surface_release( previous );
+    if (!winios_desktop_mode()) InterlockedIncrement( &ios_game_dialog_surfaces );   /* ml879 */
 
     {
         /* ml505: was capped at 16 GLOBALLY, so a window created late (the
@@ -756,6 +816,22 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     return TRUE;
 }
 
+/* ml879: game mode's pCreateWindowSurface. FALSE keeps upstream's offscreen
+ * surface, which is what every window got here before. */
+static BOOL winios_game_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect,
+                                             struct window_surface **window_surface )
+{
+    if (!winios_game_dialog_window( hwnd )) return FALSE;
+    {
+        static unsigned n;
+        if (n++ < 16)
+            dprintf( 2, "[game-dialog] ml879 hwnd=%p gets a presented surface {%d,%d,%d,%d}\n", hwnd,
+                     (int)surface_rect->left, (int)surface_rect->top,
+                     (int)surface_rect->right, (int)surface_rect->bottom );
+    }
+    return winios_CreateWindowSurface( hwnd, layered, surface_rect, window_surface );
+}
+
 /* pWindowPosChanged wrapper: dereference window_rects HERE (Winios.m
  * cannot include wine headers) and forward plain ints for the layer
  * frame; chain to the Winios.m hook afterwards. */
@@ -763,8 +839,10 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
     /* desktop mode only — game windows must never wake the compositor
-     * (it would draw its backdrop OVER the DXMT Metal layer) */
-    if (winios_window_frame && winios_desktop_mode())
+     * (it would draw its backdrop OVER the DXMT Metal layer). ml879: and a
+     * game session's dialogs, which Winios.m shows in a transparent overlay
+     * that has no backdrop (see winios_game_CreateWindowSurface). */
+    if (winios_window_frame && (winios_desktop_mode() || winios_game_dialog_window( hwnd )))
     {
         const RECT *v = &new_rects->visible;
         const RECT *c = &new_rects->client;
@@ -1971,6 +2049,7 @@ static void load_display_driver(void)
             winios_user_driver.pCreateWindowSurface = winios_CreateWindowSurface;
             dprintf( 2, "[winios] desktop mode: window-surface compositing ENABLED\n" );
         }
+        else winios_user_driver.pCreateWindowSurface = winios_game_CreateWindowSurface;   /* ml879: dialogs only */
         winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
         __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );
 #else

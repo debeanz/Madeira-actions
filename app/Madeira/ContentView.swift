@@ -245,6 +245,9 @@ final class MetalBackedView: UIView {
         if !Self.layerRegistered {
             Self.layerRegistered = true
             madeira_display_set_layer(host.metalLayer)
+            // ml879: the game-session dialog overlay (launchers, setup windows)
+            // lives inside this host, on top of the game's own frames.
+            winios_set_game_host_view(Unmanaged.passUnretained(host).toOpaque())
             LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted singleton)", level: .success)
         }
     }
@@ -2904,7 +2907,11 @@ struct ContentView: View {
         // on a "Closing game…" panel with no way out. Leaving `.playing` kills
         // the panel whether or not the flag was cleared.
         if closingGame, case .playing = launcherSession { return true }
-        guard launchingGame != nil, !firstFrameSeen else { return false }
+        // ml879: a launcher or setup window the game shows before its first
+        // frame is the screen to use, not something to wait behind: the panel
+        // steps aside while one is up (it covers the pointer and the controls)
+        // and comes back for the game's own loading once it is gone.
+        guard launchingGame != nil, !firstFrameSeen, !gameDialogs.windowsOnScreen else { return false }
         switch launcherSession {
         case .enablingJIT, .launching, .playing: return true
         default: return false

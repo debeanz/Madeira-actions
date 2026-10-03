@@ -3744,13 +3744,17 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
      * Wake every 16ms to poll driver events; only surface WAIT_TIMEOUT
      * when the CALLER's own deadline expires. Games path unchanged. */
     {
+        /* ml879: in a game session too while a dialog is on screen (launcher
+         * or setup window in the game overlay): its modal loop sleeps here and
+         * the user's taps would sit in the ring. driver_ios.c counts them. */
+        extern volatile LONG ios_game_dialog_surfaces;
         static int ios_slice = -1;
         if (ios_slice < 0)
         {
             const char *d = getenv( "MADEIRA_DESKTOP" );
             ios_slice = (d && *d == '1');
         }
-        if (!ios_slice)
+        if (!ios_slice && !ios_game_dialog_surfaces)
         {
             do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
             while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));

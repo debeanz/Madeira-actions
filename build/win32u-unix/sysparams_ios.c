@@ -4117,6 +4117,45 @@ static NTSTATUS d3dkmt_open_adapter_from_gdi_display_name( D3DKMT_OPENADAPTERFRO
 
     RtlInitUnicodeString( &name, desc->DeviceName );
     if (!name.Length) return STATUS_UNSUCCESSFUL;
+
+    /* ml879, ported from 125hz/Madeira (their 2026-09-16 fix; the wow64 merge
+     * kept this file whole and lost it). In the virtual-monitor regime the
+     * sources list is EMPTY, so find_source() fails for every name -- even the
+     * "\\.\DISPLAY1" that NtUserEnumDisplayDevices hands out. wined3d asks
+     * exactly this first (wined3d_output_init), so every wined3d client --
+     * DirectDraw, Direct3D 8, dxdiagn's display probe through them -- got
+     * "err:d3d:wined3d_adapter_create_output Failed to initialise output
+     * L"\\.\DISPLAY1", hr 0x80070057" and no adapter at all: Prince of
+     * Persia: The Two Thrones' launcher read 0 MB of video memory and
+     * greyed out "Launch Game !" (0.1.143 log). DXMT never calls this.
+     *
+     * Answer for the one display this driver advertises with a stable LUID and
+     * the single VidPnSourceId. NtGdiDdDDIOpenAdapterFromLuid allocates a real
+     * D3DKMT handle for any LUID (it only WARNs that no Vulkan device matches),
+     * and wined3d_output_init needs that handle for D3DKMTCreateDevice. */
+    if (ios_virtual_monitor_active())
+    {
+        static const LUID virtual_luid = { 0x4d616469, 0x1 };   /* 'Madi', as 125hz */
+
+        if (get_display_index( &name ) != 1)
+        {
+            WARN( "unknown device name %s\n", debugstr_us(&name) );
+            return STATUS_UNSUCCESSFUL;
+        }
+        luid_desc.AdapterLuid = virtual_luid;
+        if ((status = NtGdiDdDDIOpenAdapterFromLuid( &luid_desc ))) return status;
+        desc->hAdapter = luid_desc.hAdapter;
+        desc->AdapterLuid = virtual_luid;
+        desc->VidPnSourceId = 1;   /* source id 0 + 1, as upstream computes it */
+        {
+            static int logged;
+            if (logged++ < 4)
+                dprintf( 2, "[vmode] ml879 synthesized D3DKMTOpenAdapterFromGdiDisplayName -> hAdapter %#x vidpn 1\n",
+                         (unsigned int)desc->hAdapter );
+        }
+        return STATUS_SUCCESS;
+    }
+
     if (!(source = find_source( &name ))) return STATUS_UNSUCCESSFUL;
 
     luid_desc.AdapterLuid = source->gpu->luid;

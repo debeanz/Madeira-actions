@@ -258,22 +258,41 @@ struct GameDialog: Identifiable, Equatable {
     let choices: [Choice]
 }
 
+/// ml879: a choice id that answers nothing in the game ("Not Now").
+let gameDialogNoAnswer = -1
+
 final class GameDialogs: ObservableObject {
     static let shared = GameDialogs()
 
     @Published private(set) var current: GameDialog?
+
+    /// ml879: dialog windows (a launcher, a setup window, a message box) that
+    /// a game session shows in its overlay right now (Winios.m reports them).
+    /// While there are any, the loading screen steps aside so the pointer can
+    /// reach them.
+    @Published private(set) var windowsOnScreen = false
 
     /// Any thread: the launch watchdogs do not count time while a game waits
     /// on its own dialog.
     var isShowing: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return showing
+        return showing || windowsShowing
     }
 
     private let lock = NSLock()
     private var showing = false
+    private var windowsShowing = false
+    private var pending: GameDialog?
     private var lastText: String?
+
+    /// Main thread (Winios.m's overlay, via madeira_game_dialog_windows).
+    func setWindowsOnScreen(_ count: Int) {
+        lock.lock()
+        windowsShowing = count > 0
+        lock.unlock()
+        if windowsOnScreen != (count > 0) { windowsOnScreen = count > 0 }
+    }
     private var timer: Timer?
     private var dir: URL { GameLibrary.driveC.appendingPathComponent("madeira") }
 
@@ -289,6 +308,11 @@ final class GameDialogs: ObservableObject {
 
     /// The user's choice goes to the agent, which presses that button.
     func answer(_ dialog: GameDialog, choice: Int) {
+        if choice == gameDialogNoAnswer {   // ml879: "Not Now" -- the window stays usable
+            LogStore.shared.log("[dialog] ml879 \"\(dialog.title)\": not now")
+            set(nil)
+            return
+        }
         let fm = FileManager.default
         let tmp = dir.appendingPathComponent("dialog-answer.tmp")
         let url = dir.appendingPathComponent("dialog-answer.txt")
@@ -305,8 +329,28 @@ final class GameDialogs: ObservableObject {
     }
 
     private func set(_ dialog: GameDialog?) {
+        // ml879: an alert's text and buttons are fixed once it is on screen, so a
+        // dialog that REPLACES the shown one must not just swap `current`: the old
+        // alert stayed up and its answer went to a window that was already gone
+        // (0.1.143: Prince of Persia's launcher put its configuration window over
+        // its splash). Take the old alert down, then show the new one.
+        if let dialog, let shown = current, shown.id != dialog.id {
+            pending = dialog
+            apply(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                guard let self, let next = self.pending, next.id == dialog.id else { return }
+                self.pending = nil
+                self.apply(next)
+            }
+            return
+        }
+        pending = nil
+        apply(dialog)
+    }
+
+    private func apply(_ dialog: GameDialog?) {
         lock.lock()
-        showing = dialog != nil
+        showing = dialog != nil || pending != nil
         lock.unlock()
         current = dialog
     }
@@ -317,40 +361,65 @@ final class GameDialogs: ObservableObject {
               text != lastText else { return }
         lastText = text
         var hwnd = "", closed = "", title = ""
+        var simple = true   // an agent from before ml879 wrote no simple= line
         var lines: [String] = []
         var choices: [GameDialog.Choice] = []
+        var greyed: [GameDialog.Choice] = []
+        func choice(_ rest: Substring) -> GameDialog.Choice? {
+            let parts = rest.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let id = parts.first.flatMap({ Int($0) }) else { return nil }
+            let label = parts.count > 1 ? String(parts[1]) : "OK"
+            return GameDialog.Choice(id: id, label: label.isEmpty ? "OK" : label)
+        }
         for raw in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
             let line = String(raw)
             if line.hasPrefix("hwnd=") { hwnd = String(line.dropFirst(5)) }
             else if line.hasPrefix("closed=") { closed = String(line.dropFirst(7)) }
             else if line.hasPrefix("title=") { title = String(line.dropFirst(6)) }
+            else if line.hasPrefix("simple=") { simple = line.dropFirst(7) == "1" }
             else if line.hasPrefix("text=") { lines.append(String(line.dropFirst(5))) }
-            else if line.hasPrefix("button=") {
-                let rest = line.dropFirst(7)
-                let parts = rest.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
-                if let id = parts.first.flatMap({ Int($0) }) {
-                    let label = parts.count > 1 ? String(parts[1]) : "OK"
-                    choices.append(GameDialog.Choice(id: id, label: label.isEmpty ? "OK" : label))
-                }
-            }
+            else if line.hasPrefix("button="), let c = choice(line.dropFirst(7)) { choices.append(c) }
+            else if line.hasPrefix("force="), let c = choice(line.dropFirst(6)) { greyed.append(c) }
         }
         if !closed.isEmpty {
-            if current?.id == closed {
+            if current?.id == closed || pending?.id == closed {
                 LogStore.shared.log("[dialog] ml876 the game closed its dialog itself")
                 set(nil)
             }
             return
         }
         guard !hwnd.isEmpty, hwnd != current?.id else { return }
-        if choices.isEmpty { choices = [GameDialog.Choice(id: 1, label: "OK")] }   // IDOK
         let message = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        let dialog = GameDialog(id: hwnd, title: title, text: message, choices: choices)
         LogStore.shared.log("[dialog] ml876 the game shows \"\(title)\": \(message.replacingOccurrences(of: "\n", with: " / ")) "
-                            + "[\(choices.map(\.label).joined(separator: ", "))]")
-        set(dialog)
+                            + "[\(choices.map(\.label).joined(separator: ", "))]"
+                            + (greyed.isEmpty ? "" : " greyed out: [\(greyed.map(\.label).joined(separator: ", "))]")
+                            + (simple ? "" : " (a full window: used on screen)"))
+        // ml879: a launcher or setup window is used through the window itself,
+        // which a game session now shows. The alert is only offered for a
+        // message box, whose buttons are easier to hit this way, and for a
+        // greyed-out button that would start the game.
+        if simple && !choices.isEmpty {
+            set(GameDialog(id: hwnd, title: title, text: message, choices: choices))
+        } else if !greyed.isEmpty {
+            let names = greyed.map { "\u{201C}\($0.label)\u{201D}" }.joined(separator: ", ")
+            let note = "\(names) is greyed out. Older launchers do this when their hardware check "
+                + "does not recognize this device. Madeira can press it anyway."
+            set(GameDialog(id: hwnd, title: title, text: note,
+                           choices: greyed.map { GameDialog.Choice(id: $0.id, label: "Press \u{201C}\($0.label)\u{201D}") }
+                               + [GameDialog.Choice(id: gameDialogNoAnswer, label: "Not Now")]))
+        } else if current != nil || pending != nil {
+            set(nil)   // the window that replaced the shown one is used on screen
+        }
     }
 }
 
+
+/// ml879: Winios.m's game-session dialog overlay reports how many dialog
+/// windows are on screen (main thread).
+@_cdecl("madeira_game_dialog_windows")
+public func madeira_game_dialog_windows(_ count: Int32) {
+    GameDialogs.shared.setWindowsOnScreen(Int(count))
+}
 
 /// ml876: GameDialogs.current as an alert with the game's own buttons; the
 /// tapped one is pressed in the game. Title: the dialog's caption, else the game.
@@ -364,7 +433,8 @@ struct GameDialogAlert: ViewModifier {
                              isPresented: Binding(get: { dialogs.current != nil }, set: { _ in }),
                              presenting: dialogs.current) { dialog in
             ForEach(dialog.choices, id: \.id) { choice in
-                Button(choice.label, role: choice.id == 2 ? ButtonRole.cancel : nil) {   // 2 = IDCANCEL
+                // 2 = IDCANCEL; gameDialogNoAnswer = ml879 "Not Now"
+                Button(choice.label, role: choice.id == 2 || choice.id == gameDialogNoAnswer ? ButtonRole.cancel : nil) {
                     dialogs.answer(dialog, choice: choice.id)
                 }
             }
