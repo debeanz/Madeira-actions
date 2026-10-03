@@ -120,6 +120,45 @@ enum StickMode: String, Codable, CaseIterable, Identifiable {
         default:      return nil
         }
     }
+    /// ml887: for the bind editor's captions.
+    var shortLabel: String {
+        switch self {
+        case .none:   return "None"
+        case .wasd:   return "WASD"
+        case .arrows: return "Arrows"
+        case .mouse:  return "Mouse"
+        }
+    }
+}
+
+/// ml887: the physical controller's input that a control of the bind editor's
+/// controller picture (the Xbox touch preset) stands for. nil for the cross,
+/// whose four directions are bound one by one.
+extension PadInput {
+    var gamepadElement: GamepadElement? {
+        switch self {
+        case .a: return .a
+        case .b: return .b
+        case .x: return .x
+        case .y: return .y
+        case .lb: return .lb
+        case .rb: return .rb
+        case .lt: return .lt
+        case .rt: return .rt
+        case .l3: return .l3
+        case .r3: return .r3
+        case .menu: return .menu
+        case .view: return .view
+        case .guide: return .guide
+        case .up: return .dpadUp
+        case .down: return .dpadDown
+        case .left: return .dpadLeft
+        case .right: return .dpadRight
+        case .ls: return .leftStick
+        case .rs: return .rightStick
+        case .dpad: return nil
+        }
+    }
 }
 
 struct GamepadMapping: Codable, Equatable {
@@ -268,8 +307,29 @@ final class GamepadBridge: ObservableObject {
             .appendingPathComponent("madeira-gamepad.json")
     }
     /// `native` is optional so files written before the XInput mode existed
-    /// still decode (they default to native).
-    private struct Saved: Codable { var enabled: Bool; var native: Bool?; var mapping: GamepadMapping }
+    /// still decode (they default to native). ml887: the top-level fields are
+    /// the DEFAULTS; `games` holds each game's own (older builds ignore it).
+    private struct Saved: Codable {
+        var enabled: Bool
+        var native: Bool?
+        var mapping: GamepadMapping
+        var games: [String: PadProfile]?
+    }
+
+    /// ml887: one game's own controller settings, like its touch controls
+    /// (GameControlsProfile): nil parts follow the defaults. Written the first
+    /// time they are changed while it runs, or from its ⋯ menu.
+    struct PadProfile: Codable, Equatable {
+        var native: Bool?
+        var mapping: GamepadMapping?
+        var isEmpty: Bool { native == nil && mapping == nil }
+    }
+    private var profiles: [String: PadProfile] = [:]
+    /// The defaults while a game's own settings are live.
+    private var defaultNative = true
+    private var defaultMapping: GamepadMapping = .generic
+    /// The Games-tab game running now (nil: none, or a desktop session).
+    @Published private(set) var gameID: String?
 
     private init() {
         loading = true
@@ -278,14 +338,125 @@ final class GamepadBridge: ObservableObject {
             enabled = s.enabled
             native = s.native ?? true
             mapping = s.mapping
+            profiles = s.games ?? [:]
         }
         loading = false
     }
 
     private func save() {
         guard !loading else { return }
-        guard let d = try? JSONEncoder().encode(Saved(enabled: enabled, native: native, mapping: mapping)) else { return }
+        // ml887: while a game runs, a change is that game's — only the parts
+        // that differ from the defaults (or were already its own). "Use
+        // controller" stays global and never creates one.
+        if let id = gameID {
+            var own = profiles[id] ?? PadProfile()
+            if own.native != nil || native != defaultNative { own.native = native }
+            if own.mapping != nil || mapping != defaultMapping { own.mapping = mapping }
+            profiles[id] = own.isEmpty ? nil : own
+        }
+        persist()
+    }
+
+    private func persist() {
+        guard !loading else { return }
+        let n = gameID == nil ? native : defaultNative
+        let m = gameID == nil ? mapping : defaultMapping
+        let s = Saved(enabled: enabled, native: n, mapping: m, games: profiles.isEmpty ? nil : profiles)
+        guard let d = try? JSONEncoder().encode(s) else { return }
         try? d.write(to: Self.url, options: .atomic)
+    }
+
+    // MARK: ml887 per game
+
+    /// The Games-tab game that is running (nil: none). Its own settings go live
+    /// over the defaults; changes from then on are saved as that game's.
+    func setGame(_ id: String?) {
+        guard id != gameID else { return }
+        if gameID == nil {
+            defaultNative = native
+            defaultMapping = mapping
+        }
+        gameID = id
+        let own = id.flatMap { profiles[$0] }
+        let n = own?.native ?? defaultNative, m = own?.mapping ?? defaultMapping
+        // Only what differs is set (the didSets release what is held), so a
+        // game without its own settings changes nothing.
+        loading = true
+        if n != native { native = n }
+        if m != mapping { mapping = m }
+        loading = false
+        if id != nil {
+            LogStore.shared.log("[controller] ml887 \(own == nil ? "default" : "this game's own") controller settings: "
+                                + (native ? "Xbox controller" : "keyboard keys"))
+        }
+    }
+
+    /// Whether the running game has controller settings of its own.
+    var gameHasOwnSettings: Bool { gameID.map { profiles[$0] != nil } ?? false }
+
+    /// The default "send as" (what a game without its own uses).
+    var defaultSendsXbox: Bool { gameID == nil ? native : defaultNative }
+
+    /// A game's own "send as": true Xbox, false keyboard, nil the default.
+    func ownSendsXbox(forGame id: String) -> Bool? {
+        profiles[id]?.native
+    }
+
+    /// Set a game's own "send as" from its ⋯ menu (nil: the default again; its
+    /// own binds stay). The running game is changed from its toolbar.
+    func setOwnSendsXbox(_ v: Bool?, forGame id: String) {
+        guard id != gameID else { return }
+        var own = profiles[id] ?? PadProfile()
+        own.native = v
+        profiles[id] = own.isEmpty ? nil : own
+        objectWillChange.send()
+        persist()
+    }
+
+    /// Whether a game has binds of its own.
+    func hasOwnMapping(forGame id: String) -> Bool { profiles[id]?.mapping != nil }
+
+    /// The binds a game uses: its own, else the defaults.
+    func mapping(forGame id: String) -> GamepadMapping {
+        if id == gameID { return mapping }
+        return profiles[id]?.mapping ?? (gameID == nil ? mapping : defaultMapping)
+    }
+
+    /// Change a game's own binds from its ⋯ menu (nil: the default binds again).
+    func setMapping(_ m: GamepadMapping?, forGame id: String) {
+        if id == gameID {
+            // Live (not reachable from the ⋯ menu while it runs, but correct).
+            if m == nil, var own = profiles[id] {
+                own.mapping = nil
+                profiles[id] = own.isEmpty ? nil : own
+            }
+            mapping = m ?? defaultMapping
+            return
+        }
+        var own = profiles[id] ?? PadProfile()
+        own.mapping = m
+        profiles[id] = own.isEmpty ? nil : own
+        objectWillChange.send()
+        persist()
+    }
+
+    /// ml887: what one control of the bind editor's controller picture sends
+    /// in keyboard mode, for its caption and the panel's header.
+    func bindSummary(_ p: PadInput) -> String {
+        switch p {
+        case .ls:   return mapping.leftStick.shortLabel
+        case .rs:   return mapping.rightStick.shortLabel
+        case .dpad:
+            let q = [GamepadElement.dpadUp, .dpadRight, .dpadDown, .dpadLeft]
+                .map { mapping.buttons[$0] ?? ControlAction.none }
+            if q == StickMode.arrows.keys!.map({ ControlAction.key($0) }) { return "Arrows" }
+            if q == StickMode.wasd.keys!.map({ ControlAction.key($0) }) { return "WASD" }
+            if q.allSatisfy({ $0 == ControlAction.none }) { return "None" }
+            return q.map { $0.bindName }.joined(separator: " ")
+        default:
+            guard let el = p.gamepadElement else { return "" }
+            return (mapping.buttons[el] ?? ControlAction.none).bindName
+        }
     }
 
     // MARK: Lifecycle
@@ -785,9 +956,18 @@ enum GamepadActionCatalogue {
 
 struct GamepadSettingsView: View {
     @ObservedObject private var pad = GamepadBridge.shared
+    @ObservedObject private var touch = TouchControlsModel.shared   // ml887: the running game
 
     var body: some View {
         List {
+            // ml887: per game. While a Games-tab game runs, these are its own.
+            if let title = touch.gameTitle {
+                Section {
+                    Text("Changes here are saved for \(title) while it runs; other games keep their own settings or the defaults.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             Section("Controller") {
                 HStack {
                     Image(systemName: pad.controllerName == nil ? "gamecontroller" : "gamecontroller.fill")
@@ -868,5 +1048,100 @@ struct GamepadSettingsView: View {
         Binding(
             get: { pad.mapping.buttons[el] ?? .none },
             set: { pad.mapping.buttons[el] = $0 })
+    }
+}
+
+/// ml887: one game's physical-controller key binds, from its ⋯ menu in the
+/// Games tab — set before it runs. The same choices as Settings › Physical
+/// controller, written to that game's own settings.
+struct GameControllerBindsView: View {
+    let gameID: String
+    let title: String
+    let done: () -> Void
+    @ObservedObject private var pad = GamepadBridge.shared
+
+    init(gameID: String, title: String, done: @escaping () -> Void) {
+        self.gameID = gameID
+        self.title = title
+        self.done = done
+    }
+
+    private var mapping: Binding<GamepadMapping> {
+        Binding(get: { pad.mapping(forGame: gameID) },
+                set: { pad.setMapping($0, forGame: gameID) })
+    }
+
+    private var sendsKeys: Bool {
+        !(pad.ownSendsXbox(forGame: gameID) ?? pad.defaultSendsXbox)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text(sendsKeys
+                         ? "\(title) gets these keys from your controller."
+                         : "\(title) gets an Xbox controller. These keys are used once its Controller sends is set to Keyboard keys.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Presets") {
+                    Button("Generic (WASD + mouse look)") { mapping.wrappedValue = .generic }
+                    Button("Hollow Knight") { mapping.wrappedValue = .hollowKnight }
+                    if pad.hasOwnMapping(forGame: gameID) {
+                        Button("Use the default binds", role: .destructive) {
+                            pad.setMapping(nil, forGame: gameID)
+                        }
+                    }
+                }
+                Section("Sticks") {
+                    Picker("Left stick", selection: mapping.leftStick) {
+                        ForEach(StickMode.allCases) { Text($0.label).tag($0) }
+                    }
+                    Picker("Right stick", selection: mapping.rightStick) {
+                        ForEach(StickMode.allCases) { Text($0.label).tag($0) }
+                    }
+                    if mapping.wrappedValue.leftStick == .mouse || mapping.wrappedValue.rightStick == .mouse {
+                        VStack(alignment: .leading) {
+                            Text("Mouse look speed: \(Int(mapping.wrappedValue.mouseSensitivity))")
+                            Slider(value: mapping.mouseSensitivity, in: 4...60, step: 1)
+                        }
+                    }
+                    VStack(alignment: .leading) {
+                        Text(String(format: "Stick deadzone: %.0f%%", mapping.wrappedValue.deadzone * 100))
+                        Slider(value: mapping.deadzone, in: 0.05...0.5, step: 0.01)
+                    }
+                    VStack(alignment: .leading) {
+                        Text(String(format: "Trigger press point: %.0f%%", mapping.wrappedValue.triggerThreshold * 100))
+                        Slider(value: mapping.triggerThreshold, in: 0.1...0.9, step: 0.05)
+                    }
+                }
+                Section("Buttons") {
+                    ForEach(GamepadElement.buttons) { el in
+                        Picker(el.label, selection: binding(for: el)) {
+                            ForEach(Array(GamepadActionCatalogue.all.enumerated()), id: \.offset) { _, it in
+                                Text(it.0).tag(it.1)
+                            }
+                        }
+                        .pickerStyle(.navigationLink)
+                    }
+                }
+            }
+            .navigationTitle("Key binds")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done", action: done) }
+            }
+        }
+    }
+
+    private func binding(for el: GamepadElement) -> Binding<ControlAction> {
+        Binding(
+            get: { pad.mapping(forGame: gameID).buttons[el] ?? .none },
+            set: {
+                var m = pad.mapping(forGame: gameID)
+                m.buttons[el] = $0
+                pad.setMapping(m, forGame: gameID)
+            })
     }
 }

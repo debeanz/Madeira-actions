@@ -1211,7 +1211,10 @@ private struct OptionsSheet: View {
     @ObservedObject private var library = GameLibrary.shared
     @ObservedObject private var covers = SteamCovers.shared
     @ObservedObject private var pad = GamepadBridge.shared
+    @ObservedObject private var touch = TouchControlsModel.shared   // ml887: per-game touch controls
     @StateObject private var model = SheetRowsModel()
+    /// ml887: this game's controller key binds, over this menu.
+    @State private var showBinds: Bool = false
     @State private var showingExecutables: Bool = false
     /// ml830: this game's shader cache on disk; nil until measured off main.
     @State private var cacheBytes: Int64? = nil
@@ -1504,6 +1507,39 @@ private struct OptionsSheet: View {
                                      FrameCap.apply(cap, persist: false)
                                  }
                              }))
+
+        // ml887: this game's controls, also before it runs. While it runs they
+        // are changed from its own toolbar (the controller button).
+        let touchOwn: TouchControlsChoice? = touch.ownChoice(forGame: id)
+        out.append(OptionRow(id: "touchcontrols", title: "Touch controls",
+                             systemImage: "hand.tap",
+                             destructive: false, checked: false,
+                             trailing: touchOwn?.title ?? "Default (\(touch.defaultChoice.title))",
+                             disabled: busy,
+                             action: {
+                                 let order: [TouchControlsChoice?] = [nil, .off, .xbox, .custom]
+                                 let cur: Int = order.firstIndex(where: { $0 == touchOwn }) ?? 0
+                                 touch.setOwnChoice(order[(cur + 1) % order.count], forGame: id)
+                             }))
+        let padOwn: Bool? = pad.ownSendsXbox(forGame: id)
+        let sendsText: (Bool) -> String = { $0 ? "Xbox controller" : "Keyboard keys" }
+        out.append(OptionRow(id: "padmode", title: "Controller sends",
+                             systemImage: "gamecontroller",
+                             destructive: false, checked: false,
+                             trailing: padOwn.map(sendsText) ?? "Default (\(sendsText(pad.defaultSendsXbox)))",
+                             disabled: busy,
+                             note: "For a physical controller. Keyboard keys is for games without controller support.",
+                             action: {
+                                 let order: [Bool?] = [nil, true, false]
+                                 let cur: Int = order.firstIndex(where: { $0 == padOwn }) ?? 0
+                                 pad.setOwnSendsXbox(order[(cur + 1) % order.count], forGame: id)
+                             }))
+        out.append(OptionRow(id: "padbinds", title: "Controller key binds",
+                             systemImage: "slider.horizontal.3",
+                             destructive: false, checked: false,
+                             trailing: pad.hasOwnMapping(forGame: id) ? "This game's" : "Default",
+                             disabled: busy,
+                             action: { showBinds = true }))
         return out
     }
 
@@ -1671,6 +1707,9 @@ private struct OptionsSheet: View {
         .environment(\.colorScheme, .dark)
         .sheet(isPresented: $showReport) {   // ml863
             ReportSheet(game: current, note: nil) { showReport = false }
+        }
+        .sheet(isPresented: $showBinds) {    // ml887
+            GameControllerBindsView(gameID: current.id, title: current.title) { showBinds = false }
         }
         .onAppear {
             configure(list.count)
