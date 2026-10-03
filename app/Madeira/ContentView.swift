@@ -5373,6 +5373,9 @@ enum PadInput: String, CaseIterable {
 /// so the editor draws what play does. Plain colours only — no glass (ml822).
 struct ControlFace {
     enum Kind { case stick, dpad, button }
+    /// ml885: the outline drawn inside the control's d × d box. Hit-testing stays
+    /// the circle (ControlsGeometry), which always covers the drawn shape.
+    enum Outline { case circle, bumper, trigger }
     var kind: Kind
     var text: String
     /// SF Symbol name, set only when this OS has the symbol; `text` otherwise.
@@ -5381,20 +5384,48 @@ struct ControlFace {
     /// Button fill while held.
     var heldFill: UIColor
     var bold = false
+    var outline: Outline = .circle
+    /// ml885: a controller input, drawn in the Xbox style (shaped bumpers and
+    /// triggers, rims, sheen, glow when held). Keys and mouse buttons keep the
+    /// plain disc they always had.
+    var xbox = false
+    /// ml885: the face buttons' coloured rim and glow; nil = white.
+    var ring: UIColor?
 
     /// Glyph point size on a face of diameter d.
     func fontSize(_ d: CGFloat) -> CGFloat {
         if symbol != nil { return d * 0.34 }
         if bold { return d * 0.42 }
+        if outline == .bumper { return d * 0.26 }
+        if outline == .trigger { return d * 0.28 }
         return d * (text.count > 2 ? 0.22 : 0.34)
     }
 
+    /// ml885: the drawn shape's size and corner radius in a d × d box.
+    func shapeSize(_ d: CGFloat) -> CGSize {
+        switch outline {
+        case .circle:  return CGSize(width: d, height: d)
+        case .bumper:  return CGSize(width: d, height: (d * 0.56).rounded())
+        case .trigger: return CGSize(width: (d * 0.78).rounded(), height: d)
+        }
+    }
+    func cornerRadius(_ d: CGFloat) -> CGFloat {
+        switch outline {
+        case .circle:  return d / 2
+        case .bumper:  return (d * 0.56).rounded() / 2
+        case .trigger: return d * 0.26
+        }
+    }
+
     static let plainHeld = UIColor(white: 1, alpha: 0.32)
+    /// ml885: the Xbox-style rest fill and the active stick colour (Xbox green).
+    static let xboxFill = UIColor(white: 0.04, alpha: 0.42)
+    static let xboxGreen = UIColor(red: 0.30, green: 0.85, blue: 0.33, alpha: 1)
 
     static func of(_ a: ControlAction) -> ControlFace {
         if a.isStick {
             return ControlFace(kind: a.padInput == .dpad ? .dpad : .stick, text: a.label,
-                               symbol: nil, tint: .white, heldFill: plainHeld)
+                               symbol: nil, tint: .white, heldFill: plainHeld, xbox: a.isPad)
         }
         guard let p = a.padInput else {
             return ControlFace(kind: .button, text: a.label, symbol: nil, tint: .white,
@@ -5402,13 +5433,25 @@ struct ControlFace {
         }
         func letter(_ c: UIColor) -> ControlFace {
             ControlFace(kind: .button, text: a.label, symbol: nil, tint: c,
-                        heldFill: c.withAlphaComponent(0.35), bold: true)
+                        heldFill: c.withAlphaComponent(0.85), bold: true, xbox: true, ring: c)
         }
+        func symbol(_ name: String) -> String? { UIImage(systemName: name) != nil ? name : nil }
         switch p {
         case .a: return letter(UIColor(red: 0.42, green: 0.80, blue: 0.25, alpha: 1))
         case .b: return letter(UIColor(red: 0.95, green: 0.30, blue: 0.28, alpha: 1))
         case .x: return letter(UIColor(red: 0.25, green: 0.56, blue: 1.00, alpha: 1))
         case .y: return letter(UIColor(red: 1.00, green: 0.80, blue: 0.12, alpha: 1))
+        case .lb, .rb:
+            return ControlFace(kind: .button, text: a.label, symbol: nil, tint: .white,
+                               heldFill: plainHeld, outline: .bumper, xbox: true)
+        case .lt, .rt:
+            return ControlFace(kind: .button, text: a.label, symbol: nil, tint: .white,
+                               heldFill: plainHeld, outline: .trigger, xbox: true)
+        case .l3, .r3:
+            return ControlFace(kind: .button, text: a.label,
+                               symbol: symbol(p == .l3 ? "l.joystick.press.down.fill"
+                                                       : "r.joystick.press.down.fill"),
+                               tint: .white, heldFill: plainHeld, xbox: true)
         case .menu, .view, .guide:
             let name: String
             switch p {
@@ -5416,18 +5459,17 @@ struct ControlFace {
             case .view: name = "rectangle.on.rectangle"
             default:    name = "logo.xbox"
             }
-            return ControlFace(kind: .button, text: a.label,
-                               symbol: UIImage(systemName: name) != nil ? name : nil,
-                               tint: .white, heldFill: plainHeld)
+            return ControlFace(kind: .button, text: a.label, symbol: symbol(name),
+                               tint: .white, heldFill: plainHeld, xbox: true)
         default:
             return ControlFace(kind: .button, text: a.label, symbol: nil, tint: .white,
-                               heldFill: plainHeld)
+                               heldFill: plainHeld, xbox: true)
         }
     }
 
-    /// D-pad cross outline on a d × d face.
+    /// D-pad cross outline on a d × d face. ml885: a little larger (was 0.15 / 0.36).
     static func dpadCross(_ d: CGFloat) -> CGPath {
-        let c = d / 2, w = d * 0.15, l = d * 0.36     // half arm width, arm reach
+        let c = d / 2, w = d * 0.16, l = d * 0.40     // half arm width, arm reach
         let p = CGMutablePath()
         p.addLines(between: [
             CGPoint(x: c - w, y: c - l), CGPoint(x: c + w, y: c - l), CGPoint(x: c + w, y: c - w),
@@ -5441,13 +5483,28 @@ struct ControlFace {
 
     /// One arm of the cross, i in stickKeys order: 0 up, 1 right, 2 down, 3 left.
     static func dpadArm(_ i: Int, _ d: CGFloat) -> CGRect {
-        let c = d / 2, w = d * 0.15, l = d * 0.36
+        let c = d / 2, w = d * 0.16, l = d * 0.40
         switch i {
         case 0:  return CGRect(x: c - w, y: c - l, width: 2 * w, height: l - w)
         case 1:  return CGRect(x: c + w, y: c - w, width: l - w, height: 2 * w)
         case 2:  return CGRect(x: c - w, y: c + w, width: 2 * w, height: l - w)
         default: return CGRect(x: c - l, y: c - w, width: l - w, height: 2 * w)
         }
+    }
+
+    /// ml885: an arrowhead near the end of each arm, pointing out.
+    static func dpadArrows(_ d: CGFloat) -> CGPath {
+        let c = d / 2
+        let tip = d * 0.33, back = d * 0.24, half = d * 0.065
+        let p = CGMutablePath()
+        for (ux, uy) in [(CGFloat(0), CGFloat(-1)), (1, 0), (0, 1), (-1, 0)] {
+            let b = CGPoint(x: c + ux * back, y: c + uy * back)
+            p.addLines(between: [CGPoint(x: c + ux * tip, y: c + uy * tip),
+                                 CGPoint(x: b.x - uy * half, y: b.y + ux * half),
+                                 CGPoint(x: b.x + uy * half, y: b.y - ux * half)])
+            p.closeSubpath()
+        }
+        return p
     }
 }
 
@@ -5692,27 +5749,42 @@ final class TouchControlsModel: ObservableObject {
                 TouchControl(nx: 0.90, ny: 0.55, scale: 0.78, action: .key(0x1B)),
             ]
         case .xbox:
-            // Landscape. The top-left (perf HUD) and top-right (toolbar)
-            // corners stay clear: those rects take hits before any control.
+            // ml885: laid out like the controller, on a landscape iPhone Pro Max
+            // (932 x 430 pt, 59 pt side and 21 pt bottom safe areas):
+            //  - each thumb's resting arc: the left stick and, below-right of it,
+            //    the D-pad; the A/B/X/Y diamond and, below-left of it, the right
+            //    stick; L3 and R3 at the inner shoulder of their sticks;
+            //  - bumpers (pills) with the triggers above them in the top corners,
+            //    the right pair clear of the toolbar's touch rect (y < 72 pt);
+            //  - View and Menu at the bottom centre;
+            //  - every control inside the safe area, 15+ pt between rims.
+            // Sizes: 118 pt left stick, 102 pt right stick, 60 pt face buttons
+            // 54 pt from the diamond's centre, 83 pt D-pad, 67 pt bumpers,
+            // 64 pt triggers, 40-42 pt small buttons. Positions are fractions of
+            // the screen, sizes are points, so on a shorter screen everything
+            // is scaled by its height (down to 0.85) to keep the same spacing.
+            let screen = UIScreen.main.bounds.size
+            let k = min(max(Double(min(screen.width, screen.height)) / 430, 0.85), 1.0)
             func c(_ x: Double, _ y: Double, _ s: Double, _ n: PadInput) -> TouchControl {
-                TouchControl(nx: x, ny: y, scale: s, action: .pad(n.rawValue))
+                TouchControl(nx: x, ny: y, scale: (s * k * 100).rounded() / 100,
+                             action: .pad(n.rawValue))
             }
             return [
-                c(0.13, 0.66, 1.50, .ls),
-                c(0.30, 0.84, 1.10, .dpad),
-                c(0.70, 0.80, 1.25, .rs),
-                c(0.87, 0.72, 0.80, .a),
-                c(0.94, 0.58, 0.80, .b),
-                c(0.80, 0.58, 0.80, .x),
-                c(0.87, 0.44, 0.80, .y),
-                c(0.08, 0.40, 0.75, .lb),
-                c(0.08, 0.26, 0.75, .lt),
-                c(0.92, 0.30, 0.75, .rb),
-                c(0.80, 0.30, 0.75, .rt),
-                c(0.44, 0.90, 0.60, .view),
-                c(0.56, 0.90, 0.60, .menu),
-                c(0.22, 0.50, 0.55, .l3),
-                c(0.62, 0.62, 0.55, .r3),
+                c(0.165, 0.680, 1.85, .ls),
+                c(0.325, 0.825, 1.30, .dpad),
+                c(0.262, 0.495, 0.62, .l3),
+                c(0.655, 0.790, 1.60, .rs),
+                c(0.578, 0.600, 0.62, .r3),
+                c(0.826, 0.830, 0.94, .a),
+                c(0.884, 0.705, 0.94, .b),
+                c(0.768, 0.705, 0.94, .x),
+                c(0.826, 0.580, 0.94, .y),
+                c(0.120, 0.430, 1.05, .lb),
+                c(0.120, 0.270, 1.00, .lt),
+                c(0.880, 0.430, 1.05, .rb),
+                c(0.880, 0.270, 1.00, .rt),
+                c(0.462, 0.885, 0.66, .view),
+                c(0.538, 0.885, 0.66, .menu),
             ]
         }
     }
@@ -6078,9 +6150,16 @@ final class ControlsInputView: UIView {
         let base = UIView()
         let label = UILabel()
         let glyph = UIImageView()                    // ml831: SF Symbol faces
-        let knob = CALayer()
+        let knob = CAGradientLayer()                 // ml885: shaded in the Xbox style; a plain disc otherwise
         let cross = CAShapeLayer()                   // ml831: D-pad outline
         let arms: [CAShapeLayer] = (0..<4).map { _ in CAShapeLayer() }   // up right down left
+        // ml885: the Xbox style's static layers. Built in layout() only; a touch
+        // changes colours, opacities and the knob's position, nothing else.
+        let sheen = CAGradientLayer()                // light along the top of the face
+        let crossFill = CAShapeLayer()               // D-pad: the cross's body, under the lit arms
+        let arrows = CAShapeLayer()                  // D-pad: an arrowhead per arm
+        let travel = CAShapeLayer()                  // stick: the ring the knob travels to
+        let knobCap = CAShapeLayer()                 // stick: the knob's dished centre
         var laidOut: TouchControl?
         var size: CGSize = .zero
         var face = ControlFace.of(.none)
@@ -6099,14 +6178,33 @@ final class ControlsInputView: UIView {
             label.baselineAdjustment = .alignCenters
             glyph.isUserInteractionEnabled = false
             glyph.contentMode = .center
+            base.layer.addSublayer(sheen)            // under everything drawn on the face
             base.addSubview(label)
             base.addSubview(glyph)
+            base.layer.addSublayer(travel)
+            base.layer.addSublayer(crossFill)
             arms.forEach { base.layer.addSublayer($0) }
             base.layer.addSublayer(cross)            // outline over the lit arms
+            base.layer.addSublayer(arrows)
             base.layer.addSublayer(knob)             // after the label: knob on top
+            knob.addSublayer(knobCap)
             knob.backgroundColor = UIColor(white: 1, alpha: 0.92).cgColor
             cross.fillColor = UIColor(white: 1, alpha: 0.12).cgColor
             cross.strokeColor = UIColor(white: 1, alpha: 0.60).cgColor
+            sheen.colors = [UIColor(white: 1, alpha: 0.20).cgColor,
+                            UIColor(white: 1, alpha: 0.05).cgColor,
+                            UIColor(white: 1, alpha: 0).cgColor]
+            sheen.locations = [0, 0.42, 1]
+            sheen.startPoint = CGPoint(x: 0.5, y: 0)
+            sheen.endPoint = CGPoint(x: 0.5, y: 1)
+            sheen.masksToBounds = true
+            travel.fillColor = nil
+            travel.lineWidth = 1
+            crossFill.fillColor = ControlFace.xboxFill.cgColor
+            arrows.fillColor = UIColor(white: 1, alpha: 0.78).cgColor
+            knobCap.fillColor = UIColor(white: 0, alpha: 0.05).cgColor
+            knobCap.strokeColor = UIColor(white: 0, alpha: 0.16).cgColor
+            knobCap.lineWidth = 1
         }
 
         /// Caller disables implicit actions. Paths, symbols and colours are built
@@ -6116,34 +6214,101 @@ final class ControlsInputView: UIView {
             self.size = size
             face = ControlFace.of(c.action)
             let d = ControlsGeometry.diameter(c)
-            base.bounds = CGRect(x: 0, y: 0, width: d, height: d)
+            let shape = face.shapeSize(d)
+            let radius = face.cornerRadius(d)
+            let xbox = face.xbox
+            base.bounds = CGRect(origin: .zero, size: shape)
             base.center = ControlsGeometry.center(c, in: size)
-            base.layer.cornerRadius = d / 2
+            base.layer.cornerRadius = radius
             knob.isHidden = face.kind != .stick
             cross.isHidden = face.kind != .dpad
             arms.forEach { $0.isHidden = face.kind != .dpad }
             label.isHidden = true
             glyph.isHidden = true
+            // ml885: Xbox-style extras. The D-pad's shape is its cross, so no
+            // sheen or glow on its round well.
+            sheen.isHidden = !xbox || face.kind == .dpad
+            crossFill.isHidden = !(xbox && face.kind == .dpad)
+            arrows.isHidden = crossFill.isHidden
+            travel.isHidden = !(xbox && face.kind == .stick)
+            knobCap.isHidden = travel.isHidden
+            sheen.frame = base.bounds
+            sheen.cornerRadius = radius
+            // The glow is the RIM's shadow (a thin ring path): a filled path would
+            // also tint the whole translucent face from underneath.
+            base.layer.shadowPath = xbox && face.kind != .dpad
+                ? UIBezierPath(roundedRect: base.bounds, cornerRadius: radius).cgPath
+                    .copy(strokingWithWidth: max(2, d / 26), lineCap: .round, lineJoin: .round,
+                          miterLimit: 0)
+                : nil
+            base.layer.shadowOffset = .zero
+            base.layer.shadowRadius = max(6, d * 0.14)
+            base.layer.shadowOpacity = 0
+            base.layer.shadowColor = (face.ring ?? (face.kind == .stick ? ControlFace.xboxGreen : .white)).cgColor
             switch face.kind {
             case .stick:
                 let k = d * ControlsGeometry.knobDiameter
                 knob.bounds = CGRect(x: 0, y: 0, width: k, height: k)
                 knob.cornerRadius = k / 2
-                base.layer.borderWidth = max(1, d / 58)   // JoystickFace: 2 pt on a 116 pt face
+                if xbox {
+                    knob.colors = [UIColor(white: 1, alpha: 0.98).cgColor,
+                                   UIColor(white: 0.74, alpha: 0.96).cgColor]
+                    knob.startPoint = CGPoint(x: 0.5, y: 0)
+                    knob.endPoint = CGPoint(x: 0.5, y: 1)
+                    knob.backgroundColor = nil
+                    knob.borderWidth = 1
+                    knob.borderColor = UIColor(white: 0, alpha: 0.22).cgColor
+                    knob.shadowColor = UIColor.black.cgColor
+                    knob.shadowOpacity = 0.45
+                    knob.shadowRadius = 4
+                    knob.shadowOffset = CGSize(width: 0, height: 2)
+                    knob.shadowPath = UIBezierPath(ovalIn: knob.bounds).cgPath
+                    let cap = k * 0.62
+                    knobCap.frame = knob.bounds
+                    knobCap.path = UIBezierPath(ovalIn: CGRect(x: (k - cap) / 2, y: (k - cap) / 2,
+                                                               width: cap, height: cap)).cgPath
+                    let t = d / 2 * ControlsGeometry.knobTravel
+                    travel.frame = base.bounds
+                    travel.path = UIBezierPath(ovalIn: CGRect(x: d / 2 - t, y: d / 2 - t,
+                                                              width: 2 * t, height: 2 * t)).cgPath
+                    base.layer.borderWidth = max(1.5, d / 60)
+                } else {
+                    knob.colors = nil
+                    knob.backgroundColor = UIColor(white: 1, alpha: 0.92).cgColor
+                    knob.borderWidth = 0
+                    knob.shadowOpacity = 0
+                    base.layer.borderWidth = max(1, d / 58)   // JoystickFace: 2 pt on a 116 pt face
+                }
             case .dpad:
+                let path = ControlFace.dpadCross(d)
                 cross.frame = base.bounds
-                cross.path = ControlFace.dpadCross(d)
-                cross.lineWidth = max(1, d / 64)
+                cross.path = path
                 for (i, arm) in arms.enumerated() {
                     arm.frame = base.bounds
                     arm.path = UIBezierPath(rect: ControlFace.dpadArm(i, d)).cgPath
                 }
-                base.layer.borderWidth = max(1, d / 58)
+                if xbox {
+                    // ml885: a dark cross on a faint round well; the lit arms sit on
+                    // the cross body and under its outline.
+                    crossFill.frame = base.bounds
+                    crossFill.path = path
+                    arrows.frame = base.bounds
+                    arrows.path = ControlFace.dpadArrows(d)
+                    cross.fillColor = UIColor.clear.cgColor
+                    cross.lineJoin = .round
+                    cross.lineWidth = max(1.5, d / 56)
+                    base.layer.borderWidth = 1
+                } else {
+                    cross.fillColor = UIColor(white: 1, alpha: 0.12).cgColor
+                    cross.lineWidth = max(1, d / 64)
+                    base.layer.borderWidth = max(1, d / 58)
+                }
             case .button:
                 let fs = face.fontSize(d)
                 if let s = face.symbol,
                    let img = UIImage(systemName: s,
-                                     withConfiguration: UIImage.SymbolConfiguration(pointSize: fs, weight: .medium)) {
+                                     withConfiguration: UIImage.SymbolConfiguration(
+                                        pointSize: fs, weight: xbox ? .semibold : .medium)) {
                     glyph.image = img
                     glyph.tintColor = face.tint
                     glyph.frame = base.bounds
@@ -6151,11 +6316,18 @@ final class ControlsInputView: UIView {
                 } else {
                     label.text = face.text
                     label.textColor = face.tint
-                    label.font = UIFont.systemFont(ofSize: fs, weight: face.bold ? .bold : .medium)
-                    label.frame = CGRect(x: d * 0.08, y: 0, width: d * 0.84, height: d)
+                    if xbox {
+                        // ml885: rounded, heavier letters, like the controller's
+                        let f = UIFont.systemFont(ofSize: fs, weight: face.bold ? .heavy : .bold)
+                        label.font = f.fontDescriptor.withDesign(.rounded)
+                            .map { UIFont(descriptor: $0, size: fs) } ?? f
+                    } else {
+                        label.font = UIFont.systemFont(ofSize: fs, weight: face.bold ? .bold : .medium)
+                    }
+                    label.frame = base.bounds.insetBy(dx: shape.width * 0.08, dy: 0)
                     label.isHidden = false
                 }
-                base.layer.borderWidth = 1
+                base.layer.borderWidth = face.ring != nil ? max(2, d / 26) : (xbox ? 1.5 : 1)
             }
             setKnob(.zero)
             setHeld(false)
@@ -6164,9 +6336,35 @@ final class ControlsInputView: UIView {
 
         func setHeld(_ held: Bool) {
             switch face.kind {
+            case .stick where face.xbox:
+                // ml885: the rim lights Xbox green and glows while the stick is held.
+                base.backgroundColor = UIColor(white: 0.04, alpha: held ? 0.46 : 0.36)
+                base.layer.borderColor = (held ? ControlFace.xboxGreen.withAlphaComponent(0.95)
+                                                : UIColor(white: 1, alpha: 0.38)).cgColor
+                base.layer.shadowOpacity = held ? 0.7 : 0
+                travel.strokeColor = UIColor(white: 1, alpha: held ? 0.24 : 0.14).cgColor
+            case .dpad where face.xbox:
+                base.backgroundColor = UIColor(white: 0.04, alpha: held ? 0.22 : 0.16)
+                base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.30 : 0.18).cgColor
+                cross.strokeColor = UIColor(white: 1, alpha: held ? 0.85 : 0.55).cgColor
             case .stick, .dpad:
                 base.backgroundColor = UIColor(white: 0, alpha: held ? 0.36 : 0.28)
                 base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.80 : 0.55).cgColor
+            case .button where face.xbox:
+                // ml885: a face button fills with its colour, its letter turns
+                // white and it glows; the others light up white.
+                base.backgroundColor = held ? face.heldFill : ControlFace.xboxFill
+                if let r = face.ring {
+                    base.layer.borderColor = r.withAlphaComponent(held ? 1 : 0.9).cgColor
+                    label.textColor = held ? .white : r
+                    glyph.tintColor = held ? .white : r
+                    base.layer.shadowOpacity = held ? 0.9 : 0
+                } else {
+                    base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.95 : 0.42).cgColor
+                    base.layer.shadowOpacity = held ? 0.45 : 0
+                }
+                label.alpha = held ? 1.0 : 0.95
+                glyph.alpha = held ? 1.0 : 0.95
             case .button:
                 base.backgroundColor = held ? face.heldFill : UIColor(white: 0, alpha: 0.28)
                 base.layer.borderColor = UIColor(white: 1, alpha: held ? 0.75 : 0.28).cgColor
@@ -7260,15 +7458,31 @@ struct TouchControlButton: View {
                        height: JoystickFace.padRadius * 2)
                 .scaleEffect(d / (JoystickFace.padRadius * 2))
         case .dpad:
-            Circle().fill(Color.black.opacity(0.28))
-            Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: max(1, d / 58))
-            Path(ControlFace.dpadCross(d)).fill(Color.white.opacity(0.12))
-            Path(ControlFace.dpadCross(d)).stroke(Color.white.opacity(0.60),
-                                                  lineWidth: max(1, d / 64))
+            // ml885: as play draws it — a dark cross with arrowheads on a faint well.
+            Circle().fill(Color(white: 0.04).opacity(0.16))
+            Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+            Path(ControlFace.dpadCross(d)).fill(Color(uiColor: ControlFace.xboxFill))
+            Path(ControlFace.dpadCross(d)).stroke(Color.white.opacity(0.55),
+                                                  style: StrokeStyle(lineWidth: max(1.5, d / 56),
+                                                                     lineJoin: .round))
+            Path(ControlFace.dpadArrows(d)).fill(Color.white.opacity(0.78))
         case .button:
-            // ml826: plain translucent disc, as in play — no GlassShape.
-            Circle().fill(Color.black.opacity(0.28))
-            glyphView(face, d)
+            if face.xbox {
+                // ml885: the controller-button shape and rim play draws.
+                let s = face.shapeSize(d), r = face.cornerRadius(d)
+                RoundedRectangle(cornerRadius: r)
+                    .fill(Color(uiColor: ControlFace.xboxFill))
+                    .frame(width: s.width, height: s.height)
+                RoundedRectangle(cornerRadius: r)
+                    .strokeBorder(Color(uiColor: face.ring ?? UIColor(white: 1, alpha: 0.42)),
+                                  lineWidth: face.ring != nil ? max(2, d / 26) : 1.5)
+                    .frame(width: s.width, height: s.height)
+                glyphView(face, d)
+            } else {
+                // ml826: plain translucent disc, as in play — no GlassShape.
+                Circle().fill(Color.black.opacity(0.28))
+                glyphView(face, d)
+            }
         }
     }
 
@@ -7294,8 +7508,9 @@ struct TouchControlButton: View {
         }
         .frame(width: diameter, height: diameter)
         .contentShape(Circle())
+        // ml885: controller buttons draw their own rim (a bumper's is not a circle).
         .overlay(Circle().stroke(.white.opacity(isSelected ? 0.95
-                                                : (isStick ? 0 : 0.28)),
+                                                : (isStick || ControlFace.of(control.action).xbox ? 0 : 0.28)),
                                  lineWidth: isSelected ? 2 : 1))
         .overlay(alignment: .topTrailing) {
             // ml833: hidden while resizing, where the scale readout sits.
