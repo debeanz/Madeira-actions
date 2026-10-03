@@ -3053,7 +3053,7 @@ struct ContentView: View {
                         Text("Performance").tag("Performance")
                     }
                     Toggle("Skip x86 memory-ordering emulation", isOn: $fexNoTSO)
-                    Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch.")
+                    Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch. Recommended for 32-bit games — turn it on for just that game from its ⋯ menu.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     LabeledContent("Translation", value: "x86-64 → ARM64")
