@@ -155,9 +155,107 @@ ULONG_PTR win32u_zero_bits(void)
     return ret;
 }
 
+/***********************************************************************
+ *           ml878: ATOMS THAT CROSS THE 32-BIT BRIDGE AS ADDRESSES
+ *
+ * 125hz's wow64win.dll (prebuilt; it converts every i386 user32 call) turns
+ * each 32-bit pointer argument into a host address with guest_ptr32(), which
+ * adds the guest window base B to anything non-NULL -- including the arguments
+ * Win32 lets be an ATOM instead of a string.  MAKEINTATOM(32770), the dialog
+ * class, arrives as B + 0x8002: no longer an atom to IS_INTRESOURCE(), and not
+ * readable memory either (the guest's first 64 KB are never mapped).
+ *
+ *   - NtUserCreateWindowEx's `class` (user32 hands over the caller's own class
+ *     argument).  Its TRACE formats it with debugstr_w(), and Wine evaluates a
+ *     TRACE's arguments the first time a file's channel is used, before it
+ *     knows the channel is off.  So the FIRST window of a session made from an
+ *     atom class died reading B + 0x8002: Prince of Persia: The Two Thrones'
+ *     launcher PrinceOfPersia.exe (an MFC dialog) is the first window anyone
+ *     creates in a game session, which has no explorer (0.1.142:
+ *     wine_dbgstr_wn+0x4c <- NtUserCreateWindowEx+0x100, addr 0x400008002).
+ *     Past that TRACE it only cost the atom: cs.lpszClass became the class
+ *     NAME where Windows gives the CBT hook and WM_CREATE the atom.
+ *   - NtUserGetProp / SetProp / RemoveProp's `str`: an atom property name
+ *     (SetPropW(hwnd, MAKEINTATOM(a), ...), what Delphi's VCL does for every
+ *     window) went to lstrlenW(B + a) -- a crash on every call, not just once.
+ *
+ * Everything else that can carry an atom either arrives as a UNICODE_STRING
+ * user32 filled with the class NAME (init_class_name), or is only ever used
+ * through LOWORD (cursor resource ids).
+ *
+ * B + x with x below 64 KB is never a guest address, so it is always an atom:
+ * it is taken back to x, for a caller that has a guest window (B is 0 for
+ * every 64-bit process, which keeps upstream behaviour exactly).  wow64win.dll
+ * cannot be rebuilt here, so the fix sits at its only other point of contact:
+ * the win32u syscall table, whose four entries are swapped before upstream
+ * init publishes it. */
+extern ULONG_PTR ios_wow_base(void);
+
+static const WCHAR *ios_wow_atom( const WCHAR *str, const char *where )
+{
+    static int logged;
+    ULONG_PTR base;
+
+    if (IS_INTRESOURCE( str ) || !(base = ios_wow_base())) return str;
+    if ((ULONG_PTR)str - base >= 0x10000) return str;
+    if (__atomic_add_fetch( &logged, 1, __ATOMIC_RELAXED ) <= 8)
+        dprintf( 2, "[wow-atom] ml878 %s: %p from a 32-bit caller is atom %#lx (B=%p)\n",
+                 where, str, (unsigned long)((ULONG_PTR)str - base), (void *)base );
+    return (const WCHAR *)((ULONG_PTR)str - base);
+}
+
+static HWND WINAPI ios_NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
+                                             UNICODE_STRING *version, UNICODE_STRING *window_name,
+                                             DWORD style, INT x, INT y, INT cx, INT cy,
+                                             HWND parent, HMENU menu, HINSTANCE instance, void *params,
+                                             DWORD flags, HINSTANCE client_instance, const WCHAR *class,
+                                             BOOL ansi )
+{
+    return NtUserCreateWindowEx( ex_style, class_name, version, window_name, style, x, y, cx, cy,
+                                 parent, menu, instance, params, flags, client_instance,
+                                 ios_wow_atom( class, "NtUserCreateWindowEx" ), ansi );
+}
+
+static HANDLE WINAPI ios_NtUserGetProp( HWND hwnd, const WCHAR *str )
+{
+    return NtUserGetProp( hwnd, ios_wow_atom( str, "NtUserGetProp" ));
+}
+
+static BOOL WINAPI ios_NtUserSetProp( HWND hwnd, const WCHAR *str, HANDLE handle )
+{
+    return NtUserSetProp( hwnd, ios_wow_atom( str, "NtUserSetProp" ), handle );
+}
+
+static HANDLE WINAPI ios_NtUserRemoveProp( HWND hwnd, const WCHAR *str )
+{
+    return NtUserRemoveProp( hwnd, ios_wow_atom( str, "NtUserRemoveProp" ));
+}
+
+static void ios_swap_syscall( ULONG_PTR orig, ULONG_PTR hook, const char *name )
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(syscalls); i++)
+    {
+        if (syscalls[i] == hook) return;   /* a later init: already swapped */
+        if (syscalls[i] != orig) continue;
+        syscalls[i] = hook;
+        return;
+    }
+    dprintf( 2, "[wow-atom] ml878 %s is not in the win32u syscall table -- "
+                "atoms from 32-bit callers stay unconverted there\n", name );
+}
+
 NTSTATUS win32u_unix_lib_init(void)
 {
-    NTSTATUS status = win32u_unix_lib_init_upstream();
+    NTSTATUS status;
+
+    ios_swap_syscall( (ULONG_PTR)NtUserCreateWindowEx, (ULONG_PTR)ios_NtUserCreateWindowEx,
+                      "NtUserCreateWindowEx" );
+    ios_swap_syscall( (ULONG_PTR)NtUserGetProp, (ULONG_PTR)ios_NtUserGetProp, "NtUserGetProp" );
+    ios_swap_syscall( (ULONG_PTR)NtUserSetProp, (ULONG_PTR)ios_NtUserSetProp, "NtUserSetProp" );
+    ios_swap_syscall( (ULONG_PTR)NtUserRemoveProp, (ULONG_PTR)ios_NtUserRemoveProp, "NtUserRemoveProp" );
+    status = win32u_unix_lib_init_upstream();
 
     /* The task-global is dead here; win32u_zero_bits() answers per
      * pseudo-process.  Keep it at 0 so that any call site that still reads it

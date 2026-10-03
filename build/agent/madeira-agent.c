@@ -48,6 +48,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <dbt.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -65,13 +66,24 @@
 #define DEVCHANGE_PATH L"C:\\madeira\\devchange.txt"   /* ml875 */
 
 /* ml797: programs we started, so their exit can be reported (the app's
- * Games tab turns "Resume" back into "Play"). */
+ * Games tab turns "Resume" back into "Play"). ml878: and the programs THEY
+ * start, each tagged with the pid the app knows its family by (see
+ * adopt_descendants). */
 static HANDLE g_child_handle[32];
 static DWORD  g_child_pid[32];
 static DWORD  g_child_kill_at[32];   /* ml799: tick when a hard kill is due, 0 = none */
+static DWORD  g_child_root[32];      /* ml878: the family's pid as the app knows it */
+static DWORD  g_child_code[32];      /* ml878: first non-zero exit code in the family so far */
 static int    g_child_n;
 
 static void agent_log( const char *fmt, ... );   /* defined below; reap_children logs */
+
+static BOOL is_child_pid( DWORD pid )
+{
+    int i;
+    for (i = 0; i < g_child_n; i++) if (g_child_pid[i] == pid) return TRUE;
+    return FALSE;
+}
 
 /* ml799: a violent TerminateProcess from outside wedges the desktop on
  * this port (the victim's threads never get the signal and keep their
@@ -120,24 +132,117 @@ static void append_text_file( const WCHAR *path, const char *text )
     CloseHandle( h );
 }
 
+/* ml878: A LAUNCHER'S GAME IS PART OF THE LAUNCHER'S ENTRY.
+ *
+ * Prince of Persia: The Two Thrones refuses to run unless its launcher,
+ * PrinceOfPersia.exe, starts it, and a launcher may well exit once the game is
+ * up. We only knew the program we started, so its exit read as "the game
+ * ended" (the app went back to the Games tab with the game still running),
+ * Force close never reached the game, and the game's message boxes were not
+ * relayed (is_child_pid).
+ *
+ * So every process whose parent is one we track joins that one's FAMILY: same
+ * root (the pid the app was given), closed and relayed with it. exit.txt gets
+ * "pid=<root> code=<c>" once the whole family is gone, c being the first
+ * non-zero exit code among its members (0 if none), so a game that crashes
+ * under a launcher that then exits cleanly still reads as a crash.
+ *
+ * A parent id only names a parent while that pid cannot have been reused: we
+ * hold a handle to every tracked process, which keeps its pid, and a candidate
+ * created BEFORE that process cannot be its child. Several passes, because a
+ * grandchild can be listed before its parent has joined. */
+static ULONGLONG process_start_time( HANDLE h )
+{
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes( h, &created, &exited, &kernel, &user )) return 0;
+    return ((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime;
+}
+
+static void adopt_descendants( void )
+{
+    PROCESSENTRY32W pe;
+    HANDLE snap, h;
+    BOOL added = TRUE;
+    int i, pass;
+
+    snap = CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
+    if (snap == INVALID_HANDLE_VALUE) return;
+    for (pass = 0; added && pass < 4; pass++)
+    {
+        added = FALSE;
+        pe.dwSize = sizeof(pe);
+        if (!Process32FirstW( snap, &pe )) break;
+        do
+        {
+            ULONGLONG parent_start, start;
+
+            if (g_child_n >= 32) break;
+            if (is_child_pid( pe.th32ProcessID )) continue;
+            for (i = 0; i < g_child_n; i++) if (g_child_pid[i] == pe.th32ParentProcessID) break;
+            if (i == g_child_n) continue;
+            h = OpenProcess( SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                             FALSE, pe.th32ProcessID );
+            if (!h) continue;
+            parent_start = process_start_time( g_child_handle[i] );
+            start = process_start_time( h );
+            if (parent_start && start && start < parent_start)
+            {
+                CloseHandle( h );   /* older than the parent: an earlier owner of that pid started it */
+                continue;
+            }
+            g_child_handle[g_child_n] = h;
+            g_child_pid[g_child_n] = pe.th32ProcessID;
+            g_child_kill_at[g_child_n] = 0;
+            g_child_root[g_child_n] = g_child_root[i];
+            g_child_code[g_child_n] = g_child_code[i];
+            g_child_n++;
+            added = TRUE;
+            agent_log( "pid=%lu %ls, started by pid=%lu, joins the family of pid=%lu",
+                       (unsigned long)pe.th32ProcessID, pe.szExeFile,
+                       (unsigned long)pe.th32ParentProcessID, (unsigned long)g_child_root[i] );
+        } while (Process32NextW( snap, &pe ));
+    }
+    CloseHandle( snap );
+}
+
 static void reap_children( void )
 {
-    int i = 0;
+    int i = 0, j;
     while (i < g_child_n)
     {
         if (WaitForSingleObject( g_child_handle[i], 0 ) == WAIT_OBJECT_0)
         {
-            DWORD code = 0;
+            DWORD code = 0, family, root = g_child_root[i];
+            int others = 0;
             char line[96];
+
+            /* ml878: what it started on its way out joins the family first
+             * (its pid is still ours to compare with: we hold its handle). */
+            adopt_descendants();
             GetExitCodeProcess( g_child_handle[i], &code );
             CloseHandle( g_child_handle[i] );
-            snprintf( line, sizeof(line), "pid=%lu code=%ld\r\n", (unsigned long)g_child_pid[i], (long)(int)code );
-            append_text_file( EXIT_PATH, line );
-            agent_log( "%s", line );
+            family = g_child_code[i] ? g_child_code[i] : code;
+            for (j = 0; j < g_child_n; j++)
+            {
+                if (j == i || g_child_root[j] != root) continue;
+                if (!g_child_code[j]) g_child_code[j] = family;
+                others++;
+            }
+            if (others)
+                agent_log( "pid=%lu ended (code %ld); %d more program(s) of pid=%lu's family still running",
+                           (unsigned long)g_child_pid[i], (long)(int)code, others, (unsigned long)root );
+            else
+            {
+                snprintf( line, sizeof(line), "pid=%lu code=%ld\r\n", (unsigned long)root, (long)(int)family );
+                append_text_file( EXIT_PATH, line );
+                agent_log( "%s", line );
+            }
             g_child_n--;
             g_child_handle[i] = g_child_handle[g_child_n];
             g_child_pid[i] = g_child_pid[g_child_n];
             g_child_kill_at[i] = g_child_kill_at[g_child_n];
+            g_child_root[i] = g_child_root[g_child_n];
+            g_child_code[i] = g_child_code[g_child_n];
             continue;
         }
         if (g_child_kill_at[i] && hardkill_enabled() && (LONG)(GetTickCount() - g_child_kill_at[i]) >= 0)
@@ -311,6 +416,8 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
             g_child_handle[g_child_n] = pi.hProcess;
             g_child_pid[g_child_n] = pi.dwProcessId;
             g_child_kill_at[g_child_n] = 0;
+            g_child_root[g_child_n] = pi.dwProcessId;   /* ml878: a family of its own */
+            g_child_code[g_child_n] = 0;
             g_child_n++;
         }
         else CloseHandle( pi.hProcess );
@@ -340,21 +447,23 @@ static void handle_request( void )
     {
         DWORD kpid = strtoul( args, NULL, 10 );
         BOOL ok = FALSE;
-        int i;
+        int i, members = 0;
         g_close_posted = 0;
-        EnumWindows( close_windows_proc, (LPARAM)kpid );
+        /* ml878: the whole family, so a launcher's game is closed with it. */
         for (i = 0; i < g_child_n; i++)
-            if (g_child_pid[i] == kpid)
+            if (g_child_root[i] == kpid || g_child_pid[i] == kpid)
             {
+                EnumWindows( close_windows_proc, (LPARAM)g_child_pid[i] );
                 /* Polite close first; the reap loop terminates after the grace. */
                 g_child_kill_at[i] = GetTickCount() + CLOSE_GRACE_MS;
                 if (!g_child_kill_at[i]) g_child_kill_at[i] = 1;
+                members++;
                 ok = TRUE;
-                break;
             }
-        if (i == g_child_n)
+        if (!members)
         {
             /* Not ours: close its windows now, terminate if none took it. */
+            EnumWindows( close_windows_proc, (LPARAM)kpid );
             if (g_close_posted) ok = TRUE;
             else
             {
@@ -362,8 +471,8 @@ static void handle_request( void )
                 if (h) { ok = TerminateProcess( h, 1 ); CloseHandle( h ); }
             }
         }
-        agent_log( "kill id=%s pid=%lu -> %s (WM_CLOSE to %d window(s), hard kill in %d ms if ignored)",
-                   id, (unsigned long)kpid, ok ? "ok" : "err", g_close_posted, CLOSE_GRACE_MS );
+        agent_log( "kill id=%s pid=%lu -> %s (WM_CLOSE to %d window(s) of %d program(s), hard kill in %d ms if ignored)",
+                   id, (unsigned long)kpid, ok ? "ok" : "err", g_close_posted, members, CLOSE_GRACE_MS );
         snprintf( result, sizeof(result), ok ? "id=%s\r\nok kill\r\n" : "id=%s\r\nerr code=%lu\r\n", id, (unsigned long)GetLastError() );
         write_text_file( RESULT_PATH, result );
         HeapFree( GetProcessHeap(), 0, text );
@@ -615,7 +724,14 @@ static void handle_devchange( void )
  *     button=<control id> <label>           (one per push button)
  * and when it goes away the file becomes "closed=0x1002c". The app answers in
  * C:\madeira\dialog-answer.txt ("hwnd=0x1002c", "button=1") and the agent
- * presses that button -- WM_COMMAND/BN_CLICKED, exactly what a click sends. */
+ * presses that button -- WM_COMMAND/BN_CLICKED, exactly what a click sends.
+ *
+ * ml878: launchers are dialogs too (PrinceOfPersia.exe, an MFC dialog), so:
+ * owner-drawn buttons count when they carry a label (skinned launchers draw
+ * their own buttons), disabled ones never do, and a disabled dialog is skipped
+ * -- a dialog is disabled while a modal one it opened is up (a launcher's
+ * Settings), and that one is shown in its place; when it closes, the dialog
+ * under it is enabled again and shown again. */
 #define DIALOG_PATH        L"C:\\madeira\\dialog.txt"
 #define DIALOG_TMP_PATH    L"C:\\madeira\\dialog.tmp"
 #define DIALOG_ANSWER_PATH L"C:\\madeira\\dialog-answer.txt"
@@ -626,19 +742,12 @@ static HWND g_dialog;   /* the dialog the app was told about; NULL = none */
 
 struct dialog_info { char text[4096]; char buttons[1024]; };
 
-static BOOL is_child_pid( DWORD pid )
-{
-    int i;
-    for (i = 0; i < g_child_n; i++) if (g_child_pid[i] == pid) return TRUE;
-    return FALSE;
-}
-
 static BOOL CALLBACK find_dialog_proc( HWND hwnd, LPARAM lp )
 {
     WCHAR cls[16];
     DWORD pid = 0;
 
-    if (!IsWindowVisible( hwnd )) return TRUE;
+    if (!IsWindowVisible( hwnd ) || !IsWindowEnabled( hwnd )) return TRUE;
     GetWindowThreadProcessId( hwnd, &pid );
     if (!is_child_pid( pid )) return TRUE;
     if (!GetClassNameW( hwnd, cls, ARRAYSIZE(cls) ) || lstrcmpiW( cls, L"#32770" )) return TRUE;
@@ -684,7 +793,8 @@ static BOOL CALLBACK dialog_child_proc( HWND child, LPARAM lp )
     else if (!lstrcmpiW( cls, L"Button" ))
     {
         kind = GetWindowLongW( child, GWL_STYLE ) & BS_TYPEMASK;
-        if (kind != BS_PUSHBUTTON && kind != BS_DEFPUSHBUTTON) return TRUE;
+        if (kind != BS_PUSHBUTTON && kind != BS_DEFPUSHBUTTON && kind != BS_OWNERDRAW) return TRUE;
+        if (!IsWindowEnabled( child )) return TRUE;   /* ml878: greyed out in the game too */
         for (i = j = 0; label[i]; i++)   /* "&Yes" -> "Yes", "&&" -> "&" */
         {
             if (label[i] == '&')
@@ -707,6 +817,7 @@ static BOOL CALLBACK dialog_child_proc( HWND child, LPARAM lp )
 static void relay_dialogs( void )
 {
     static struct dialog_info info;
+    static unsigned int seq;
     char out[6144];
     WCHAR title[256];
     HWND hwnd = NULL;
@@ -720,9 +831,10 @@ static void relay_dialogs( void )
         agent_log( "dialog 0x%llx closed", (unsigned long long)(ULONG_PTR)g_dialog );
         g_dialog = NULL;
     }
-    if (g_dialog || !g_child_n) return;
+    if (!g_child_n) return;
     EnumWindows( find_dialog_proc, (LPARAM)&hwnd );
-    if (!hwnd) return;
+    /* ml878: a dialog opened over the one shown takes its place (see above). */
+    if (!hwnd || hwnd == g_dialog) return;
 
     g_dialog = hwnd;
     GetWindowThreadProcessId( hwnd, &pid );
@@ -730,7 +842,10 @@ static void relay_dialogs( void )
     GetWindowTextW( hwnd, title, ARRAYSIZE(title) );
     memset( &info, 0, sizeof(info) );
     EnumChildWindows( hwnd, dialog_child_proc, (LPARAM)&info );
-    snprintf( out, sizeof(out), "hwnd=0x%llx\r\n", (unsigned long long)(ULONG_PTR)hwnd );
+    /* ml878: seq= makes every announcement new to the app, which skips a file
+     * it has already read: the same dialog shown again after a dialog over it
+     * closed must not look like the copy it saw before. */
+    snprintf( out, sizeof(out), "hwnd=0x%llx\r\nseq=%u\r\n", (unsigned long long)(ULONG_PTR)hwnd, ++seq );
     append_lines( out, sizeof(out), "title=", title );
     strncat( out, info.text, sizeof(out) - strlen( out ) - 1 );
     strncat( out, info.buttons, sizeof(out) - strlen( out ) - 1 );
@@ -764,6 +879,7 @@ static void handle_dialog_answer( void )
 int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
 {
     char ready[64];
+    unsigned int polls;
 
     CreateDirectoryW( AGENT_DIR, NULL );
     DeleteFileW( READY_PATH );
@@ -868,12 +984,13 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
     write_text_file( READY_PATH, ready );
 
     DeleteFileW( EXIT_PATH );
-    for (;;)
+    for (polls = 0;; polls++)
     {
         Sleep( 200 );
         if (GetFileAttributesW( REQUEST_PATH ) != INVALID_FILE_ATTRIBUTES) handle_request();
         if (GetFileAttributesW( DEVCHANGE_PATH ) != INVALID_FILE_ATTRIBUTES) handle_devchange();   /* ml875 */
         if (GetFileAttributesW( DIALOG_ANSWER_PATH ) != INVALID_FILE_ATTRIBUTES) handle_dialog_answer();   /* ml876 */
+        if (g_child_n && polls % 5 == 0) adopt_descendants();   /* ml878: once a second */
         if (g_child_n || g_dialog) relay_dialogs();
         if (g_child_n) reap_children();
     }
