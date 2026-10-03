@@ -18,7 +18,11 @@ permissions:
   contents: read
 
 env:
-  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+  # No DEVELOPER_DIR here: it overrides xcode-select, so pinning it to Xcode
+  # 16.4 silently undid the "Select Xcode" step below and built every IPA up to
+  # 0.1.132 against the iOS 18.5 SDK — which iOS 26 draws in its old style
+  # (alerts without the round buttons, the old tab bar) and which stripped the
+  # glassEffect calls. The newest installed Xcode is chosen in that step.
   IOS_DEPLOYMENT_TARGET: "16.0"
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
   # bump to invalidate every cache at once
@@ -45,11 +49,14 @@ jobs:
           if [ -n "$NEWEST" ]; then
             sudo xcode-select -s "$NEWEST/Contents/Developer"
           else
-            sudo xcode-select -s "$DEVELOPER_DIR" \
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer \
               || sudo xcode-select -s "$(ls -d /Applications/Xcode_1*.app | sort -V | tail -1)/Contents/Developer"
           fi
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+          # Both must name the Xcode chosen above (a DEVELOPER_DIR would win over it).
+          xcode-select -p
+          xcrun --find xcodebuild
 
       - name: Host dependencies
         run: |
