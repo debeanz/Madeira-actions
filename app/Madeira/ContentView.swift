@@ -1507,6 +1507,13 @@ struct ContentView: View {
     /// and a crash leaves threads behind that can hold a lock the next game
     /// blocks on (ml812). Advice, not a block: "Not Now" keeps the warm session.
     @State private var showRestartAfterGameAlert = false
+    /// ml859: a game crashed, hung or failed to start: the game whose log the
+    /// "Save Log" alert offers to keep, and that alert's headline. nil otherwise.
+    @State private var crashLogGame: LauncherGame? = nil
+    @State private var crashLogTitle = ""
+    /// ml859: what saving it did ("Log saved as Celeste 3 …"), shown at the top
+    /// of the restart alert that follows.
+    @State private var crashLogResult: String? = nil
     @State private var showActivityLogs = false
     @State private var showRuntimeStatus = false
     @State private var prefixSizeText = "Calculating…"
@@ -1625,13 +1632,24 @@ struct ContentView: View {
         } message: {
             Text("Games launched from the Games tab run on their own, without the Windows desktop, and the runtime can only be started once per launch. Quit and reopen Madeira, then use Start Desktop before playing a game.")
         }
+        // ml859: after a crash, hang or failed start — save THAT game's log as
+        // "<title> <n>.txt" in Documents/logs. Either answer leads into the
+        // restart advice below.
+        .alert(Text(crashLogTitle),
+               isPresented: Binding(get: { crashLogGame != nil },
+                                    set: { if !$0 { crashLogGame = nil } }),
+               presenting: crashLogGame) { game in
+            Button("Save Log") { saveCrashLog(game) }
+            Button("Not Now", role: .cancel) { recommendRestartAfterGame() }
+        } message: { _ in
+            Text("Save a log of what happened so the problem can be looked at? It goes to "
+                 + "Files › Madeira › logs, named after the game and numbered.")
+        }
         .alert("Restart Madeira before your next game", isPresented: $showRestartAfterGameAlert) {
             Button("Close Madeira", role: .destructive) { quitApp() }
-            Button("Not Now", role: .cancel) {}
+            Button("Not Now", role: .cancel) { crashLogResult = nil }
         } message: {
-            Text("Quitting a game doesn't free everything it used — some memory and background "
-                 + "threads stay behind until Madeira closes. For the best performance and to avoid "
-                 + "crashes, close Madeira and reopen it before playing again.")
+            Text(restartAlertMessage)
         }
         .onAppear {
             jit_install_trap_handler()
@@ -1694,6 +1712,20 @@ struct ContentView: View {
             // The tab may not change (already on Games): re-apply anyway so
             // the window-level surfaces never linger over the UI.
             applySurfaceVisibility(tab: selectedTab)
+        }
+        // ml858: the in-game toolbar's Save Log. It saves THIS game's log —
+        // launchingGame stays set for the whole session the game runs in — or,
+        // in a Windows desktop session with no Games-tab game, the run as "Desktop".
+        .onReceive(NotificationCenter.default.publisher(for: .madeiraSaveLog)) { _ in
+            let done: (String?) -> Void = { name in
+                NotificationCenter.default.post(name: .madeiraLogSaved, object: nil,
+                                                userInfo: name.map { ["name": $0] as [AnyHashable: Any] })
+            }
+            if let game = launchingGame {
+                GameLogSaver.save(game: game, done: done)
+            } else {
+                GameLogSaver.save(title: "Desktop", exe: nil, done: done)
+            }
         }
     }
 
@@ -1855,7 +1887,12 @@ struct ContentView: View {
                 // threads can hold a lock in a shared DLL that the new game
                 // blocks on. Say so plainly instead of silently bouncing the
                 // user back to the grid to try again forever.
-                if sessionCrashed { showSessionCrashedAlert = true }
+                if sessionCrashed {
+                    showSessionCrashedAlert = true
+                } else {
+                    // ml859: it bounced straight back to the grid — keep the log.
+                    offerCrashLog(gameID: game.id, headline: "\(game.title) could not start")
+                }
                 launcherSession = .idle
                 launchingGame = nil
                 desktopFullScreen = false
@@ -2024,6 +2061,8 @@ struct ContentView: View {
                     self.launchingGame = nil
                     self.desktopFullScreen = false
                     self.selectedTab = .games
+                    // ml859: a startup failure is exactly the log worth keeping.
+                    self.offerCrashLog(gameID: gameID, headline: "\(title) could not start")
                 }
             }
 
@@ -2085,6 +2124,7 @@ struct ContentView: View {
             var announced = false
             var sawAudio = winios_audio_streams_live() > 0
             var tripReason: String? = nil
+            var hung = false            // ml859: a hang, as opposed to quitting
             while !done.done {
                 Thread.sleep(forTimeInterval: 0.5)
                 since += 0.5
@@ -2122,6 +2162,7 @@ struct ContentView: View {
                 }
                 if stalled >= 20 {
                     tripReason = "stopped drawing for 20 s with no sign of quitting — treating it as hung"
+                    hung = true
                     break
                 }
                 if since.truncatingRemainder(dividingBy: 15) < 0.25 {
@@ -2129,6 +2170,7 @@ struct ContentView: View {
                 }
             }
             guard !done.done, let reason = tripReason else { return }
+            let wasHung = hung
             DispatchQueue.main.async {
                 guard !done.done, case .playing(let t) = self.launcherSession, t == title,
                       self.playingPid == pid else { return }
@@ -2139,7 +2181,13 @@ struct ContentView: View {
                 self.launchingGame = nil
                 self.desktopFullScreen = false
                 self.selectedTab = .games
-                self.recommendRestartAfterGame()   // ml856
+                // ml859: a hang gets the Save Log offer; a game seen quitting just
+                // gets the restart advice (ml856).
+                if wasHung {
+                    self.offerCrashLog(gameID: gameID, headline: "\(title) stopped responding")
+                } else {
+                    self.recommendRestartAfterGame()
+                }
             }
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
@@ -2166,7 +2214,13 @@ struct ContentView: View {
                 launchingGame = nil
                 desktopFullScreen = false
                 selectedTab = .games
-                recommendRestartAfterGame()   // ml856
+                // ml859: a crash (non-zero exit) gets the Save Log offer first;
+                // a clean quit or a force close (both exit 0) gets the restart advice.
+                if code != 0 {
+                    offerCrashLog(gameID: gameID, headline: "\(title) crashed")
+                } else {
+                    recommendRestartAfterGame()   // ml856
+                }
             }
         }
     }
@@ -2385,6 +2439,44 @@ struct ContentView: View {
             guard launcherSession == .idle, !desktopFullScreen else { return }
             logStore.log("Recommending a restart of Madeira before the next game")
             showRestartAfterGameAlert = true
+        }
+    }
+
+    /// ml859: a game crashed, hung, or failed to start, and the Games tab is
+    /// back: offer to save THAT game's log. Either answer then leads into the
+    /// restart advice (ml856), which matters most after a crash. Same wait and
+    /// guard as that advice: over the Games tab, never once another game started.
+    /// The game is looked up by id because every session-end path has already
+    /// cleared launchingGame by the time this runs.
+    private func offerCrashLog(gameID: String, headline: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            guard launcherSession == .idle, !desktopFullScreen else { return }
+            guard let game = GameLibrary.shared.game(withID: gameID) else {
+                recommendRestartAfterGame()   // the game is gone from the library
+                return
+            }
+            logStore.log("Offering to save the log: \(headline)")
+            crashLogResult = nil
+            crashLogTitle = headline
+            crashLogGame = game
+        }
+    }
+
+    /// ml856 advice, with ml859's save result on top when the crash alert came first.
+    private var restartAlertMessage: String {
+        let advice = "Quitting a game doesn't free everything it used — some memory and background "
+            + "threads stay behind until Madeira closes. For the best performance and to avoid "
+            + "crashes, close Madeira and reopen it before playing again."
+        guard let result = crashLogResult else { return advice }
+        return result + "\n\n" + advice
+    }
+
+    private func saveCrashLog(_ game: LauncherGame) {
+        // The alert's headline ("Celeste crashed") goes into the file's header.
+        GameLogSaver.save(game: game, note: crashLogTitle) { name in
+            crashLogResult = name.map { "Log saved as \($0) in Files › Madeira › logs." }
+                ?? "The log could not be saved."
+            recommendRestartAfterGame()
         }
     }
 
@@ -6397,6 +6489,12 @@ enum TouchControlsHost {
 extension Notification.Name {
     /// Posted by MetalBackedView on a quick, still tap of the game surface.
     static let madeiraSurfaceTap = Notification.Name("MadeiraSurfaceTap")
+    /// ml858: the in-game toolbar's Save Log button. ContentView answers it,
+    /// because only it knows which game is running (launchingGame).
+    static let madeiraSaveLog = Notification.Name("MadeiraSaveLog")
+    /// ml858: the save finished; userInfo["name"] is the file's name ("Celeste 3"),
+    /// absent when there was no log to save.
+    static let madeiraLogSaved = Notification.Name("MadeiraLogSaved")
 }
 
 struct TouchControlsOverlay: View {
@@ -6409,6 +6507,20 @@ struct TouchControlsOverlay: View {
     @State private var chromeVisible = true
     @State private var chromeHideWork: DispatchWorkItem?
     private var chromeShown: Bool { chromeVisible || m.editing }
+    /// ml858: what the toolbar's Save Log did ("Saved: Celeste 3"), shown under
+    /// the toolbar for a few seconds.
+    @State private var logToast: String? = nil
+    @State private var logToastHide: DispatchWorkItem?
+
+    private func showLogToast(_ text: String, for seconds: Double = 3) {
+        withAnimation(.easeInOut(duration: 0.2)) { logToast = text }
+        logToastHide?.cancel()
+        let work = DispatchWorkItem {
+            withAnimation(.easeInOut(duration: 0.3)) { logToast = nil }
+        }
+        logToastHide = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
 
     private func showChrome() {
         withAnimation(.easeInOut(duration: 0.2)) { chromeVisible = true }
@@ -6464,6 +6576,22 @@ struct TouchControlsOverlay: View {
                         }
                         .padding(.top, geo.safeAreaInsets.top + 10)
                         .padding(.trailing, geo.safeAreaInsets.trailing + 12)
+                    // ml858: Save Log's result, just under the toolbar (56 pt tall:
+                    // 44 pt buttons + 6 pt padding each side). Takes no touches, and
+                    // sits outside the measured toolbar rect, so taps reach the game.
+                    if let toast = logToast {
+                        Text(toast)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.88)))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.10), lineWidth: 1))
+                            .padding(.top, geo.safeAreaInsets.top + 10 + 56 + 8)
+                            .padding(.trailing, geo.safeAreaInsets.trailing + 12)
+                            .allowsHitTesting(false)
+                            .transition(.opacity)
+                    }
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
@@ -6499,6 +6627,14 @@ struct TouchControlsOverlay: View {
         // ml827: the 4 s auto-hide ran out during the load; show the toolbar
         // when the game appears.
         .onChange(of: m.launchPanelUp) { _, up in if !up { showChrome() } }
+        // ml858: the save the toolbar asked for is done.
+        .onReceive(NotificationCenter.default.publisher(for: .madeiraLogSaved)) { note in
+            if let name = note.userInfo?["name"] as? String {
+                showLogToast("Saved: \(name)  ·  Files › Madeira › logs", for: 4)
+            } else {
+                showLogToast("No log to save")
+            }
+        }
     }
 
     private var topBar: some View {
@@ -6521,6 +6657,12 @@ struct TouchControlsOverlay: View {
             // pointer panel's ⌨ button and the touch-overlay action).
             glassButton("keyboard") {
                 MetalBackedView.toggleKeyboard()
+            }
+            // ml858: save this game's log to Documents/logs without leaving it —
+            // the moment a slowdown is happening is the moment worth saving.
+            glassButton("doc.text") {
+                showLogToast("Saving log…")
+                NotificationCenter.default.post(name: .madeiraSaveLog, object: nil)
             }
             if m.visible {
                 glassButton(m.editing ? "checkmark" : "pencil",

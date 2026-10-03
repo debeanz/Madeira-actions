@@ -2101,28 +2101,38 @@ private struct SheetRowStyle: ButtonStyle {
 enum GameLogSaver {
     /// The work runs off the main thread; `done` gets the saved file's name
     /// (without .txt) on the main thread, or nil when there was no log to save.
-    static func save(game: LauncherGame, done: @escaping (String?) -> Void) {
-        let header = "Madeira log — \(game.title)\n"
-            + "Saved \(Date().formatted(date: .abbreviated, time: .standard))"
+    /// ml859: `note` says what happened ("Celeste crashed") when that is known.
+    static func save(game: LauncherGame, note: String? = nil, done: @escaping (String?) -> Void) {
+        save(title: game.title, exe: game.exe, note: note, done: done)
+    }
+
+    /// ml858: the same for a run with no Games-tab game behind it — the in-game
+    /// toolbar in a Windows desktop session saves as "Desktop". No exe means no
+    /// Unity log, and no launch line means the current run.
+    static func save(title: String, exe: URL?, note: String? = nil, done: @escaping (String?) -> Void) {
+        let now = Date()
+        var header = "Madeira log — \(title)\n"
+            + "Saved \(now.formatted(date: .abbreviated, time: .standard))"
             + " · Madeira \(ContentView.appVersionText)"
             + " · \(deviceModel) · iOS \(UIDevice.current.systemVersion)\n"
+        if let note = note { header += "What happened: \(note)\n" }
         DispatchQueue.global(qos: .userInitiated).async {
-            let name = Self.write(game: game, header: header)
+            let name = Self.write(title: title, exe: exe, header: header, at: now)
             DispatchQueue.main.async {
                 if let name = name {
-                    LogStore.shared.log("Saved log for \(game.title): logs/\(name).txt")
+                    LogStore.shared.log("Saved log for \(title): logs/\(name).txt")
                 }
                 done(name)
             }
         }
     }
 
-    private static func write(game: LauncherGame, header: String) -> String? {
+    private static func write(title: String, exe: URL?, header: String, at date: Date) -> String? {
         let fm = FileManager.default
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let current = try? Data(contentsOf: docs.appendingPathComponent("madeira-log.txt"))
         let previous = try? Data(contentsOf: docs.appendingPathComponent("madeira-log.prev.txt"))
-        let marker = Data("Games: launching \(game.title) →".utf8)
+        let marker = Data("Games: launching \(title) →".utf8)
         let currentHasGame = current.map { $0.range(of: marker) != nil } ?? false
         let previousHasGame = previous.map { $0.range(of: marker) != nil } ?? false
         let usePrevious = !currentHasGame && previousHasGame
@@ -2134,21 +2144,21 @@ enum GameLogSaver {
             ? "the previous session (madeira-log.prev.txt) — Madeira was reopened after the game ran"
             : "this session (madeira-log.txt)") + "\n" + rule + "\n").utf8))
         out.append(log)
-        if let exe = game.exe, let unity = unityLog(exe: exe),
+        if let exe = exe, let unity = unityLog(exe: exe),
            let unityData = try? Data(contentsOf: unity), !unityData.isEmpty {
-            out.append(Data("\n\(rule)\n\(game.title)'s own Unity log (\(unity.lastPathComponent))\n\(rule)\n".utf8))
+            out.append(Data("\n\(rule)\n\(title)'s own Unity log (\(unity.lastPathComponent))\n\(rule)\n".utf8))
             out.append(unityData)
         }
 
         let dir = docs.appendingPathComponent("logs", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        let base = fileSafe(game.title)
+        // ml860: "<title> <n> (<yyyy-MM-dd HH.mm>).txt". n counts up per game, so
+        // "Celeste 3" stays the short way to name one; the date and time say when
+        // at a glance in the Files app.
+        let base = fileSafe(title)
         let existing = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-        let highest = existing.compactMap { file -> Int? in
-            guard file.hasPrefix(base + " "), file.hasSuffix(".txt") else { return nil }
-            return Int(file.dropFirst(base.count + 1).dropLast(4))
-        }.max() ?? 0
-        let name = "\(base) \(highest + 1)"
+        let highest = existing.compactMap { number(in: $0, base: base) }.max() ?? 0
+        let name = "\(base) \(highest + 1) (\(fileStamp.string(from: date)))"
         do {
             try out.write(to: dir.appendingPathComponent(name + ".txt"), options: .atomic)
         } catch {
@@ -2156,6 +2166,27 @@ enum GameLogSaver {
         }
         return name
     }
+
+    /// The n in "<base> <n> (<date>).txt", or in "<base> <n>.txt" (the shape
+    /// 0.1.121 saved), else nil. The number must be followed by exactly " (" or
+    /// ".txt", so a game called "Celeste 64" is never counted as Celeste's 64th log.
+    private static func number(in file: String, base: String) -> Int? {
+        guard file.hasPrefix(base + " "), file.hasSuffix(".txt") else { return nil }
+        let rest = file.dropFirst(base.count + 1)
+        let digits = rest.prefix { $0.isASCII && $0.isNumber }
+        guard !digits.isEmpty, let n = Int(digits) else { return nil }
+        let after = rest.dropFirst(digits.count)
+        return (after == ".txt" || after.hasPrefix(" (")) ? n : nil
+    }
+
+    /// "2026-10-03 14.05": sorts by date, 24-hour like the log's own timestamps,
+    /// and no colon, which the Files app does not allow in a name.
+    private static let fileStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH.mm"
+        return f
+    }()
 
     /// The newest Player.log / output_log.txt under any profile's
     /// AppData/LocalLow/<company>/<product>. Profiles disagree on the user name
