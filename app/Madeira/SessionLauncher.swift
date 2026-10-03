@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 // ============================================================================
 // Launch a program inside the running desktop session (ml791).
@@ -229,6 +230,146 @@ final class SessionLauncher {
                 Thread.sleep(forTimeInterval: 0.2)
             }
             DispatchQueue.main.async { completion(.noAnswer) }
+        }
+    }
+}
+
+// ============================================================================
+// ml876: a game's message box, shown as an alert.
+//
+// Nothing draws a game's GDI windows in a game session, so a MessageBox was
+// invisible and the game waited on it until the first-frame watchdog gave up
+// (Prince of Persia: The Two Thrones, 0.1.141). madeira-agent writes the
+// dialog to C:\madeira\dialog.txt (hwnd= / title= / text= lines / button=<id>
+// <label>, or closed=<hwnd> once it is gone); ContentView shows it, and the
+// button the user taps is written back to dialog-answer.txt for the agent to
+// press.
+// ============================================================================
+
+struct GameDialog: Identifiable, Equatable {
+    struct Choice: Equatable {
+        let id: Int
+        let label: String
+    }
+    /// The dialog's window handle, exactly as the agent wrote it.
+    let id: String
+    let title: String
+    let text: String
+    let choices: [Choice]
+}
+
+final class GameDialogs: ObservableObject {
+    static let shared = GameDialogs()
+
+    @Published private(set) var current: GameDialog?
+
+    /// Any thread: the launch watchdogs do not count time while a game waits
+    /// on its own dialog.
+    var isShowing: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return showing
+    }
+
+    private let lock = NSLock()
+    private var showing = false
+    private var lastText: String?
+    private var timer: Timer?
+    private var dir: URL { GameLibrary.driveC.appendingPathComponent("madeira") }
+
+    private init() {}
+
+    /// Main thread; idempotent. Two checks a second, only while Wine runs.
+    func start() {
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
+    }
+
+    /// The user's choice goes to the agent, which presses that button.
+    func answer(_ dialog: GameDialog, choice: Int) {
+        let fm = FileManager.default
+        let tmp = dir.appendingPathComponent("dialog-answer.tmp")
+        let url = dir.appendingPathComponent("dialog-answer.txt")
+        do {
+            try "hwnd=\(dialog.id)\r\nbutton=\(choice)\r\n".write(to: tmp, atomically: false, encoding: .utf8)
+            try? fm.removeItem(at: url)
+            try fm.moveItem(at: tmp, to: url)
+        } catch {
+            try? fm.removeItem(at: tmp)
+        }
+        let label = dialog.choices.first { $0.id == choice }?.label ?? "\(choice)"
+        LogStore.shared.log("[dialog] ml876 \"\(dialog.title)\": the user chose \(label)")
+        set(nil)
+    }
+
+    private func set(_ dialog: GameDialog?) {
+        lock.lock()
+        showing = dialog != nil
+        lock.unlock()
+        current = dialog
+    }
+
+    private func poll() {
+        guard wineserver_is_running() != 0,
+              let text = try? String(contentsOf: dir.appendingPathComponent("dialog.txt"), encoding: .utf8),
+              text != lastText else { return }
+        lastText = text
+        var hwnd = "", closed = "", title = ""
+        var lines: [String] = []
+        var choices: [GameDialog.Choice] = []
+        for raw in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            let line = String(raw)
+            if line.hasPrefix("hwnd=") { hwnd = String(line.dropFirst(5)) }
+            else if line.hasPrefix("closed=") { closed = String(line.dropFirst(7)) }
+            else if line.hasPrefix("title=") { title = String(line.dropFirst(6)) }
+            else if line.hasPrefix("text=") { lines.append(String(line.dropFirst(5))) }
+            else if line.hasPrefix("button=") {
+                let rest = line.dropFirst(7)
+                let parts = rest.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
+                if let id = parts.first.flatMap({ Int($0) }) {
+                    let label = parts.count > 1 ? String(parts[1]) : "OK"
+                    choices.append(GameDialog.Choice(id: id, label: label.isEmpty ? "OK" : label))
+                }
+            }
+        }
+        if !closed.isEmpty {
+            if current?.id == closed {
+                LogStore.shared.log("[dialog] ml876 the game closed its dialog itself")
+                set(nil)
+            }
+            return
+        }
+        guard !hwnd.isEmpty, hwnd != current?.id else { return }
+        if choices.isEmpty { choices = [GameDialog.Choice(id: 1, label: "OK")] }   // IDOK
+        let message = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let dialog = GameDialog(id: hwnd, title: title, text: message, choices: choices)
+        LogStore.shared.log("[dialog] ml876 the game shows \"\(title)\": \(message.replacingOccurrences(of: "\n", with: " / ")) "
+                            + "[\(choices.map(\.label).joined(separator: ", "))]")
+        set(dialog)
+    }
+}
+
+
+/// ml876: GameDialogs.current as an alert with the game's own buttons; the
+/// tapped one is pressed in the game. Title: the dialog's caption, else the game.
+struct GameDialogAlert: ViewModifier {
+    @ObservedObject var dialogs: GameDialogs
+    let fallbackTitle: String
+
+    func body(content: Content) -> some View {
+        let title = (dialogs.current?.title).flatMap { $0.isEmpty ? nil : $0 } ?? fallbackTitle
+        return content.alert(title,
+                             isPresented: Binding(get: { dialogs.current != nil }, set: { _ in }),
+                             presenting: dialogs.current) { dialog in
+            ForEach(dialog.choices, id: \.id) { choice in
+                Button(choice.label, role: choice.id == 2 ? ButtonRole.cancel : nil) {   // 2 = IDCANCEL
+                    dialogs.answer(dialog, choice: choice.id)
+                }
+            }
+        } message: { dialog in
+            Text(dialog.text)
         }
     }
 }

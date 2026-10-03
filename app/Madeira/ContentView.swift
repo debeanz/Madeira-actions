@@ -1439,6 +1439,7 @@ struct ContentView: View {
     // held. StikDebug is let go right after the pool, at startup.
     @State private var debuggerAttached = isDebuggerAttached() || StikJITHelper.poolReady
     @ObservedObject private var input = InputSettings.shared
+    @ObservedObject private var gameDialogs = GameDialogs.shared   // ml876
     @ObservedObject private var touchControls = TouchControlsModel.shared
     @ObservedObject private var gamepad = GamepadBridge.shared
     @State private var pointerPanel = false
@@ -1692,7 +1693,10 @@ struct ContentView: View {
             syncGamepadUIMode()
             // ml872: take the JIT pool while StikDebug is still attached.
             StikJITHelper.allocateEarly()
+            GameDialogs.shared.start()   // ml876
         }
+        // ml876: a game's own message box, which nothing else would show.
+        .modifier(GameDialogAlert(dialogs: gameDialogs, fallbackTitle: launchingGame?.title ?? "Game"))
         // ml872: and when coming back from StikDebug after Enable JIT.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             StikJITHelper.allocateEarly()
@@ -2100,7 +2104,9 @@ struct ContentView: View {
                 if c < base { base = c }          // new swapchain — re-baseline
                 if c >= base + 2 { drew = true; break }
                 Thread.sleep(forTimeInterval: 0.25)
-                waited += 0.25
+                // ml876: a game waiting on its own message box has not failed to
+                // start; the 60 s begin again once the user has answered it.
+                waited = GameDialogs.shared.isShowing ? 0 : waited + 0.25
             }
             // ml840: while the game's threads are still there, write every
             // thread's state to the log so a load-time hang names its holder.
@@ -2194,7 +2200,8 @@ struct ContentView: View {
                     lastCount = c
                     stalled = 0
                 } else {
-                    stalled += 0.5
+                    // ml876: a game stopped on its own dialog is waiting, not quitting.
+                    stalled = GameDialogs.shared.isShowing ? 0 : stalled + 0.5
                 }
                 let audioGone = sawAudio && live == 0
                 let quitting = done.quitRequested || audioGone

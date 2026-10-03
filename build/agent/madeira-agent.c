@@ -599,6 +599,168 @@ static void handle_devchange( void )
                arrival ? "arrival" : "removal", sent, silent );
 }
 
+/* ml876: A GAME'S MESSAGE BOX, SHOWN BY THE APP AS AN ALERT.
+ *
+ * In a game session nothing draws GDI windows -- the app shows what the game
+ * renders through Direct3D -- so a MessageBox was invisible, and the game sat
+ * waiting for a click nobody could give until the app's 60 s first-frame
+ * watchdog gave up: Prince of Persia: The Two Thrones (0.1.141) put up a
+ * one-line box with an OK button and never got past it.
+ *
+ * Each poll, the first visible dialog window (#32770 -- what MessageBox and
+ * DialogBox create) of a program we started is written to C:\madeira\dialog.txt
+ *     hwnd=0x1002c
+ *     title=<caption>
+ *     text=<a line of static text>          (one per line)
+ *     button=<control id> <label>           (one per push button)
+ * and when it goes away the file becomes "closed=0x1002c". The app answers in
+ * C:\madeira\dialog-answer.txt ("hwnd=0x1002c", "button=1") and the agent
+ * presses that button -- WM_COMMAND/BN_CLICKED, exactly what a click sends. */
+#define DIALOG_PATH        L"C:\\madeira\\dialog.txt"
+#define DIALOG_TMP_PATH    L"C:\\madeira\\dialog.tmp"
+#define DIALOG_ANSWER_PATH L"C:\\madeira\\dialog-answer.txt"
+#ifndef BS_TYPEMASK
+#define BS_TYPEMASK 0x0000000FL
+#endif
+static HWND g_dialog;   /* the dialog the app was told about; NULL = none */
+
+struct dialog_info { char text[4096]; char buttons[1024]; };
+
+static BOOL is_child_pid( DWORD pid )
+{
+    int i;
+    for (i = 0; i < g_child_n; i++) if (g_child_pid[i] == pid) return TRUE;
+    return FALSE;
+}
+
+static BOOL CALLBACK find_dialog_proc( HWND hwnd, LPARAM lp )
+{
+    WCHAR cls[16];
+    DWORD pid = 0;
+
+    if (!IsWindowVisible( hwnd )) return TRUE;
+    GetWindowThreadProcessId( hwnd, &pid );
+    if (!is_child_pid( pid )) return TRUE;
+    if (!GetClassNameW( hwnd, cls, ARRAYSIZE(cls) ) || lstrcmpiW( cls, L"#32770" )) return TRUE;
+    *(HWND *)lp = hwnd;
+    return FALSE;
+}
+
+/* Append "<key><line>\r\n" to `buf` for every line of `w`, as UTF-8. */
+static void append_lines( char *buf, size_t size, const char *key, const WCHAR *w )
+{
+    char utf8[4096], *line = utf8, *end;
+
+    if (WideCharToMultiByte( CP_UTF8, 0, w, -1, utf8, sizeof(utf8), NULL, NULL ) <= 0) return;
+    utf8[sizeof(utf8) - 1] = 0;
+    for (;;)
+    {
+        size_t used = strlen( buf );
+        char brk;
+
+        end = strpbrk( line, "\r\n" );
+        brk = end ? *end : 0;
+        if (end) *end = 0;
+        if (used + 1 < size) snprintf( buf + used, size - used, "%s%s\r\n", key, line );
+        if (!end) break;
+        line = end + 1;
+        if (brk == '\r' && *line == '\n') line++;
+    }
+}
+
+static BOOL CALLBACK dialog_child_proc( HWND child, LPARAM lp )
+{
+    struct dialog_info *info = (struct dialog_info *)lp;
+    WCHAR cls[32], label[1024];
+    LONG kind;
+    int i, j;
+
+    if (!IsWindowVisible( child ) || !GetClassNameW( child, cls, ARRAYSIZE(cls) )) return TRUE;
+    label[0] = 0;
+    GetWindowTextW( child, label, ARRAYSIZE(label) );
+    if (!label[0]) return TRUE;
+    if (!lstrcmpiW( cls, L"Static" ))
+        append_lines( info->text, sizeof(info->text), "text=", label );
+    else if (!lstrcmpiW( cls, L"Button" ))
+    {
+        kind = GetWindowLongW( child, GWL_STYLE ) & BS_TYPEMASK;
+        if (kind != BS_PUSHBUTTON && kind != BS_DEFPUSHBUTTON) return TRUE;
+        for (i = j = 0; label[i]; i++)   /* "&Yes" -> "Yes", "&&" -> "&" */
+        {
+            if (label[i] == '&')
+            {
+                if (label[i + 1] != '&') continue;
+                i++;
+            }
+            label[j++] = label[i];
+        }
+        label[j] = 0;
+        {
+            char key[32];
+            snprintf( key, sizeof(key), "button=%d ", GetDlgCtrlID( child ) );
+            append_lines( info->buttons, sizeof(info->buttons), key, label );
+        }
+    }
+    return TRUE;
+}
+
+static void relay_dialogs( void )
+{
+    static struct dialog_info info;
+    char out[6144];
+    WCHAR title[256];
+    HWND hwnd = NULL;
+    DWORD pid = 0;
+
+    if (g_dialog && (!IsWindow( g_dialog ) || !IsWindowVisible( g_dialog )))
+    {
+        snprintf( out, sizeof(out), "closed=0x%llx\r\n", (unsigned long long)(ULONG_PTR)g_dialog );
+        write_text_file( DIALOG_TMP_PATH, out );
+        MoveFileExW( DIALOG_TMP_PATH, DIALOG_PATH, MOVEFILE_REPLACE_EXISTING );
+        agent_log( "dialog 0x%llx closed", (unsigned long long)(ULONG_PTR)g_dialog );
+        g_dialog = NULL;
+    }
+    if (g_dialog || !g_child_n) return;
+    EnumWindows( find_dialog_proc, (LPARAM)&hwnd );
+    if (!hwnd) return;
+
+    g_dialog = hwnd;
+    GetWindowThreadProcessId( hwnd, &pid );
+    title[0] = 0;
+    GetWindowTextW( hwnd, title, ARRAYSIZE(title) );
+    memset( &info, 0, sizeof(info) );
+    EnumChildWindows( hwnd, dialog_child_proc, (LPARAM)&info );
+    snprintf( out, sizeof(out), "hwnd=0x%llx\r\n", (unsigned long long)(ULONG_PTR)hwnd );
+    append_lines( out, sizeof(out), "title=", title );
+    strncat( out, info.text, sizeof(out) - strlen( out ) - 1 );
+    strncat( out, info.buttons, sizeof(out) - strlen( out ) - 1 );
+    write_text_file( DIALOG_TMP_PATH, out );
+    MoveFileExW( DIALOG_TMP_PATH, DIALOG_PATH, MOVEFILE_REPLACE_EXISTING );
+    agent_log( "dialog 0x%llx from pid %lu, shown in the app:\n%s", (unsigned long long)(ULONG_PTR)hwnd,
+               (unsigned long)pid, out );
+}
+
+static void handle_dialog_answer( void )
+{
+    char *text = read_text_file( DIALOG_ANSWER_PATH );
+    char hv[32], bv[16];
+
+    DeleteFileW( DIALOG_ANSWER_PATH );
+    if (!text) return;
+    if (get_field( text, "hwnd", hv, sizeof(hv) ) && get_field( text, "button", bv, sizeof(bv) ))
+    {
+        HWND hwnd = (HWND)(ULONG_PTR)strtoull( hv, NULL, 16 );
+        int id = atoi( bv );
+        if (hwnd && hwnd == g_dialog && IsWindow( hwnd ))
+        {
+            PostMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
+            agent_log( "dialog %s: pressed button %d for the user", hv, id );
+        }
+        else agent_log( "dialog answer for %s ignored: that dialog is gone", hv );
+    }
+    HeapFree( GetProcessHeap(), 0, text );
+}
+
 int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
 {
     char ready[64];
@@ -608,6 +770,8 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
     DeleteFileW( REQUEST_PATH );
     DeleteFileW( RESULT_PATH );
     DeleteFileW( DEVCHANGE_PATH );   /* ml875: a notice from before this session */
+    DeleteFileW( DIALOG_PATH );      /* ml876: likewise a dialog and its answer */
+    DeleteFileW( DIALOG_ANSWER_PATH );
     agent_log( "madeira-agent started, pid=%lu, cmdline=%ls", (unsigned long)GetCurrentProcessId(), cmdline );
 
     /* ml803: in game mode there is no explorer, so nothing owns the win32
@@ -709,6 +873,8 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
         Sleep( 200 );
         if (GetFileAttributesW( REQUEST_PATH ) != INVALID_FILE_ATTRIBUTES) handle_request();
         if (GetFileAttributesW( DEVCHANGE_PATH ) != INVALID_FILE_ATTRIBUTES) handle_devchange();   /* ml875 */
+        if (GetFileAttributesW( DIALOG_ANSWER_PATH ) != INVALID_FILE_ATTRIBUTES) handle_dialog_answer();   /* ml876 */
+        if (g_child_n || g_dialog) relay_dialogs();
         if (g_child_n) reap_children();
     }
     return 0;
