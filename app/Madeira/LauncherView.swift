@@ -1224,6 +1224,8 @@ private struct OptionsSheet: View {
     @State private var folderBytes: Int64? = nil
     /// ml862: the game's folder size for the header; nil until measured off main.
     @State private var gameBytes: Int64? = nil
+    /// ml863: the Report Compatibility form, over this menu.
+    @State private var showReport: Bool = false
     /// ml857: Save Log in progress, then what it did ("Saved: Celeste (…)").
     @State private var savingLog: Bool = false
     @State private var saveLogResult: String? = nil
@@ -1343,6 +1345,10 @@ private struct OptionsSheet: View {
                                      saveLogResult = name.map { "Saved: \($0)" } ?? "No log to save"
                                  }
                              }))
+        // ml863: rate this game for the compatibility site, log attached.
+        out.append(OptionRow(id: "report", title: "Report Compatibility", systemImage: "paperplane",
+                             destructive: false, checked: false,
+                             action: { showReport = true }))
         out.append(deleteRow(g))
         return out
     }
@@ -1657,6 +1663,9 @@ private struct OptionsSheet: View {
         .background(LinearGradient(colors: [LauncherPalette.bgTop, LauncherPalette.bgBottom],
                                    startPoint: .top, endPoint: .bottom).ignoresSafeArea())
         .environment(\.colorScheme, .dark)
+        .sheet(isPresented: $showReport) {   // ml863
+            ReportSheet(game: current, note: nil) { showReport = false }
+        }
         .onAppear {
             configure(list.count)
             loadCacheSize()
@@ -2150,6 +2159,32 @@ enum GameLogSaver {
     private static func write(title: String, exe: URL?, header: String, at date: Date) -> String? {
         let fm = FileManager.default
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        guard let out = buildLog(title: title, exe: exe, header: header) else { return nil }
+
+        let dir = docs.appendingPathComponent("logs", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        // ml860: "<title> (yyyy-MM-dd HH.mm).txt" — the game and when, nothing
+        // else (the user dropped the per-game number). A second save in the same
+        // minute gets the seconds too, rather than replacing the first.
+        let base = fileSafe(title)
+        var name = "\(base) (\(fileStamp.string(from: date)))"
+        if fm.fileExists(atPath: dir.appendingPathComponent(name + ".txt").path) {
+            name = "\(base) (\(fileStampSeconds.string(from: date)))"
+        }
+        do {
+            try out.write(to: dir.appendingPathComponent(name + ".txt"), options: .atomic)
+        } catch {
+            return nil
+        }
+        return name
+    }
+
+    /// ml863: the log's content without writing it — the header, the session
+    /// this game last ran in, and its Unity log. Save Log writes it to a file;
+    /// Report Compatibility sends exactly the same bytes. Blocking (reads files).
+    static func buildLog(title: String, exe: URL?, header: String) -> Data? {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let current = try? Data(contentsOf: docs.appendingPathComponent("madeira-log.txt"))
         let previous = try? Data(contentsOf: docs.appendingPathComponent("madeira-log.prev.txt"))
         let marker = Data("Games: launching \(title) →".utf8)
@@ -2169,23 +2204,7 @@ enum GameLogSaver {
             out.append(Data("\n\(rule)\n\(title)'s own Unity log (\(unity.lastPathComponent))\n\(rule)\n".utf8))
             out.append(unityData)
         }
-
-        let dir = docs.appendingPathComponent("logs", isDirectory: true)
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        // ml860: "<title> (yyyy-MM-dd HH.mm).txt" — the game and when, nothing
-        // else (the user dropped the per-game number). A second save in the same
-        // minute gets the seconds too, rather than replacing the first.
-        let base = fileSafe(title)
-        var name = "\(base) (\(fileStamp.string(from: date)))"
-        if fm.fileExists(atPath: dir.appendingPathComponent(name + ".txt").path) {
-            name = "\(base) (\(fileStampSeconds.string(from: date)))"
-        }
-        do {
-            try out.write(to: dir.appendingPathComponent(name + ".txt"), options: .atomic)
-        } catch {
-            return nil
-        }
-        return name
+        return out
     }
 
     /// "2026-10-03 14.05": sorts by date, 24-hour like the log's own timestamps,
@@ -2229,7 +2248,7 @@ enum GameLogSaver {
 
     /// "iPhone16,1" — the model identifier, which is what matters for a GPU or
     /// memory question; the marketing name is not available without a table.
-    private static var deviceModel: String {
+    static var deviceModel: String {
         var u = utsname()
         uname(&u)
         return withUnsafeBytes(of: &u.machine) { raw in
@@ -2240,5 +2259,560 @@ enum GameLogSaver {
     /// A game title as a file name: path separators and colons become dashes.
     private static func fileSafe(_ s: String) -> String {
         String(s.map { "/\\:".contains($0) ? "-" : $0 })
+    }
+}
+
+// MARK: - Report Compatibility (ml863)
+
+/// ml863: reports for the compatibility site (docs/ on main), sent straight to
+/// its Supabase project. projectURL and anonKey are public by design — what they
+/// allow is fixed by supabase/schema.sql: file a report, read reports, upload
+/// (never read) a log. Empty until that project exists; the form then says so
+/// and will not send.
+enum ReportService {
+    static let projectURL = ""
+    static let anonKey = ""
+    static let siteURL = "https://debeanz.github.io/Madeira-actions/"
+
+    static var isConfigured: Bool { !projectURL.isEmpty && !anonKey.isEmpty }
+
+    struct Tier {
+        let id: String
+        let label: String
+        let blurb: String
+        let color: Color
+    }
+    /// The site's five ratings, ids as schema.sql checks them, colours as the site draws them.
+    static let tiers: [Tier] = [
+        Tier(id: "perfect", label: "Perfect", blurb: "Plays like it does on a PC.",
+             color: Color(red: 102.0 / 255.0, green: 192.0 / 255.0, blue: 244.0 / 255.0)),
+        Tier(id: "playable", label: "Playable", blurb: "Small problems that don't get in the way.",
+             color: Color(red: 76.0 / 255.0, green: 185.0 / 255.0, blue: 68.0 / 255.0)),
+        Tier(id: "runs", label: "Runs", blurb: "Reaches gameplay, with problems you notice.",
+             color: Color(red: 229.0 / 255.0, green: 181.0 / 255.0, blue: 59.0 / 255.0)),
+        Tier(id: "boots", label: "Boots", blurb: "Starts, but can't really be played.",
+             color: Color(red: 224.0 / 255.0, green: 122.0 / 255.0, blue: 53.0 / 255.0)),
+        Tier(id: "broken", label: "Broken", blurb: "Doesn't start, or crashes right away.",
+             color: Color(red: 229.0 / 255.0, green: 72.0 / 255.0, blue: 77.0 / 255.0)),
+    ]
+    struct Option: Hashable {
+        let id: String
+        let label: String
+    }
+    static let issueOptions: [Option] = [
+        Option(id: "crash", label: "Crashes"), Option(id: "slow", label: "Low frame rate"),
+        Option(id: "graphics", label: "Graphics glitches"), Option(id: "audio", label: "Audio problems"),
+        Option(id: "controls", label: "Controls"), Option(id: "video", label: "Videos don't play"),
+    ]
+    static let fpsOptions: [Option] = [
+        Option(id: "under-20", label: "Under 20"), Option(id: "20-30", label: "20–30"),
+        Option(id: "30-45", label: "30–45"), Option(id: "45-60", label: "45–60"), Option(id: "60", label: "60"),
+    ]
+
+    /// The site's page for a game. The database derives the same key from the
+    /// title: lowercase, every run of other characters one dash, none at the ends.
+    static func gameKey(_ title: String) -> String {
+        var out = ""
+        var dash = false
+        for u in title.lowercased().unicodeScalars {
+            if (u >= "a" && u <= "z") || (u >= "0" && u <= "9") {
+                out.unicodeScalars.append(u)
+                dash = false
+            } else if !dash {
+                out += "-"
+                dash = true
+            }
+        }
+        return out.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
+
+    static func pageURL(for title: String) -> URL? {
+        URL(string: siteURL + "game.html?g=" + gameKey(title))
+    }
+
+    /// A random id per install, which the database's rate limit counts reports
+    /// by. It is never shown on the site.
+    static var clientID: String {
+        let key = "madeira.reportClientID"
+        if let id = UserDefaults.standard.string(forKey: key) { return id }
+        let id = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(id, forKey: key)
+        return id
+    }
+
+    struct Draft {
+        var game: LauncherGame
+        var note: String?
+        var rating: String
+        var issues: [String]
+        var fps: String?
+        var text: String
+        var includeLog: Bool
+        var settings: [String: Any]
+        var ios: String
+    }
+
+    enum Failure: LocalizedError {
+        case notConfigured
+        case server(String)
+        var errorDescription: String? {
+            switch self {
+            case .notConfigured: return "Reporting isn't connected in this build yet."
+            case .server(let message): return message
+            }
+        }
+    }
+
+    /// Uploads the log first, so the report can say whether it has one; a log
+    /// that fails to upload does not stop the report. Returns whether it made it.
+    static func send(_ d: Draft) async throws -> Bool {
+        guard isConfigured else { throw Failure.notConfigured }
+        let id = UUID().uuidString.lowercased()
+        let version = ContentView.appVersionText
+        let device = GameLogSaver.deviceModel
+
+        var hasLog = false
+        if d.includeLog {
+            var header = "Madeira report \(id) — \(d.game.title)\n"
+                + "Sent \(Date().formatted(date: .abbreviated, time: .standard)) · Madeira \(version)"
+                + " · \(device) · iOS \(d.ios)\n"
+                + "Rating: \(d.rating)"
+                + (d.issues.isEmpty ? "" : " · Issues: " + d.issues.joined(separator: ", "))
+                + "\n"
+            if let note = d.note { header += "What happened: \(note)\n" }
+            if let log = GameLogSaver.buildLog(title: d.game.title, exe: d.game.exe, header: header),
+               let gz = gzip(log) {
+                do {
+                    try await post("/storage/v1/object/logs/\(id).txt.gz", body: gz,
+                                   contentType: "application/gzip", headers: ["x-upsert": "false"])
+                    hasLog = true
+                } catch {
+                    hasLog = false   // the report still goes; the site shows no log
+                }
+            }
+        }
+
+        var arch: String? = nil
+        if let exe = d.game.exe, let machine = PEResources.machine(of: exe) {
+            if machine == PEResources.machineI386 { arch = "x86" }
+            else if machine == PEResources.machineAMD64 { arch = "x64" }
+        }
+        var row: [String: Any] = [
+            "id": id,
+            "game": String(d.game.title.prefix(120)),
+            "rating": d.rating,
+            "issues": d.issues,
+            "description": String(d.text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2000)),
+            "madeira_version": String(version.prefix(80)),
+            "device": String(device.prefix(40)),
+            "ios": String(d.ios.prefix(20)),
+            "settings": d.settings,
+            "has_log": hasLog,
+            "client_id": clientID,
+        ]
+        if let steam = d.game.steamAppID { row["steam_app_id"] = steam }
+        if let fps = d.fps { row["fps"] = fps }
+        if let arch = arch { row["arch"] = arch }
+        let body = try JSONSerialization.data(withJSONObject: row)
+        try await post("/rest/v1/reports", body: body, contentType: "application/json",
+                       headers: ["Prefer": "return=minimal"])
+        return hasLog
+    }
+
+    private static func post(_ path: String, body: Data, contentType: String,
+                             headers: [String: String]) async throws {
+        let base = projectURL.hasSuffix("/") ? String(projectURL.dropLast()) : projectURL
+        guard let url = URL(string: base + path) else {
+            throw Failure.server("The report address is not valid.")
+        }
+        var request = URLRequest(url: url, timeoutInterval: 90)
+        request.httpMethod = "POST"
+        request.setValue(anonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(anonKey)", forHTTPHeaderField: "Authorization")
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        let (data, response) = try await URLSession.shared.upload(for: request, from: body)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let message = (json?["message"] as? String) ?? (json?["error"] as? String)
+            throw Failure.server(message ?? "The server answered \(status).")
+        }
+    }
+
+    /// gzip around Foundation's raw DEFLATE (.zlib there is RFC 1951 with no
+    /// header): a log shrinks about tenfold, and Windows opens .gz itself.
+    static func gzip(_ data: Data) -> Data? {
+        guard let deflated = try? (data as NSData).compressed(using: .zlib) as Data else { return nil }
+        var out = Data([0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03])
+        out.append(deflated)
+        var crc = crc32(data).littleEndian
+        var size = UInt32(truncatingIfNeeded: data.count).littleEndian
+        withUnsafeBytes(of: &crc) { out.append(contentsOf: $0) }
+        withUnsafeBytes(of: &size) { out.append(contentsOf: $0) }
+        return out
+    }
+
+    private static let crcTable: [UInt32] = (0..<256).map { (i: Int) -> UInt32 in
+        var c = UInt32(i)
+        for _ in 0..<8 { c = (c & 1) != 0 ? (0xEDB8_8320 ^ (c >> 1)) : (c >> 1) }
+        return c
+    }
+
+    static func crc32(_ data: Data) -> UInt32 {
+        let table = crcTable
+        var c: UInt32 = 0xFFFF_FFFF
+        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            for b in buf { c = table[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8) }
+        }
+        return c ^ 0xFFFF_FFFF
+    }
+}
+
+/// ml863: the Report Compatibility form. The game, build, device, iOS and the
+/// game's settings fill themselves in; the player picks how it runs and what
+/// went wrong, and says what happened. Touch only — it has a text field — so
+/// the controller is held off the screens behind it while it is up.
+struct ReportSheet: View {
+    let game: LauncherGame
+    /// "Celeste crashed" when the crash alert opened it.
+    let note: String?
+    let close: () -> Void
+
+    private enum Phase: Equatable { case editing, sending, sent(logAttached: Bool), failed(String) }
+    private final class PadToken {}
+
+    @State private var rating: String? = nil
+    @State private var issues: Set<String>
+    @State private var fps: String? = nil
+    @State private var text = ""
+    @State private var includeLog = true
+    @State private var phase: Phase = .editing
+    @State private var settings: [String: Any] = [:]
+    @State private var autoLine = ""
+    @State private var pad = PadToken()
+    @State private var savedPadHandler: ((GamepadNavAction) -> Void)? = nil
+    @State private var savedPadOwner: AnyObject? = nil
+    @FocusState private var textFocused: Bool
+    @Environment(\.openURL) private var openURL
+
+    init(game: LauncherGame, note: String?, presetIssues: Set<String> = [], close: @escaping () -> Void) {
+        self.game = game
+        self.note = note
+        self.close = close
+        _issues = State(initialValue: presetIssues)
+    }
+
+    private var isSent: Bool { if case .sent = phase { return true } else { return false } }
+    private var isSending: Bool { phase == .sending }
+    private var canSend: Bool { ReportService.isConfigured && rating != nil && !isSending && !isSent }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 26) {
+                    header
+                    if case .sent(let logAttached) = phase {
+                        sentView(logAttached: logAttached)
+                    } else {
+                        if !ReportService.isConfigured { notConnected }
+                        form
+                    }
+                }
+                .padding(20)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .background(LinearGradient(colors: [LauncherPalette.bgTop, LauncherPalette.bgBottom],
+                                       startPoint: .top, endPoint: .bottom).ignoresSafeArea())
+            .navigationTitle("Report Compatibility")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(isSent ? "Done" : "Cancel") { close() }
+                        .disabled(isSending)
+                }
+            }
+        }
+        .environment(\.colorScheme, .dark)
+        .interactiveDismissDisabled(isSending)
+        .onAppear {
+            gatherAutomaticInfo()
+            takePad()
+        }
+        .onDisappear { releasePad() }
+        .onChange(of: text) { _, new in
+            if new.count > 2000 { text = String(new.prefix(2000)) }
+        }
+    }
+
+    // MARK: Pieces
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(game.title)
+                .font(.title2.weight(.bold))
+                .foregroundStyle(.white)
+            if let note = note {
+                Text(note)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(LauncherPalette.danger)
+            }
+            Text(autoLine)
+                .font(.caption)
+                .foregroundStyle(LauncherPalette.textSecondary)
+        }
+    }
+
+    private var notConnected: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.orange)
+            Text("Reporting isn't connected in this build yet, so a report can't be sent. Save Log still keeps a copy.")
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.85))
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.orange.opacity(0.12)))
+    }
+
+    private var form: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            section("How does it run?") {
+                VStack(spacing: 8) {
+                    ForEach(ReportService.tiers, id: \.id) { tier in tierRow(tier) }
+                }
+            }
+            section("What went wrong?", hint: "Pick any that apply.") {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
+                    ForEach(ReportService.issueOptions, id: \.id) { option in
+                        chip(option.label, on: issues.contains(option.id)) {
+                            if issues.contains(option.id) { issues.remove(option.id) } else { issues.insert(option.id) }
+                        }
+                    }
+                }
+            }
+            section("Frame rate", hint: "Roughly, in fps — skip it if you're not sure.") {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 84), spacing: 8)], spacing: 8) {
+                    ForEach(ReportService.fpsOptions, id: \.id) { option in
+                        chip(option.label, on: fps == option.id) {
+                            fps = (fps == option.id) ? nil : option.id
+                        }
+                    }
+                }
+            }
+            section("What happened?") {
+                ZStack(alignment: .topLeading) {
+                    if text.isEmpty {
+                        Text("Where it crashed, what looks wrong, which settings helped…")
+                            .foregroundStyle(.white.opacity(0.35))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 8)
+                            .allowsHitTesting(false)
+                    }
+                    TextEditor(text: $text)
+                        .focused($textFocused)
+                        .scrollContentBackground(.hidden)
+                        .foregroundStyle(.white)
+                        .frame(minHeight: 130)
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(LauncherPalette.panel))
+                Text("\(text.count) / 2000")
+                    .font(.caption2)
+                    .foregroundStyle(LauncherPalette.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            Toggle(isOn: $includeLog) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Attach the log")
+                        .foregroundStyle(.white)
+                    Text("Only the developer can see it — it contains file paths from your phone.")
+                        .font(.caption)
+                        .foregroundStyle(LauncherPalette.textSecondary)
+                }
+            }
+            .tint(LauncherPalette.accent)
+
+            if case .failed(let message) = phase {
+                Text(message)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(LauncherPalette.danger)
+            }
+
+            Button { send() } label: {
+                HStack(spacing: 10) {
+                    if isSending { ProgressView().tint(.white) }
+                    Text(isSending ? "Sending…" : "Send Report")
+                        .font(.headline)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+                .foregroundStyle(.white)
+                .background(Capsule().fill(canSend || isSending ? LauncherPalette.accent : Color.white.opacity(0.12)))
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSend)
+
+            Text(rating == nil
+                 ? "Pick how it runs to send. The report is public on the compatibility site: the rating, what you wrote, your device model, iOS version and the game's settings."
+                 : "The report is public on the compatibility site: the rating, what you wrote, your device model, iOS version and the game's settings.")
+                .font(.caption)
+                .foregroundStyle(LauncherPalette.textSecondary)
+        }
+    }
+
+    private func sentView(logAttached: Bool) -> some View {
+        VStack(spacing: 14) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 56))
+                .foregroundStyle(LauncherPalette.play)
+            Text("Thanks — your report is in.")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
+            Text(logAttached ? "It's on the compatibility site now."
+                             : "It's on the compatibility site, but the log couldn't be attached.")
+                .font(.subheadline)
+                .foregroundStyle(LauncherPalette.textSecondary)
+                .multilineTextAlignment(.center)
+            if let url = ReportService.pageURL(for: game.title) {
+                Button { openURL(url) } label: {
+                    Label("See \(game.title) on the site", systemImage: "safari")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 48)
+                        .foregroundStyle(.white)
+                        .background(Capsule().fill(LauncherPalette.accent))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 8)
+            }
+            Button("Done") { close() }
+                .foregroundStyle(LauncherPalette.accent)
+                .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 24)
+    }
+
+    private func section<Content: View>(_ title: String, hint: String? = nil,
+                                        @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                if let hint = hint {
+                    Text(hint)
+                        .font(.caption)
+                        .foregroundStyle(LauncherPalette.textSecondary)
+                }
+            }
+            content()
+        }
+    }
+
+    private func tierRow(_ tier: ReportService.Tier) -> some View {
+        let on: Bool = rating == tier.id
+        return Button { rating = tier.id } label: {
+            HStack(spacing: 12) {
+                Circle().fill(tier.color).frame(width: 10, height: 10)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(tier.label)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.white)
+                    Text(tier.blurb)
+                        .font(.footnote)
+                        .foregroundStyle(LauncherPalette.textSecondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(on ? tier.color : Color.white.opacity(0.25))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(on ? tier.color.opacity(0.14) : LauncherPalette.panel))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(on ? tier.color.opacity(0.7) : Color.white.opacity(0.06), lineWidth: 1.5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func chip(_ label: String, on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(on ? Color.white : Color.white.opacity(0.75))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(on ? LauncherPalette.accent.opacity(0.28) : LauncherPalette.panel))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(on ? LauncherPalette.accent : Color.white.opacity(0.06), lineWidth: 1.5))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: Behaviour
+
+    /// Main thread: the game's own settings, else Settings' defaults — what it
+    /// actually ran with.
+    private func gatherAutomaticInfo() {
+        let s = GameLibrary.shared.settings(for: game.id)
+        let resolution = s.resolution ?? (UserDefaults.standard.string(forKey: "madeira.desktopResolution") ?? "960x540")
+        let noTSO = s.noTSO ?? UserDefaults.standard.bool(forKey: "madeira.fexNoTSO")
+        let cap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
+        settings = ["resolution": resolution, "x86MemoryOrdering": !noTSO, "frameCap": cap.label]
+        let version = ContentView.appVersionText.split(separator: " ").first.map(String.init) ?? ContentView.appVersionText
+        autoLine = "Madeira \(version) · \(GameLogSaver.deviceModel) · iOS \(UIDevice.current.systemVersion) · "
+            + resolution.replacingOccurrences(of: "x", with: "×")
+    }
+
+    private func send() {
+        guard let rating = rating, canSend else { return }
+        textFocused = false
+        phase = .sending
+        let draft = ReportService.Draft(
+            game: game, note: note, rating: rating,
+            issues: ReportService.issueOptions.map { $0.id }.filter { issues.contains($0) },
+            fps: fps, text: text, includeLog: includeLog, settings: settings,
+            ios: UIDevice.current.systemVersion)
+        let title = game.title
+        let wantedLog = includeLog
+        Task {
+            do {
+                let logged = try await ReportService.send(draft)
+                await MainActor.run {
+                    phase = .sent(logAttached: logged || !wantedLog)
+                    LogStore.shared.log("Report Compatibility: sent for \(title) (\(rating), log \(logged ? "attached" : "not attached"))")
+                }
+            } catch {
+                await MainActor.run { phase = .failed(error.localizedDescription) }
+            }
+        }
+    }
+
+    /// The Games tab answers the controller through GamesFocus's overlay hook.
+    /// Hold it while the form is up: B leaves, nothing else reaches the rows or
+    /// the grid behind it, and the previous owner gets it back afterwards.
+    private func takePad() {
+        let focus = GamesFocus.shared
+        savedPadHandler = focus.overlayHandler
+        savedPadOwner = focus.overlayOwner
+        focus.overlayOwner = pad
+        let leave = close
+        focus.overlayHandler = { action in
+            if action == .back { leave() }
+        }
+    }
+
+    private func releasePad() {
+        let focus = GamesFocus.shared
+        guard focus.overlayOwner === pad else { return }
+        focus.overlayHandler = savedPadHandler
+        focus.overlayOwner = savedPadOwner
     }
 }

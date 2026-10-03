@@ -1514,6 +1514,17 @@ struct ContentView: View {
     /// ml859: what saving it did ("Log saved as Celeste (…) …"), shown at the top
     /// of the restart alert that follows.
     @State private var crashLogResult: String? = nil
+    /// ml863: the Report Compatibility form over the Games tab — opened from the
+    /// crash alert or the in-game ⋯ menu (the Games tab's own ⋯ opens its own).
+    private struct ReportRequest: Identifiable {
+        let id = UUID()
+        let game: LauncherGame
+        let note: String?
+        let preset: Set<String>
+    }
+    @State private var reportRequest: ReportRequest? = nil
+    /// ml863: the form came from the crash alert, so the restart advice follows it.
+    @State private var adviseAfterReport = false
     @State private var showActivityLogs = false
     @State private var showRuntimeStatus = false
     @State private var prefixSizeText = "Calculating…"
@@ -1640,10 +1651,22 @@ struct ContentView: View {
                                     set: { if !$0 { crashLogGame = nil } }),
                presenting: crashLogGame) { game in
             Button("Save Log") { saveCrashLog(game) }
+            Button("Report Compatibility") { reportCrash(game) }   // ml863
             Button("Not Now", role: .cancel) { recommendRestartAfterGame() }
         } message: { _ in
-            Text("Save a log of what happened so the problem can be looked at? It goes to "
-                 + "Files › Madeira › logs, named after the game and the date.")
+            Text("Save a log of what happened, or report it with the log so the game can be fixed. "
+                 + "Saved logs go to Files › Madeira › logs, named after the game and the date.")
+        }
+        .sheet(item: $reportRequest, onDismiss: {
+            // ml863: after a crash, the restart advice still comes — once the form is gone.
+            if adviseAfterReport {
+                adviseAfterReport = false
+                recommendRestartAfterGame()
+            }
+        }) { request in
+            ReportSheet(game: request.game, note: request.note, presetIssues: request.preset) {
+                reportRequest = nil
+            }
         }
         .alert("Restart Madeira before your next game", isPresented: $showRestartAfterGameAlert) {
             Button("Close Madeira", role: .destructive) { quitApp() }
@@ -1732,6 +1755,17 @@ struct ContentView: View {
         // never on the crash offer (ml859).
         .onReceive(NotificationCenter.default.publisher(for: .madeiraCloseGame)) { _ in
             forceCloseGame()
+        }
+        // ml863: the in-game ⋯ menu's Report Compatibility. Leave the game view
+        // first, as ✕ does (the game keeps running): a sheet from the app window
+        // would sit under the touch-controls window (+101), which owns the
+        // toolbar and the controls. Then open the form over the Games tab.
+        .onReceive(NotificationCenter.default.publisher(for: .madeiraReportGame)) { _ in
+            guard let game = launchingGame else { return }
+            NotificationCenter.default.post(name: Notification.Name("MadeiraExitFullScreen"), object: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                reportRequest = ReportRequest(game: game, note: nil, preset: [])
+            }
         }
         // ml861: which game the toolbar ⋯ menu can close.
         .onChange(of: launcherSession, initial: true) { _, s in
@@ -2482,6 +2516,19 @@ struct ContentView: View {
             + "crashes, close Madeira and reopen it before playing again."
         guard let result = crashLogResult else { return advice }
         return result + "\n\n" + advice
+    }
+
+    /// ml863: the crash alert's Report Compatibility. The alert is still animating
+    /// away, so the form waits a moment before it opens (presenting over a closing
+    /// alert can fail silently); the restart advice follows when it closes. A
+    /// crash pre-ticks "Crashes" — a hang or a failed start does not.
+    private func reportCrash(_ game: LauncherGame) {
+        let headline = crashLogTitle
+        let preset: Set<String> = headline.hasSuffix(" crashed") ? ["crash"] : []
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            adviseAfterReport = true
+            reportRequest = ReportRequest(game: game, note: headline, preset: preset)
+        }
     }
 
     private func saveCrashLog(_ game: LauncherGame) {
@@ -6519,6 +6566,8 @@ extension Notification.Name {
     /// ml861: the toolbar ⋯ menu's "Close <game>": the same force close as the
     /// Games tab's ⋯ → Force close.
     static let madeiraCloseGame = Notification.Name("MadeiraCloseGame")
+    /// ml863: the toolbar ⋯ menu's "Report Compatibility" for the running game.
+    static let madeiraReportGame = Notification.Name("MadeiraReportGame")
 }
 
 struct TouchControlsOverlay: View {
@@ -6756,6 +6805,11 @@ struct TouchControlsOverlay: View {
                 NotificationCenter.default.post(name: .madeiraSaveLog, object: nil)
             }
             if let title = m.gameTitle {
+                Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+                // ml863: opens over the Games tab — see the .madeiraReportGame handler.
+                menuRow("Report Compatibility", system: "paperplane") {
+                    NotificationCenter.default.post(name: .madeiraReportGame, object: nil)
+                }
                 Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
                 menuRow("Close \(title)", system: "xmark.octagon", destructive: true) {
                     NotificationCenter.default.post(name: .madeiraCloseGame, object: nil)
