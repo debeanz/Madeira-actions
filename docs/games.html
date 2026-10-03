@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Compatibility — Madeira</title>
+  <meta name="description" content="Which Windows games run on Madeira, reported by players from inside the app.">
+  <meta name="theme-color" content="#0e1117">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="config.js" defer></script>
+  <script src="assets/site.js" defer></script>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="favicon.svg" alt="">Madeira</a>
+    <nav class="nav-links" aria-label="Main">
+      <a href="games.html" aria-current="page">Compatibility</a>
+      <a class="hide-s" href="./#how">How it works</a>
+      <a class="hide-s" href="./#install">Install</a>
+      <a class="nav-gh" href="https://github.com/debeanz/Madeira-actions">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="page-head">
+    <div class="wrap">
+      <span class="eyebrow reveal">Compatibility</span>
+      <h1 class="reveal" style="--d:1">What runs on Madeira</h1>
+      <p class="section-lede reveal" style="--d:2">
+        Reports sent from the app by people playing these games, with the build,
+        device and settings they used. A game's rating is the one most of its
+        reports agree on.
+      </p>
+      <div class="legend">
+        <div class="reveal" style="--d:2"><span class="rating r-perfect">Perfect</span><p>Plays like it does on a PC.</p></div>
+        <div class="reveal" style="--d:3"><span class="rating r-playable">Playable</span><p>Small problems that don't get in the way.</p></div>
+        <div class="reveal" style="--d:4"><span class="rating r-runs">Runs</span><p>Reaches gameplay, with problems you notice.</p></div>
+        <div class="reveal" style="--d:5"><span class="rating r-boots">Boots</span><p>Starts, but can't really be played.</p></div>
+        <div class="reveal" style="--d:6"><span class="rating r-broken">Broken</span><p>Doesn't start, or crashes right away.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="filters">
+        <label class="search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+          <span class="sr-only">Search games</span>
+          <input id="q" type="search" placeholder="Search games" autocomplete="off" spellcheck="false">
+        </label>
+        <button class="toggle r-perfect" data-r="perfect" aria-pressed="false">Perfect</button>
+        <button class="toggle r-playable" data-r="playable" aria-pressed="false">Playable</button>
+        <button class="toggle r-runs" data-r="runs" aria-pressed="false">Runs</button>
+        <button class="toggle r-boots" data-r="boots" aria-pressed="false">Boots</button>
+        <button class="toggle r-broken" data-r="broken" aria-pressed="false">Broken</button>
+        <label class="sr-only" for="sort">Sort</label>
+        <select id="sort" class="select">
+          <option value="recent">Recently reported</option>
+          <option value="reports">Most reports</option>
+          <option value="name">A–Z</option>
+        </select>
+        <span id="count" class="result-count" aria-live="polite"></span>
+      </div>
+      <div id="games"></div>
+    </div>
+  </section>
+
+  <section class="section tight">
+    <div class="wrap">
+      <div class="notice reveal">
+        <h3>Add a report</h3>
+        <p>In Madeira, open a game's ⋯ menu — on the Games tab, or from the toolbar while you play — and choose <b>Report Compatibility</b>. The game's name, your device and the build fill themselves in; you pick a rating and say what happened.</p>
+        <p>If a game crashes, Madeira offers to report it right then.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <a class="brand" href="./" style="font-size:15px"><img src="favicon.svg" alt="" style="width:22px;height:22px;border-radius:6px">Madeira</a>
+    <a href="./">Home</a>
+    <a href="https://github.com/debeanz/Madeira-actions">GitHub</a>
+    <span class="spacer"></span>
+    <span>Not affiliated with Microsoft, Valve or Apple. Game names and artwork belong to their owners. © <span id="year">2026</span></span>
+  </div>
+</footer>
+
+</body>
+</html>

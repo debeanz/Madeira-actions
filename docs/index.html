@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Madeira — Windows games on iPhone</title>
+  <meta name="description" content="Madeira runs Windows PC games on a non-jailbroken iPhone, with Wine, FEX and DXMT in one app. See which games run, reported by players.">
+  <meta name="theme-color" content="#0e1117">
+  <meta property="og:title" content="Madeira — Windows games on iPhone">
+  <meta property="og:description" content="Wine, FEX and DXMT in one iOS app. See which games run, reported by players.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="config.js" defer></script>
+  <script src="assets/site.js" defer></script>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="favicon.svg" alt="">Madeira</a>
+    <nav class="nav-links" aria-label="Main">
+      <a href="games.html">Compatibility</a>
+      <a class="hide-s" href="#how">How it works</a>
+      <a class="hide-s" href="#install">Install</a>
+      <a class="nav-gh" href="https://github.com/debeanz/Madeira-actions">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- ── Hero ─────────────────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <span class="tag"><span class="dot"></span><b>New</b> 32-bit games run too</span>
+        <h1>
+          <span class="line"><span>Windows games.</span></span>
+          <span class="line"><span>On your iPhone.</span></span>
+        </h1>
+        <p class="lede">
+          Madeira runs PC games inside one iOS app. Wine stands in for Windows,
+          FEX translates the game's x86 code to ARM64 as it runs, and DXMT turns
+          Direct3D into Metal. No jailbreak: you sideload it and let a debugger
+          switch on JIT.
+        </p>
+        <div class="cta">
+          <a class="btn btn-play" href="games.html">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/></svg>
+            See what runs
+          </a>
+          <a class="btn btn-ghost" href="#install">Install guide</a>
+        </div>
+        <p class="fineprint">A research project — free and open source (GPL-3.0). Expect rough edges and per-game quirks.</p>
+      </div>
+
+      <div class="device-stage" aria-hidden="true">
+        <div class="device">
+          <div class="device-screen">
+            <div class="lib">
+              <div class="lib-head">
+                <b>Games</b><span>7 games</span>
+                <span class="lib-pad"><i>A</i> Play <i>Y</i> Add game</span>
+              </div>
+              <div class="lib-row">
+                <div class="lib-track">
+                  <figure class="tile" data-title="Thumper" data-steam="356400" data-sub="Last played 2 hours ago"></figure>
+                  <figure class="tile" data-title="Untitled Goose Game" data-steam="837470" data-sub="Last played yesterday"></figure>
+                  <figure class="tile" data-title="ULTRAKILL" data-steam="1229490" data-sub="Last played 3 days ago"></figure>
+                  <figure class="tile" data-title="Undertale" data-steam="391540" data-sub="32-bit · Last played today"></figure>
+                  <figure class="tile" data-title="Rhythm Doctor" data-steam="774181" data-sub="Last played last week"></figure>
+                  <figure class="tile" data-title="Enter the Gungeon" data-steam="311690" data-sub="Last played 2 weeks ago"></figure>
+                  <figure class="tile" data-title="OneShot: World Machine Edition" data-steam="2915460" data-sub="Last played last month"></figure>
+                </div>
+              </div>
+              <div class="lib-card">
+                <div class="meta"><div class="t">Thumper</div><div class="s">Last played 2 hours ago</div></div>
+                <span class="lib-play">
+                  <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/></svg>
+                  Play
+                </span>
+              </div>
+            </div>
+            <div class="lib-dock"><span class="on">Games</span><span>Containers</span><span>Desktop</span><span>Settings</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── How it works ─────────────────────────────────────────────────── -->
+  <section class="section" id="how">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">How it works</span>
+        <h2 class="h2">From a Windows .exe to the iPhone's GPU</h2>
+        <p class="section-lede">
+          All of it runs inside the one app. Even Wine's server is a thread rather
+          than a separate process, because an iOS app can't start processes of its own.
+        </p>
+      </div>
+
+      <div class="pipe">
+        <div class="pipe-line"></div>
+        <div class="pipe-node reveal" style="--i:0;--d:0">
+          <div class="pipe-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 8.5h18M6.5 6.25h.01M9 6.25h.01"/></svg></div>
+          <div><span class="pipe-k">Game</span><h3>Your .exe</h3><p>The Windows build you already own — 64-bit or 32-bit.</p></div>
+        </div>
+        <div class="pipe-node reveal" style="--i:1;--d:1">
+          <div class="pipe-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h10l-.9 7.2A4.2 4.2 0 0 1 12 14a4.2 4.2 0 0 1-4.1-3.8z"/><path d="M12 14v6M8.5 21h7"/></svg></div>
+          <div><span class="pipe-k">Windows</span><h3>Wine</h3><p>Stands in for Windows, built for ARM64EC: files, windows, input and sound.</p></div>
+        </div>
+        <div class="pipe-node reveal" style="--i:2;--d:2">
+          <div class="pipe-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9.5 3v3M14.5 3v3M9.5 18v3M14.5 18v3M3 9.5h3M3 14.5h3M18 9.5h3M18 14.5h3"/><path d="M10 12h4m-1.5-1.5L14 12l-1.5 1.5"/></svg></div>
+          <div><span class="pipe-k">CPU</span><h3>FEX</h3><p>Translates the game's x86 code to ARM64 as it runs, so it executes natively.</p></div>
+        </div>
+        <div class="pipe-node reveal" style="--i:3;--d:3">
+          <div class="pipe-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg></div>
+          <div><span class="pipe-k">Graphics</span><h3>DXMT</h3><p>Turns Direct3D 11 into Metal — and Direct3D 9, for 32-bit games.</p></div>
+        </div>
+        <div class="pipe-node reveal" style="--i:4;--d:4">
+          <div class="pipe-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6.5" width="19" height="11" rx="2.6"/><path d="M5.2 10.5v3"/></svg></div>
+          <div><span class="pipe-k">Device</span><h3>Your iPhone</h3><p>Metal draws the frame. Touch, controllers and audio flow back to the game.</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Features ─────────────────────────────────────────────────────── -->
+  <section class="section" id="features" style="padding-top:24px">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">In the app</span>
+        <h2 class="h2">Built for playing, not for poking at Windows</h2>
+        <p class="section-lede">Madeira opens on your games, not on a desktop. Here's what's there once you're in.</p>
+      </div>
+
+      <div class="features">
+        <article class="feature reveal" style="--d:0">
+          <div class="mini">
+            <div class="mini-rows" style="width:90%;grid-template-columns:repeat(3,1fr);gap:8px">
+              <div class="cover" style="border-radius:8px"><div class="ph" style="font-size:10px;padding:6px;background:linear-gradient(135deg,hsl(212 37.9% 39.9%),hsl(212 48.1% 14.9%))">Thumper</div></div>
+              <div class="cover" style="border-radius:8px;box-shadow:0 0 0 2px #fff,0 0 0 4px var(--accent);transform:scale(1.08)"><div class="ph" style="font-size:10px;padding:6px;background:linear-gradient(135deg,hsl(96 37.9% 39.9%),hsl(96 48.1% 14.9%))">Goose</div></div>
+              <div class="cover" style="border-radius:8px"><div class="ph" style="font-size:10px;padding:6px;background:linear-gradient(135deg,hsl(352 37.9% 39.9%),hsl(352 48.1% 14.9%))">Undertale</div></div>
+            </div>
+          </div>
+          <h3>A library, not a desktop</h3>
+          <p>Games launch from a cover grid with their Steam artwork, the way a console works. Quit one and you're back in your library.</p>
+        </article>
+
+        <article class="feature reveal" style="--d:1">
+          <div class="mini">
+            <div class="mini-rows">
+              <div class="mini-row focus">Resolution <b>1280×720</b></div>
+              <div class="mini-row">Skip x86 memory-ordering <b>Off</b></div>
+              <div class="mini-row">Frame rate cap <b>60</b></div>
+            </div>
+          </div>
+          <h3>Settings for each game</h3>
+          <p>Resolution, x86 memory-ordering and a frame-rate cap, set per game. Anything you leave alone follows Settings.</p>
+        </article>
+
+        <article class="feature reveal" style="--d:2">
+          <div class="mini">
+            <div class="mini-touch">
+              <div class="mini-stick"></div>
+              <div class="mini-pad-zone">trackpad</div>
+              <span class="mini-btn y">Y</span><span class="mini-btn b">B</span><span class="mini-btn a">A</span>
+            </div>
+          </div>
+          <h3>Touch controls you lay out</h3>
+          <p>Put a stick and buttons where your thumbs rest, in keyboard-and-mouse or Xbox mode. The middle of the screen works as a trackpad.</p>
+        </article>
+
+        <article class="feature reveal" style="--d:3">
+          <div class="mini mini-pad">
+            <svg viewBox="0 0 120 70" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M30 14h60c12 0 20 10 22 24l3 18c1 8-8 12-14 6l-9-9H28l-9 9c-6 6-15 2-14-6l3-18C10 24 18 14 30 14z"/>
+              <path d="M30 32v12M24 38h12"/>
+              <circle class="lit" cx="88" cy="32" r="3.2" fill="currentColor" stroke="none"/>
+              <circle cx="96" cy="40" r="3.2"/><circle cx="80" cy="40" r="3.2"/><circle cx="88" cy="48" r="3.2"/>
+            </svg>
+          </div>
+          <h3>Controllers, 64- and 32-bit</h3>
+          <p>Bluetooth controllers reach games as XInput pads — in 64-bit and 32-bit games alike. No pad? The on-screen one works the same way.</p>
+        </article>
+
+        <article class="feature reveal" style="--d:4">
+          <div class="mini">
+            <div class="mini-arch">
+              <span class="chip-cpu">x64<small>64-bit</small></span>
+              <span class="chip-cpu new">x86<small>32-bit · new</small></span>
+            </div>
+          </div>
+          <h3>32-bit games</h3>
+          <p>Older games built for 32-bit Windows run in a 4 GB address window of their own, inside the app.</p>
+        </article>
+
+        <article class="feature reveal" style="--d:5">
+          <div class="mini">
+            <div class="mini-menu"><span>Save Log</span><span class="hot">Report Compatibility</span><span>Close game</span></div>
+            <div class="mini-toast">Saved: Celeste (2026-10-03 14.05)</div>
+          </div>
+          <h3>When something breaks</h3>
+          <p>Save Log keeps a dated copy of what happened. Report Compatibility sends it here with your notes, so it can be fixed.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Compatibility teaser ─────────────────────────────────────────── -->
+  <section class="section" id="compatibility" style="padding-top:24px">
+    <div class="wrap">
+      <div class="section-head row reveal">
+        <div>
+          <span class="eyebrow">Compatibility</span>
+          <h2 class="h2">Reported by players</h2>
+          <p class="section-lede">Every report comes from inside the app, with the build, device and settings it ran on.</p>
+        </div>
+        <a class="btn btn-ghost" href="games.html">All games →</a>
+      </div>
+      <div id="recent"></div>
+    </div>
+  </section>
+
+  <!-- ── Install ──────────────────────────────────────────────────────── -->
+  <section class="section" id="install">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Install</span>
+        <h2 class="h2">Four steps to your first game</h2>
+        <p class="section-lede">
+          Games need JIT to run at speed, and iOS only allows it while a debugger is
+          attached — so Madeira can't be on the App Store. You sideload it.
+        </p>
+      </div>
+
+      <div class="steps">
+        <div class="step reveal" style="--d:0">
+          <h3>Get the app</h3>
+          <p>Every change is built by GitHub Actions. Download the newest <code>Madeira-0.1.x</code> artifact from the repository's <a href="https://github.com/debeanz/Madeira-actions/actions">Actions</a> tab while signed in to GitHub.</p>
+        </div>
+        <div class="step reveal" style="--d:1">
+          <h3>Sideload it</h3>
+          <p>Install the IPA with your Apple ID. A free account works, but it expires after 7 days — reinstalling keeps your games and saves.</p>
+        </div>
+        <div class="step reveal" style="--d:2">
+          <h3>Turn on JIT</h3>
+          <p>Install <a href="https://github.com/0-Blu/StikJIT">StikDebug</a>. When you start a game, Madeira asks it to attach.</p>
+        </div>
+        <div class="step reveal" style="--d:3">
+          <h3>Add a game</h3>
+          <p>In the Files app, put each game in its own folder on the C: drive — <code>Madeira › wine › drive_c</code>. It shows up in the Games tab.</p>
+        </div>
+      </div>
+
+      <div class="limits reveal">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+        <ul>
+          <li><b>It's a research project.</b> Plenty of games run; some run slowly or not at all. Check the compatibility list first.</li>
+          <li><b>Direct3D only.</b> Games that need OpenGL or Vulkan don't run yet.</li>
+          <li><b>Bring your own games.</b> Madeira ships no games and no copy of Windows — you copy in games you own.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── FAQ ──────────────────────────────────────────────────────────── -->
+  <section class="section" id="faq" style="padding-top:24px">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Questions</span>
+        <h2 class="h2">Good to know</h2>
+      </div>
+      <div class="faq reveal">
+        <details>
+          <summary>Does it need a jailbreak?</summary>
+          <p>No. It's an ordinary sideloaded app. The one special requirement is JIT, which StikDebug provides by attaching as a debugger.</p>
+        </details>
+        <details>
+          <summary>Which games work?</summary>
+          <p>The <a href="games.html">compatibility list</a> has what players have reported. Direct3D 11 games are the best bet — Unity games like Untitled Goose Game run, and so does Undertale, a 32-bit GameMaker game.</p>
+        </details>
+        <details>
+          <summary>Where do my saves go?</summary>
+          <p>Inside the app, in its Wine prefix — the same place a Windows PC would keep them. They survive reinstalling Madeira.</p>
+        </details>
+        <details>
+          <summary>A game crashed. What now?</summary>
+          <p>Madeira offers to save the log or report the game right away. A report with its log attached is how games get fixed — and quitting and reopening Madeira before the next game avoids leftovers from the crash.</p>
+        </details>
+        <details>
+          <summary>What does a report share?</summary>
+          <p>Reports are public: your rating and notes, the device model, iOS and Madeira versions, and the game's settings. The log goes only to the developer. It contains file paths from your phone, so it's never shown here.</p>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Credits ──────────────────────────────────────────────────────── -->
+  <section class="section" id="credits" style="padding-top:24px">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <span class="eyebrow">Credits</span>
+        <h2 class="h2">Standing on a lot of shoulders</h2>
+      </div>
+      <div class="credits">
+        <div class="credit reveal" style="--d:0">
+          <h3>Madeira</h3>
+          <p>Created by <a href="https://github.com/willfaust">Will Faust</a>, whose work took iOS emulation this far. This is a fork of his app.</p>
+        </div>
+        <div class="credit reveal" style="--d:1">
+          <h3>This fork</h3>
+          <p>Builds and this site come from <a href="https://github.com/debeanz/Madeira-actions">debeanz/Madeira-actions</a>. 32-bit support came from <a href="https://github.com/125hz/Madeira">125hz/Madeira</a>.</p>
+        </div>
+        <div class="credit reveal" style="--d:2">
+          <h3>Built on</h3>
+          <p><a href="https://www.winehq.org/">Wine</a>, <a href="https://github.com/FEX-Emu/FEX">FEX-Emu</a> and <a href="https://github.com/3Shain/DXMT">DXMT</a>, with <a href="https://github.com/0-Blu/StikJIT">StikDebug</a> for JIT. Madeira is licensed GPL-3.0-or-later.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <a class="brand" href="./" style="font-size:15px"><img src="favicon.svg" alt="" style="width:22px;height:22px;border-radius:6px">Madeira</a>
+    <a href="games.html">Compatibility</a>
+    <a href="https://github.com/debeanz/Madeira-actions">GitHub</a>
+    <a href="https://github.com/debeanz/Madeira-actions/blob/main/LICENSE">License</a>
+    <span class="spacer"></span>
+    <span>Not affiliated with Microsoft, Valve or Apple. Game names and artwork belong to their owners. © <span id="year">2026</span></span>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,28 @@
+# Compatibility database
+
+The website (`docs/`) and the app's **Report Compatibility** button store
+reports in a free [Supabase](https://supabase.com) project. Setting one up
+takes a few minutes and needs no card.
+
+1. Sign in at supabase.com (Continue with GitHub works) and create a project.
+   Any name and region; keep the database password somewhere safe.
+2. Open **SQL Editor → New query**, paste all of [`schema.sql`](schema.sql),
+   and press **Run**.
+3. Open **Project Settings → API** and copy two values:
+   - **Project URL** — `https://<something>.supabase.co`
+   - **anon public** key — a long `eyJ…` string
+
+   Both are meant to be public. What they allow is fixed by `schema.sql`:
+   filing and reading reports, and uploading (never reading) logs.
+4. Put them in [`docs/config.js`](../docs/config.js) for the website and in
+   `ReportService` (`app/Madeira/LauncherView.swift`) for the app.
+
+## Day to day
+
+- **Logs** are in **Storage → logs**, one `<report id>.txt.gz` per report that
+  attached one. The report's id is in the **reports** table.
+- **Spam** — delete the row in **Table Editor → reports**; the website drops it
+  on the next load.
+- **Pausing** — Supabase pauses free projects after a week without traffic.
+  `.github/workflows/compat-keepalive.yml` reads one row every three days so
+  that does not happen.

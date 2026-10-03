@@ -1,0 +1,32 @@
+# Supabase pauses a free project after a week without traffic, and a paused
+# project would leave the compatibility pages empty. Read one row every three
+# days so that never happens. Does nothing until docs/config.js is filled in.
+name: Keep the compatibility database awake
+
+on:
+  schedule:
+    - cron: "17 6 */3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: docs/config.js
+          sparse-checkout-cone-mode: false
+      - name: Read one row
+        run: |
+          url=$(sed -n 's/.*supabaseUrl: *"\([^"]*\)".*/\1/p' docs/config.js)
+          key=$(sed -n 's/.*supabaseAnonKey: *"\([^"]*\)".*/\1/p' docs/config.js)
+          if [ -z "$url" ] || [ -z "$key" ]; then
+            echo "docs/config.js has no Supabase project yet; nothing to keep awake."
+            exit 0
+          fi
+          curl -fsS "${url%/}/rest/v1/game_summary?select=key&limit=1" \
+            -H "apikey: $key" -H "Authorization: Bearer $key" > /dev/null
+          echo "Database answered."
