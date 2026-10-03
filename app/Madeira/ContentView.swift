@@ -1442,7 +1442,7 @@ struct ContentView: View {
     // held. StikDebug is let go right after the pool, at startup.
     @State private var debuggerAttached = isDebuggerAttached() || StikJITHelper.poolReady
     @ObservedObject private var input = InputSettings.shared
-    @ObservedObject private var gameDialogs = GameDialogs.shared   // ml876
+    @ObservedObject private var gameDialogs = GameDialogs.shared   // ml879: dialog windows on screen
     @ObservedObject private var touchControls = TouchControlsModel.shared
     @ObservedObject private var gamepad = GamepadBridge.shared
     @State private var pointerPanel = false
@@ -1696,10 +1696,7 @@ struct ContentView: View {
             syncGamepadUIMode()
             // ml872: take the JIT pool while StikDebug is still attached.
             StikJITHelper.allocateEarly()
-            GameDialogs.shared.start()   // ml876
         }
-        // ml876: a game's own message box, which nothing else would show.
-        .modifier(GameDialogAlert(dialogs: gameDialogs, fallbackTitle: launchingGame?.title ?? "Game"))
         // ml872: and when coming back from StikDebug after Enable JIT.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             StikJITHelper.allocateEarly()
@@ -4215,6 +4212,24 @@ struct ContentView: View {
         }
     }
 
+    /// ml880: launchers whose hardware check does not know the Apple GPU. The
+    /// 32-bit D3D9 renderer (DXMT's d3d9-emulated.dll) reads DXMT_CONFIG, and
+    /// lines after an "[exe]" header apply to that exe only -- so the LAUNCHER
+    /// sees a card from its own era and passes its check ("Launch Game !" is no
+    /// longer greyed out), while the game it starts, and every other program,
+    /// keeps the real adapter. DXVK's spelling: ids are four hex digits, and a
+    /// description with spaces must be quoted (a bare value ends at a space).
+    ///
+    /// Prince of Persia: The Two Thrones' PrinceOfPersia.exe (Ubisoft's
+    /// detection kit): "Compatible graphics card and driver: Unsupported card
+    /// -- Apple A17 Pro GPU" (0.1.143). A GeForce 6800 GT (10DE:0045) is on
+    /// every supported list of that generation. The section header is compared
+    /// case-sensitively with the exe's file name, hence both spellings.
+    static let launcherGPUProfiles = ["PrinceOfPersia.exe", "princeofpersia.exe"]
+        .map { "[\($0)];d3d9.customVendorId=10de;d3d9.customDeviceId=0045;"
+               + "d3d9.customDeviceDesc=\"NVIDIA GeForce 6800 GT\"" }
+        .joined(separator: ";")
+
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
@@ -4399,14 +4414,19 @@ struct ContentView: View {
             // d3d11.mipClampBC=N is the one that matters for memory: this GPU cannot
             // sample BC, so those textures are expanded to uncompressed and cost 2-8x
             // their shipped size.
+            // ml880: plus the launcher GPU profiles below, after the user's lines so
+            // those stay global (DXMT applies lines after an "[exe]" header to
+            // that exe only).
+            var dxmtConfig = Self.launcherGPUProfiles
             if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
                let txt = try? String(contentsOf: d.appendingPathComponent("madeira-dxmt.txt"), encoding: .utf8) {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
-                    setenv("DXMT_CONFIG", v, 1)
+                    dxmtConfig = v + ";" + dxmtConfig
                     logStore.log("DXMT config: \(v) via madeira-dxmt.txt")
                 }
             }
+            setenv("DXMT_CONFIG", dxmtConfig, 1)
 
             // ml819/ml829/ml830: DXMT shader cache. d3d11.dll reads its settings from
             // the WINDOWS environment, which the runtime snapshots from here once at

@@ -1087,7 +1087,10 @@ static void relay_dialogs( void )
     strncat( out, info.force, sizeof(out) - strlen( out ) - 1 );   /* ml879 */
     write_text_file( DIALOG_TMP_PATH, out );
     MoveFileExW( DIALOG_TMP_PATH, DIALOG_PATH, MOVEFILE_REPLACE_EXISTING );
-    agent_log( "dialog 0x%llx from pid %lu, shown in the app:\n%s", (unsigned long long)(ULONG_PTR)hwnd,
+    /* ml880: the app no longer shows alerts for these (the user asked never to
+     * see them again; a game session shows the window itself since ml879), so
+     * dialog.txt goes unread and this line is the record. */
+    agent_log( "dialog 0x%llx from pid %lu:\n%s", (unsigned long long)(ULONG_PTR)hwnd,
                (unsigned long)pid, out );
 }
 
