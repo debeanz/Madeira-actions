@@ -1875,6 +1875,12 @@ struct ContentView: View {
         // ml861: which game the toolbar ⋯ menu can close.
         .onChange(of: launcherSession, initial: true) { _, s in
             if case .playing(let t) = s { touchControls.gameTitle = t } else { touchControls.gameTitle = nil }
+            // ml886: the touch controls are per game: from the launch (they come
+            // up with the first frame) until the game has ended.
+            switch s {
+            case .launching, .enablingJIT, .playing: touchControls.setGame(launchingGame?.id)
+            case .idle, .ended:                      touchControls.setGame(nil)
+            }
         }
     }
 
@@ -3151,6 +3157,14 @@ struct ContentView: View {
                         desktopFullScreen = true
                     } label: {
                         Label("Edit Custom Layout", systemImage: "pencil")
+                    }
+                    // ml886: the Xbox Keys binds, edited on the preset itself.
+                    Button {
+                        touchControls.choice = .xboxKeys
+                        touchControls.editing = true
+                        desktopFullScreen = true
+                    } label: {
+                        Label("Edit Key Binds", systemImage: "keyboard")
                     }
                 }
 
@@ -5314,6 +5328,58 @@ enum ControlAction: Codable, Equatable, Hashable {
             return String(format: "%02X", vk)
         }
     }
+
+    /// ml886: a bind's name as the bind editor writes it ("Space", "L click").
+    var bindName: String {
+        switch self {
+        case .none:        return "None"
+        case .mouseLeft:   return "L click"
+        case .mouseRight:  return "R click"
+        case .key(let vk): return ControlAction.keyName(vk)
+        default:           return label
+        }
+    }
+
+    /// ml886: the key names of MappingPanel's catalogue, for captions.
+    static func keyName(_ vk: Int32) -> String {
+        switch vk {
+        case 0x20: return "Space"
+        case 0x0D: return "Enter"
+        case 0x1B: return "Esc"
+        case 0x09: return "Tab"
+        case 0x10: return "Shift"
+        case 0x11: return "Ctrl"
+        case 0x12: return "Alt"
+        case 0x08: return "Bksp"
+        case 0x14: return "Caps"
+        case 0x5B: return "Win"
+        case 0x2D: return "Ins"
+        case 0x2E: return "Del"
+        case 0x24: return "Home"
+        case 0x23: return "End"
+        case 0x21: return "PgUp"
+        case 0x22: return "PgDn"
+        case 0x70...0x7B: return "F\(vk - 0x6F)"
+        case 0x60...0x69: return "N\(vk - 0x60)"
+        case 0x6A: return "N*"
+        case 0x6B: return "N+"
+        case 0x6D: return "N−"
+        case 0x6E: return "N."
+        case 0x6F: return "N/"
+        case 0xBD: return "-"
+        case 0xBB: return "="
+        case 0xDB: return "["
+        case 0xDD: return "]"
+        case 0xDC: return "\\"
+        case 0xBA: return ";"
+        case 0xDE: return "'"
+        case 0xBC: return ","
+        case 0xBE: return "."
+        case 0xBF: return "/"
+        case 0xC0: return "`"
+        default:   return keyLabel(vk)     // letters, digits, arrows
+        }
+    }
 }
 
 /// ml831: the Xbox inputs a touch control can send (ControlAction.pad names).
@@ -5513,38 +5579,45 @@ struct ControlFace {
 /// controller inputs. `custom` keeps the raw value "keyboardMouse" it had when
 /// it held only keys, so saved files read the same in every build.
 enum TouchControlsMode: String, Codable, CaseIterable {
-    case custom = "keyboardMouse", xbox
+    /// ml886: `xboxKeys` is the Xbox preset sending keyboard keys (and mouse
+    /// buttons) from the player's binds instead of XInput. An older build reads
+    /// the unknown raw value as the custom layout, as designed.
+    case custom = "keyboardMouse", xbox, xboxKeys
 }
 
-/// ml865: the three-way switch behind the game toolbar's controller button and
-/// Settings: no on-screen controls, the Xbox preset, or the custom layout.
+/// ml865: the switch behind the game toolbar's controller button and Settings:
+/// no on-screen controls, the Xbox preset, the Xbox preset on keyboard keys
+/// (ml886), or the custom layout.
 enum TouchControlsChoice: String, CaseIterable, Identifiable {
-    case off, xbox, custom
+    case off, xbox, xboxKeys, custom
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .off:    return "Off"
-        case .xbox:   return "Xbox"
-        case .custom: return "Custom"
+        case .off:      return "Off"
+        case .xbox:     return "Xbox"
+        case .xboxKeys: return "Xbox Keys"
+        case .custom:   return "Custom"
         }
     }
 
     var icon: String {
         switch self {
-        case .off:    return "nosign"
-        case .xbox:   return "gamecontroller"
-        case .custom: return "square.grid.2x2"
+        case .off:      return "nosign"
+        case .xbox:     return "gamecontroller"
+        case .xboxKeys: return "keyboard"
+        case .custom:   return "square.grid.2x2"
         }
     }
 
     /// The toolbar's confirmation after a switch.
     var toast: String {
         switch self {
-        case .off:    return "Touch controls off"
-        case .xbox:   return "Xbox controller"
-        case .custom: return "Custom layout"
+        case .off:      return "Touch controls off"
+        case .xbox:     return "Xbox controller"
+        case .xboxKeys: return "Xbox controller on keyboard keys"
+        case .custom:   return "Custom layout"
         }
     }
 
@@ -5555,10 +5628,21 @@ enum TouchControlsChoice: String, CaseIterable, Identifiable {
             return "No on-screen controls. The screen works as a trackpad, and a physical controller still works."
         case .xbox:
             return "A ready-made Xbox controller layout. Games read it as player 1, alongside any physical controller."
+        case .xboxKeys:
+            return "The Xbox controller layout for games without controller support: every button and direction sends the keyboard key you bind to it."
         case .custom:
             return "Your own layout: any mix of controller buttons, keys and mouse buttons. While it has controller buttons, games also see an Xbox controller."
         }
     }
+}
+
+/// ml886: one game's own touch controls. Written the first time the controls
+/// are changed while that game is running; until then it uses the defaults.
+struct GameControlsProfile: Codable, Equatable {
+    var mode: String                         // TouchControlsMode raw value
+    var visible: Bool
+    var custom: [TouchControl]               // its custom layout
+    var keys: [String: ControlAction]        // its Xbox Keys binds
 }
 
 /// One on-screen control.
@@ -5589,10 +5673,12 @@ final class TouchControlsModel: ObservableObject {
             guard !loading, mode != oldValue else { return }
             selected = nil
             editing = false
-            if mode == .xbox {
+            if mode != .custom {
                 // Stash BEFORE assigning `controls`: its didSet saves, and save()
-                // reads `customStash` as the custom layout in Xbox mode.
-                customStash = controls
+                // reads `customStash` as the custom layout in the Xbox modes.
+                // ml886: only when leaving the custom layout — between Xbox and
+                // Xbox Keys `controls` is the preset, not the player's layout.
+                if oldValue == .custom { customStash = controls }
                 controls = Self.defaultLayout(.xbox)
             } else {
                 controls = customStash              // saves
@@ -5601,6 +5687,13 @@ final class TouchControlsModel: ObservableObject {
             pushPadConnected()
         }
     }
+    /// ml886: the Xbox Keys binds, by PadInput name ("A", "LB", "D↑") and, for
+    /// the sticks, by direction ("LS↑", "RS→"). An absent name uses
+    /// `defaultKeyBinds`; `.none` is unbound.
+    @Published var keyBinds: [String: ControlAction] = [:] { didSet { save() } }
+    /// ml886: the Games-tab game running now (nil: none, or a desktop session).
+    /// Its own profile, if it has one, is what the controls show.
+    @Published private(set) var gameID: String?
     @Published var fullScreen = false           // transient; overlay belongs to the desktop
     /// Transient, never persisted. ml865: the editor can give a custom layout its
     /// first controller button or take its last away; the pad follows when
@@ -5621,7 +5714,14 @@ final class TouchControlsModel: ObservableObject {
     /// ml865: Off / Xbox / Custom as one value — the toolbar's controller panel
     /// and the Settings picker both set this.
     var choice: TouchControlsChoice {
-        get { visible ? (mode == .xbox ? .xbox : .custom) : .off }
+        get {
+            guard visible else { return .off }
+            switch mode {
+            case .xbox:     return .xbox
+            case .xboxKeys: return .xboxKeys
+            case .custom:   return .custom
+            }
+        }
         set {
             guard newValue != choice else { return }
             switch newValue {
@@ -5630,6 +5730,9 @@ final class TouchControlsModel: ObservableObject {
                 visible = false
             case .xbox:
                 mode = .xbox
+                visible = true
+            case .xboxKeys:
+                mode = .xboxKeys
                 visible = true
             case .custom:
                 mode = .custom
@@ -5657,12 +5760,22 @@ final class TouchControlsModel: ObservableObject {
     /// ignores defaults, and a failed decode would silently empty the layout.
     /// `mode` is the raw string, so an unknown future mode reads as the custom
     /// layout instead of failing the whole file.
+    /// ml886: the top-level fields stay the DEFAULT controls (what an older build
+    /// reads); `keys` are the default Xbox Keys binds and `games` each game's
+    /// own profile, both ignored by older builds.
     private struct Saved: Codable {
         var controls: [TouchControl]
         var visible: Bool
         var mode: String?
         var padControls: [TouchControl]?
+        var keys: [String: ControlAction]?
+        var games: [String: GameControlsProfile]?
     }
+
+    /// ml886: per-game profiles, and the default controls while a game's own
+    /// profile is on screen.
+    private var profiles: [String: GameControlsProfile] = [:]
+    private var defaults: GameControlsProfile?
 
     private init() {
         loading = true
@@ -5671,13 +5784,15 @@ final class TouchControlsModel: ObservableObject {
             let m = s.mode.flatMap { TouchControlsMode(rawValue: $0) } ?? .custom
             mode      = m
             legacyPad = s.padControls
-            if m == .xbox {
+            if m != .custom {
                 customStash = s.controls
                 controls    = Self.defaultLayout(.xbox)
             } else {
                 controls = s.controls
             }
-            visible = s.visible
+            visible  = s.visible
+            keyBinds = s.keys ?? [:]
+            profiles = s.games ?? [:]
         }
         loading = false
         // ml831: next turn, so GamepadBridge.shared is never first touched from
@@ -5685,10 +5800,120 @@ final class TouchControlsModel: ObservableObject {
         DispatchQueue.main.async { [weak self] in self?.pushPadConnected() }
     }
 
+    /// ml886: what is on screen now, as a profile.
+    private func snapshot() -> GameControlsProfile {
+        GameControlsProfile(mode: mode.rawValue, visible: visible,
+                            custom: mode == .custom ? controls : customStash, keys: keyBinds)
+    }
+
+    /// ml886: put a profile on screen. `loading` keeps every didSet from saving
+    /// or re-deriving anything half-way; the pad is told once at the end.
+    private func apply(_ p: GameControlsProfile) {
+        loading = true
+        let m = TouchControlsMode(rawValue: p.mode) ?? .custom
+        selected = nil
+        editing = false
+        customStash = p.custom
+        keyBinds = p.keys
+        mode = m
+        controls = m == .custom ? p.custom : Self.defaultLayout(.xbox)
+        if controls.isEmpty { controls = Self.defaultLayout(m) }
+        visible = p.visible
+        loading = false
+        pushPadConnected()
+    }
+
+    /// ml886: the Games-tab game that is running (nil: none). Its own profile
+    /// goes on screen if it has one, else the defaults; anything changed from
+    /// then on is saved as that game's profile (save()), never as the defaults.
+    func setGame(_ id: String?) {
+        guard id != gameID else { return }
+        if gameID == nil { defaults = snapshot() }
+        let base = defaults ?? snapshot()
+        gameID = id
+        if let id, let own = profiles[id] {
+            apply(own)
+            LogStore.shared.log("[controls] ml886 this game's own touch controls: \(own.mode)\(own.visible ? "" : " (off)")")
+        } else {
+            apply(base)
+            if id != nil {
+                LogStore.shared.log("[controls] ml886 default touch controls (this game has no layout of its own yet)")
+            }
+        }
+        if id == nil { defaults = nil }
+    }
+
+    /// ml886: whether the running game has controls of its own.
+    var gameHasOwnControls: Bool { gameID.map { profiles[$0] != nil } ?? false }
+
+    /// ml886: Xbox Keys before the player changes anything — the usual PC
+    /// layout: moving on WASD, the right stick and the D-pad on the arrows,
+    /// Space / Esc / E / R on A / B / X / Y, Q and F on the bumpers, the mouse
+    /// buttons on the triggers (right = aim, left = fire), Shift and Ctrl on the
+    /// stick clicks, Tab and Enter on View and Menu.
+    static let defaultKeyBinds: [String: ControlAction] = [
+        "LS↑": .key(0x57), "LS→": .key(0x44), "LS↓": .key(0x53), "LS←": .key(0x41),
+        "RS↑": .key(0x26), "RS→": .key(0x27), "RS↓": .key(0x28), "RS←": .key(0x25),
+        "D↑": .key(0x26), "D→": .key(0x27), "D↓": .key(0x28), "D←": .key(0x25),
+        "A": .key(0x20), "B": .key(0x1B), "X": .key(0x45), "Y": .key(0x52),
+        "LB": .key(0x51), "RB": .key(0x46), "LT": .mouseRight, "RT": .mouseLeft,
+        "L3": .key(0x10), "R3": .key(0x11), "View": .key(0x09), "Menu": .key(0x0D),
+    ]
+    /// The directions of a stick-like control, in ControlAction.stickKeys order.
+    static let bindDirections = ["↑", "→", "↓", "←"]
+
+    func keyBind(_ name: String) -> ControlAction {
+        keyBinds[name] ?? Self.defaultKeyBinds[name] ?? ControlAction.none
+    }
+
+    func setKeyBind(_ name: String, _ action: ControlAction) {
+        guard keyBind(name) != action else { return }
+        keyBinds[name] = action
+    }
+
+    /// The bind-name prefix of a stick-like control: "LS", "RS", "D"; nil for buttons.
+    static func bindPrefix(_ p: PadInput) -> String? {
+        switch p {
+        case .ls:   return "LS"
+        case .rs:   return "RS"
+        case .dpad: return "D"
+        default:    return nil
+        }
+    }
+
+    /// ml886: the four keys a stick-like control sends in Xbox Keys (up, right,
+    /// down, left); 0 = unbound direction.
+    func keyQuad(_ p: PadInput) -> [Int32] {
+        guard let prefix = Self.bindPrefix(p) else { return [] }
+        return Self.bindDirections.map { d -> Int32 in
+            if case .key(let vk) = keyBind(prefix + d) { return vk }
+            return 0
+        }
+    }
+
+    static let wasdQuad: [Int32] = [0x57, 0x44, 0x53, 0x41]
+    static let arrowQuad: [Int32] = [0x26, 0x27, 0x28, 0x25]
+
+    /// ml886: what a preset control sends in Xbox Keys, for the editor's captions.
+    func bindSummary(_ p: PadInput) -> String {
+        guard Self.bindPrefix(p) != nil else { return keyBind(p.rawValue).bindName }
+        let q = keyQuad(p)
+        if q == Self.wasdQuad { return "WASD" }
+        if q == Self.arrowQuad { return "Arrows" }
+        if q.allSatisfy({ $0 == 0 }) { return "None" }
+        return q.map { $0 == 0 ? "–" : ControlAction.keyName($0) }.joined(separator: " ")
+    }
+
     private func save() {
         guard !loading else { return }
-        let s = Saved(controls: mode == .xbox ? customStash : controls, visible: visible,
-                      mode: mode.rawValue, padControls: legacyPad)
+        // ml886: while a game runs, a change is that game's; the defaults are
+        // written as they were when it started.
+        let live = snapshot()
+        if let id = gameID { profiles[id] = live }
+        let base = gameID == nil ? live : (defaults ?? live)
+        let s = Saved(controls: base.custom, visible: base.visible, mode: base.mode,
+                      padControls: legacyPad, keys: base.keys.isEmpty ? nil : base.keys,
+                      games: profiles.isEmpty ? nil : profiles)
         guard let d = try? JSONEncoder().encode(s) else { return }
         // ml835: coalesce. A drag or resize in the editor changes `controls` on
         // every touch sample, and an atomic file write per sample made the editor
@@ -5720,7 +5945,8 @@ final class TouchControlsModel: ObservableObject {
     /// leaving full screen) only zero the input (ControlsInputView.releaseAll).
     private func pushPadConnected() {
         guard !loading else { return }
-        let on = visible && (mode == .xbox || controls.contains { $0.action.isPad })
+        // ml886: Xbox Keys sends keys only — the game must see NO controller.
+        let on = visible && mode != .xboxKeys && (mode == .xbox || controls.contains { $0.action.isPad })
         if Thread.isMainThread {
             GamepadBridge.shared.setTouchPadConnected(on)
         } else {
@@ -5748,7 +5974,7 @@ final class TouchControlsModel: ObservableObject {
                 TouchControl(nx: 0.73, ny: 0.60, scale: 0.88, action: .key(0x20)),
                 TouchControl(nx: 0.90, ny: 0.55, scale: 0.78, action: .key(0x1B)),
             ]
-        case .xbox:
+        case .xbox, .xboxKeys:   // ml886: Xbox Keys is the same preset on keys
             // ml885: laid out like the controller, on a landscape iPhone Pro Max
             // (932 x 430 pt, 59 pt side and 21 pt bottom safe areas):
             //  - each thumb's resting arc: the left stick and, below-right of it,
@@ -6144,6 +6370,12 @@ final class ControlsInputView: UIView {
         let action: ControlAction
         var dir: Int
         let downAt: CFTimeInterval
+        /// ml886: Xbox Keys, resolved when the finger landed so the release
+        /// always undoes exactly what the press did (a mode switch or a rebind
+        /// mid-hold cannot strand a key): a button's bound key / mouse button,
+        /// or a stick's / the cross's four direction keys.
+        var bound: ControlAction? = nil
+        var quad: [Int32]? = nil
     }
 
     private final class Visual {
@@ -6635,8 +6867,14 @@ final class ControlsInputView: UIView {
     }
 
     private func beginGrab(_ key: ObjectIdentifier, touch t: UITouch, control c: TouchControl) {
-        grabs[key] = Grab(touch: t, id: c.id, action: c.action, dir: -1,
-                          downAt: CACurrentMediaTime())
+        var g = Grab(touch: t, id: c.id, action: c.action, dir: -1, downAt: CACurrentMediaTime())
+        // ml886: Xbox Keys — the controller input becomes the player's binds.
+        let m = TouchControlsModel.shared
+        if m.mode == .xboxKeys, let p = c.action.padInput {
+            if TouchControlsModel.bindPrefix(p) != nil { g.quad = m.keyQuad(p) }
+            else { g.bound = m.keyBind(p.rawValue) }
+        }
+        grabs[key] = g
         let v = visuals[c.id]
         if c.action.isStick {
             recentLifts[c.id] = nil
@@ -6645,7 +6883,7 @@ final class ControlsInputView: UIView {
             driveStick(key)                            // ml824: no haptic for the stick
         } else {
             quietly { v?.setHeld(true) }
-            press(c.action, down: true)
+            press(g.bound ?? c.action, down: true)
         }
     }
 
@@ -6693,7 +6931,8 @@ final class ControlsInputView: UIView {
             // the direction's hysteresis carries on.
             standby[hk] = nil
             grabs[key] = nil
-            grabs[hk] = Grab(touch: ht, id: g.id, action: g.action, dir: g.dir, downAt: g.downAt)
+            grabs[hk] = Grab(touch: ht, id: g.id, action: g.action, dir: g.dir, downAt: g.downAt,
+                             bound: g.bound, quad: g.quad)
             if leftStickOwner == key { leftStickOwner = hk }
             if rightStickOwner == key { rightStickOwner = hk }
             driveStick(hk)
@@ -6745,6 +6984,21 @@ final class ControlsInputView: UIView {
         let v = visuals[g.id]
         let pad = g.action.padInput
         if pad != .dpad { quietly { v?.setKnob(CGPoint(x: dx * k, y: dy * k)) } }
+        if let q = g.quad {
+            // ml886: Xbox Keys — the analog sticks and the cross are 8-way key
+            // sticks on the bound keys (0 = an unbound direction), with the same
+            // hysteresis as the WASD stick.
+            let next = ControlsGeometry.stickDirection(dx: dx, dy: dy, radius: r, current: g.dir)
+            guard next != g.dir else { return }
+            let old = Set(ControlsGeometry.directionKeys(g.dir, q))
+            let new = Set(ControlsGeometry.directionKeys(next, q))
+            for vk in old.subtracting(new) where vk != 0 { keyUp(vk) }
+            for vk in new.subtracting(old) where vk != 0 { keyDown(vk) }
+            if pad == .dpad { quietly { v?.setDpad(next) } }
+            g.dir = next
+            grabs[key] = g
+            return
+        }
         if let side = pad?.stick {
             // Deflection as a fraction of knob travel, clamped to the unit
             // circle, then deadzone + floor (ControlsGeometry.analogMagnitude).
@@ -6788,7 +7042,22 @@ final class ControlsInputView: UIView {
         let v = visuals[g.id]
         if g.action.isStick {
             let pad = g.action.padInput
-            if let side = pad?.stick {
+            if let q = g.quad {
+                // ml886: Xbox Keys. A real lift of the cross keeps its keys for
+                // minPress, like a button, so a quick menu tap spans a game poll.
+                let keys = ControlsGeometry.directionKeys(g.dir, q).filter { $0 != 0 }
+                if pad == .dpad { quietly { v?.setDpad(-1) } }
+                let holdLeft = Self.minPress - (CACurrentMediaTime() - g.downAt)
+                if pad != .dpad || !animated || holdLeft <= 0 || keys.isEmpty {
+                    for vk in keys { keyUp(vk) }
+                } else {
+                    let epoch = releaseEpoch
+                    DispatchQueue.main.asyncAfter(deadline: .now() + holdLeft) { [weak self] in
+                        guard let self, self.releaseEpoch == epoch else { return }   // releaseAll already zeroed
+                        for vk in keys { self.keyUp(vk) }
+                    }
+                }
+            } else if let side = pad?.stick {
                 // Centre the stick only if this finger is the one driving it.
                 if side == .left, leftStickOwner == key {
                     leftStickOwner = nil
@@ -6836,11 +7105,11 @@ final class ControlsInputView: UIView {
             // resize and leaving play release immediately.
             let holdLeft = Self.minPress - (CACurrentMediaTime() - g.downAt)
             if !animated || holdLeft <= 0 {
-                press(g.action, down: false)
+                press(g.bound ?? g.action, down: false)      // ml886: what the press sent
             } else {
                 // The ledger keeps this balanced: a re-press during the wait
                 // only bumps the refcount.
-                let action = g.action, epoch = releaseEpoch
+                let action = g.bound ?? g.action, epoch = releaseEpoch
                 DispatchQueue.main.asyncAfter(deadline: .now() + holdLeft) { [weak self] in
                     guard let self, self.releaseEpoch == epoch else { return }
                     self.press(action, down: false)
@@ -7218,13 +7487,14 @@ struct TouchControlsOverlay: View {
                 MetalBackedView.toggleKeyboard()
             }
             // ml865: only the custom layout is edited; the Xbox preset is fixed.
-            if m.choice == .custom {
+            // ml886: Xbox Keys edits its key binds (the buttons stay put).
+            if m.choice == .custom || m.choice == .xboxKeys {
                 glassButton(m.editing ? "checkmark" : "pencil",
                             steam: m.editing, primary: m.editing) {
                     m.editing.toggle()
                     if !m.editing { m.selected = nil }
                 }
-                if m.editing {
+                if m.editing && m.choice == .custom {
                     glassButton("plus", steam: true) {
                         var c = TouchControl()
                         // Stagger, so repeated adds do not stack invisibly.
@@ -7292,6 +7562,17 @@ struct TouchControlsOverlay: View {
                 .foregroundStyle(Color.white.opacity(0.5))
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
+            // ml886: per game. Says whose controls these are.
+            if let title = m.gameTitle {
+                Text(m.gameHasOwnControls ? "\(title)'s own controls"
+                                          : "Changes are saved for \(title)")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.62))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+            }
             HStack(spacing: 8) {
                 ForEach(TouchControlsChoice.allCases) { c in choiceTile(c) }
             }
@@ -7303,8 +7584,13 @@ struct TouchControlsOverlay: View {
                 m.choice = .custom
                 m.editing = true
             }
+            // ml886: the Xbox Keys binds (its buttons stay where the preset puts them).
+            menuRow("Edit Key Binds", system: "keyboard") {
+                m.choice = .xboxKeys
+                m.editing = true
+            }
         }
-        .frame(width: 300)
+        .frame(width: 360)
         .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
                         .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.95)))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -7330,7 +7616,9 @@ struct TouchControlsOverlay: View {
                 Text(c.title)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)     // ml886: "Xbox Keys" in a quarter of the panel
             }
+            .padding(.horizontal, 4)
             .foregroundStyle(on ? Color.white : Color.white.opacity(0.72))
             .frame(maxWidth: .infinity)
             .frame(height: 66)
@@ -7546,12 +7834,31 @@ struct TouchControlButton: View {
                     .allowsHitTesting(false)
             }
         }
+        .overlay(alignment: .bottom) {
+            // ml886: in the Xbox Keys editor, what each control sends.
+            if m.editing, m.mode == .xboxKeys, let p = control.action.padInput {
+                Text(m.bindSummary(p))
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(isSelected ? SteamPalette.accent : SteamPalette.panel))
+                    .overlay(Capsule().stroke(SteamPalette.border, lineWidth: 1))
+                    .fixedSize()
+                    .alignmentGuide(.bottom) { d in d[.top] - 4 }
+                    .allowsHitTesting(false)
+            }
+        }
         .position(ControlsGeometry.center(control, in: screen))
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
                     guard m.editing else { return }
                     if m.selected != control.id { m.selected = control.id }
+                    // ml886: Xbox Keys binds keys to the preset; its buttons
+                    // never move or resize.
+                    guard m.mode != .xboxKeys else { return }
                     guard let i = m.index(of: control.id) else { return }
                     // Re-base on a NEW gesture (its startLocation differs), so a
                     // cancelled drag (no onEnded) cannot leave a stale base that
@@ -7619,6 +7926,9 @@ struct MappingPanel: View {
     /// 0 keyboard, 1 controller. ml865: opens on the tab of the control's own
     /// input — a custom layout mixes both (an Esc key beside the pad).
     @State private var tab: Int
+    /// ml886: Xbox Keys — which direction of a stick or the D-pad is being bound
+    /// (ControlAction.stickKeys order: up, right, down, left).
+    @State private var dir = 0
 
     init(control: TouchControl, screen: CGSize) {
         self.control = control
@@ -7626,21 +7936,36 @@ struct MappingPanel: View {
         _tab = State(initialValue: control.action.isPad ? 1 : 0)
     }
 
+    /// ml886: in Xbox Keys the panel binds keys to this preset control instead
+    /// of choosing what the control is.
+    private var bindPad: PadInput? { m.mode == .xboxKeys ? control.action.padInput : nil }
 
     var body: some View {
         // ml833: Steam Big Picture style — opaque #1B2838 panel, #171A21 tab
         // strip, accent-filled selection. No glass/material in the editor.
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                tabButton(0, "keyboard", "Keyboard")
-                tabButton(1, "gamecontroller", "Controller")
+            Group {
+                if let p = bindPad {
+                    bindHeader(p)
+                } else {
+                    HStack(spacing: 8) {
+                        tabButton(0, "keyboard", "Keyboard")
+                        tabButton(1, "gamecontroller", "Controller")
+                    }
+                }
             }
             .padding(8)
             .background(SteamPalette.base)
             Rectangle().fill(SteamPalette.border).frame(height: 1)
             ScrollView {
-                (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
-                    .padding(12)
+                Group {
+                    if let p = bindPad {
+                        bindTab(p)
+                    } else {
+                        tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab)
+                    }
+                }
+                .padding(12)
             }
         }
         .frame(width: layout.size.width, height: layout.size.height)
@@ -7737,6 +8062,23 @@ struct MappingPanel: View {
            ("N.", .key(0x6E)), ("N/", .key(0x6F))]
     }
 
+    private var modifiers: [(String, ControlAction)] {
+        [("Esc", .key(0x1B)), ("Tab", .key(0x09)), ("Caps", .key(0x14)),
+         ("Shift", .key(0x10)), ("Ctrl", .key(0x11)), ("Alt", .key(0x12)),
+         ("Space", .key(0x20)), ("Enter", .key(0x0D)), ("Bksp", .key(0x08)),
+         ("Win", .key(0x5B))]
+    }
+    private var navigation: [(String, ControlAction)] {
+        [("←", .key(0x25)), ("↑", .key(0x26)), ("→", .key(0x27)), ("↓", .key(0x28)),
+         ("Ins", .key(0x2D)), ("Del", .key(0x2E)), ("Home", .key(0x24)),
+         ("End", .key(0x23)), ("PgUp", .key(0x21)), ("PgDn", .key(0x22))]
+    }
+    private var symbols: [(String, ControlAction)] {
+        [("-", .key(0xBD)), ("=", .key(0xBB)), ("[", .key(0xDB)), ("]", .key(0xDD)),
+         ("\\", .key(0xDC)), (";", .key(0xBA)), ("'", .key(0xDE)), (",", .key(0xBC)),
+         (".", .key(0xBE)), ("/", .key(0xBF)), ("`", .key(0xC0))]
+    }
+
     private var keyboardTab: some View {
         VStack(alignment: .leading, spacing: 12) {
             section("Pointer, sticks & special", [
@@ -7747,24 +8089,172 @@ struct MappingPanel: View {
             section("Letters", letters)
             section("Numbers", digits)
             section("Function", fkeys)
-            section("Modifiers & editing", [
-                ("Esc", .key(0x1B)), ("Tab", .key(0x09)), ("Caps", .key(0x14)),
-                ("Shift", .key(0x10)), ("Ctrl", .key(0x11)), ("Alt", .key(0x12)),
-                ("Space", .key(0x20)), ("Enter", .key(0x0D)), ("Bksp", .key(0x08)),
-                ("Win", .key(0x5B)),
-            ])
-            section("Navigation", [
-                ("←", .key(0x25)), ("↑", .key(0x26)), ("→", .key(0x27)), ("↓", .key(0x28)),
-                ("Ins", .key(0x2D)), ("Del", .key(0x2E)), ("Home", .key(0x24)),
-                ("End", .key(0x23)), ("PgUp", .key(0x21)), ("PgDn", .key(0x22)),
-            ])
-            section("Symbols", [
-                ("-", .key(0xBD)), ("=", .key(0xBB)), ("[", .key(0xDB)), ("]", .key(0xDD)),
-                ("\\", .key(0xDC)), (";", .key(0xBA)), ("'", .key(0xDE)), (",", .key(0xBC)),
-                (".", .key(0xBE)), ("/", .key(0xBF)), ("`", .key(0xC0)),
-            ])
+            section("Modifiers & editing", modifiers)
+            section("Navigation", navigation)
+            section("Symbols", symbols)
             section("Numpad", numpad)
         }
+    }
+
+    // MARK: ml886 Xbox Keys binds
+
+    private static func padTitle(_ p: PadInput) -> String {
+        switch p {
+        case .ls:   return "Left stick"
+        case .rs:   return "Right stick"
+        case .dpad: return "D-pad"
+        default:    return p.rawValue
+        }
+    }
+
+    private func bindHeader(_ p: PadInput) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "keyboard")
+                .font(.system(size: 14, weight: .semibold))
+            Text("\(Self.padTitle(p)) sends")
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Text(m.bindSummary(p))
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundStyle(SteamPalette.accent)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .foregroundStyle(Color.white)
+        .frame(maxWidth: .infinity, minHeight: 30)
+        .padding(.horizontal, 6)
+    }
+
+    private func bindTab(_ p: PadInput) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let prefix = TouchControlsModel.bindPrefix(p) {
+                // A stick or the cross: pick a direction, then its key.
+                HStack(spacing: 8) {
+                    ForEach(0..<4, id: \.self) { i in directionChip(prefix, i) }
+                }
+                bindPresets(prefix)
+                let target = prefix + TouchControlsModel.bindDirections[dir]
+                bindSection("None", [("None", .none)], target)
+                bindSection("Letters", letters, target)
+                bindSection("Numbers", digits, target)
+                bindSection("Function", fkeys, target)
+                bindSection("Modifiers & editing", modifiers, target)
+                bindSection("Navigation", navigation, target)
+                bindSection("Symbols", symbols, target)
+                bindSection("Numpad", numpad, target)
+            } else {
+                let target = p.rawValue
+                bindSection("Mouse", [("L click", .mouseLeft), ("R click", .mouseRight),
+                                      ("None", .none)], target)
+                bindSection("Letters", letters, target)
+                bindSection("Numbers", digits, target)
+                bindSection("Function", fkeys, target)
+                bindSection("Modifiers & editing", modifiers, target)
+                bindSection("Navigation", navigation, target)
+                bindSection("Symbols", symbols, target)
+                bindSection("Numpad", numpad, target)
+            }
+        }
+    }
+
+    /// One direction of a stick or the cross, with the key it sends now.
+    private func directionChip(_ prefix: String, _ i: Int) -> some View {
+        let on = dir == i
+        let name = m.keyBind(prefix + TouchControlsModel.bindDirections[i]).bindName
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            dir = i
+        } label: {
+            VStack(spacing: 1) {
+                Text(TouchControlsModel.bindDirections[i])
+                    .font(.system(size: 14, weight: .bold))
+                Text(name)
+                    .font(.system(size: 10, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+            .foregroundStyle(on ? Color.white : SteamPalette.chipText)
+            .frame(maxWidth: .infinity, minHeight: 40)
+            .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                .fill(on ? SteamPalette.accent : SteamPalette.surface))
+            .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// WASD / Arrows / None for all four directions at once.
+    private func bindPresets(_ prefix: String) -> some View {
+        let quad = control.action.padInput.map { m.keyQuad($0) } ?? []
+        let presets: [(String, [Int32])] = [("WASD", TouchControlsModel.wasdQuad),
+                                            ("Arrows", TouchControlsModel.arrowQuad),
+                                            ("None", [0, 0, 0, 0])]
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("All four")
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.6)
+                .textCase(.uppercase)
+                .foregroundStyle(SteamPalette.secondary)
+            HStack(spacing: 8) {
+                ForEach(Array(presets.enumerated()), id: \.offset) { _, pr in
+                    let on = quad == pr.1
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        for (i, d) in TouchControlsModel.bindDirections.enumerated() {
+                            m.setKeyBind(prefix + d, pr.1[i] == 0 ? ControlAction.none : .key(pr.1[i]))
+                        }
+                    } label: {
+                        Text(pr.0)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(on ? Color.white : SteamPalette.chipText)
+                            .frame(maxWidth: .infinity, minHeight: 32)
+                            .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                                .fill(on ? SteamPalette.accent : SteamPalette.surface))
+                            .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                                .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func bindSection(_ title: String, _ items: [(String, ControlAction)],
+                             _ target: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.6)
+                .textCase(.uppercase)
+                .foregroundStyle(SteamPalette.secondary)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 8)], spacing: 8) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, it in
+                    bindChip(it.0, it.1, target)
+                }
+            }
+        }
+    }
+
+    private func bindChip(_ label: String, _ action: ControlAction, _ target: String) -> some View {
+        let on = m.keyBind(target) == action
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            m.setKeyBind(target, action)
+        } label: {
+            Text(label)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+                .foregroundStyle(on ? Color.white : SteamPalette.chipText)
+                .padding(.horizontal, 4)
+                .frame(maxWidth: .infinity, minHeight: 32)
+                .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                    .fill(on ? SteamPalette.accent : SteamPalette.surface))
+                .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
+                    .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private var controllerTab: some View {
