@@ -798,7 +798,7 @@ final class GameLibrary: ObservableObject {
         let std = exe.standardizedFileURL
         let id = "manual:" + relative(std, to: GameLibrary.driveC)
         let folder = std.deletingLastPathComponent()
-        let title = titleOverrides[id] ?? GameLibrary.prettyTitle(folder.lastPathComponent)
+        let title = titleOverrides[id] ?? GameLibrary.fallbackTitle(folder: folder, exe: std)   // ml877
         return LauncherGame(id: id, title: title, folder: folder, exe: std, candidates: [std],
                             only32Bit: false, isManual: true, steamAppID: steamIDs[id],
                             lastPlayed: played[id].map { Date(timeIntervalSince1970: $0) })
@@ -940,7 +940,8 @@ final class GameLibrary: ObservableObject {
             if let o = exeOverrides[id], candidates.contains(where: { $0.path == o }) {
                 exe = URL(fileURLWithPath: o)
             }
-            let title = titleOverrides[id] ?? steamTitles[id] ?? GameLibrary.prettyTitle(folder.lastPathComponent)
+            let title = titleOverrides[id] ?? steamTitles[id]
+                ?? GameLibrary.fallbackTitle(folder: folder, exe: exe)   // ml877
             out.append(LauncherGame(id: id, title: title, folder: folder, exe: exe,
                                     candidates: candidates, only32Bit: candidates.isEmpty && only32,
                                     isManual: false, steamAppID: steamIDs[id],
@@ -1059,15 +1060,76 @@ final class GameLibrary: ObservableObject {
     }
 
     /// "Hollow_Knight" -> "Hollow Knight", "OneShot.World.Machine.Edition" ->
-    /// "OneShot World Machine Edition". Names that already contain spaces are
-    /// left alone.
+    /// "OneShot World Machine Edition".
+    ///
+    /// ml877: also drops what download and repack sites add, because this is
+    /// the name the Games tab, the Steam search and Report Compatibility use
+    /// whenever Steam has not named the game — the compatibility site had
+    /// "Fields of Mistria v1 0 2 ZeiGames com" from
+    /// "Fields.of.Mistria.v1.0.2.ZeiGames.com":
+    ///   - (..) [..] {..} groups: "(SteamRIP.com)", "[FitGirl Repack]"
+    ///   - everything from the first version on: "v16", "v1.0.2", "1.5.78.11833"
+    ///   - with no spaces in the name, "." "_" "-" are word breaks
+    ///   - everything from a release group or download site on: "RexaGames",
+    ///     "Ankergames", "GOG", "x64", "<site> com"
+    /// Never cuts down to nothing; the first word always stays.
     static func prettyTitle(_ name: String) -> String {
-        var t = name
-        if !t.contains(" ") {
-            t = t.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: ".", with: " ")
+        var s = name.replacingOccurrences(of: #"\s*[\(\[\{][^\)\]\}]*[\)\]\}]"#, with: " ",
+                                          options: .regularExpression)
+        if let r = s.range(of: #"(?i)(^|[\s._\-])v?\d+(\.\d+)+|[\s._\-]v\d+(?![a-z])"#, options: .regularExpression),
+           r.lowerBound > s.startIndex {
+            s = String(s[..<r.lowerBound])
         }
-        while t.contains("  ") { t = t.replacingOccurrences(of: "  ", with: " ") }
-        return t.trimmingCharacters(in: .whitespaces)
+        let spaced = s.contains(" ")
+        s = s.replacingOccurrences(of: "_", with: " ")
+        if !spaced {
+            s = s.replacingOccurrences(of: ".", with: " ").replacingOccurrences(of: "-", with: " ")
+        }
+        var words = s.split(separator: " ").map(String.init)
+        if let cut = words.indices.dropFirst().first(where: { i in
+            let w = words[i].lowercased()
+            return releaseWords.contains(w)
+                || w.range(of: #"^multi\d*$"#, options: .regularExpression) != nil
+                || (i == words.count - 2 && siteSuffixes.contains(words[i + 1].lowercased()))
+        }) {
+            words = Array(words[..<cut])
+        }
+        let t = words.joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: " -"))
+        if !t.isEmpty { return t }
+        var plain = name.replacingOccurrences(of: "_", with: " ")
+        while plain.contains("  ") { plain = plain.replacingOccurrences(of: "  ", with: " ") }
+        return plain.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// ml877: words a release group or download site appends to a folder name.
+    private static let releaseWords: Set<String> = [
+        "repack", "repacked", "fitgirl", "dodi", "elamigos", "codex", "plaza", "skidrow", "rune",
+        "tenoke", "razor1911", "empress", "goldberg", "gog", "steamrip", "rexagames", "zeigames",
+        "ankergames", "ankergame", "igggames", "steamunlocked", "onlinefix", "darksiders", "flt",
+        "cpy", "hoodlum", "prophet", "tinyiso", "simplex", "kaos", "portable", "x64", "x86",
+        "win64", "win32", "build", "update", "incl", "dlc", "dlcs", "crack", "cracked", "goty",
+    ]
+    /// ml877: "<site> com" at the end of a dotted folder name.
+    private static let siteSuffixes: Set<String> = ["com", "net", "org", "ru", "to", "io", "cc", "me", "xyz"]
+
+    /// ml877: the name a Unity game gives itself — line 2 of
+    /// "<exe>_Data/app.info" ("company\nproduct"). Better than any folder name.
+    static func unityProductName(exe: URL?) -> String? {
+        guard let exe else { return nil }
+        let stem = exe.deletingPathExtension().lastPathComponent
+        let info = exe.deletingLastPathComponent()
+            .appendingPathComponent(stem + "_Data", isDirectory: true)
+            .appendingPathComponent("app.info")
+        guard let data = try? Data(contentsOf: info), data.count < 1024,
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard lines.count >= 2, !lines[1].isEmpty, lines[1].count <= 120 else { return nil }
+        return lines[1]
+    }
+
+    /// ml877: a game's name when neither the user nor Steam has given one.
+    static func fallbackTitle(folder: URL, exe: URL?) -> String {
+        unityProductName(exe: exe) ?? prettyTitle(folder.lastPathComponent)
     }
 
     // MARK: Icons

@@ -72,7 +72,19 @@ final class SteamCovers: ObservableObject {
 
     private static let ciContext = CIContext(options: nil)
 
-    private init() {}
+    /// ml877: bumped when matching gets better, so games that failed under the
+    /// old rules are searched again now rather than after the week-long
+    /// negative cache runs out.
+    private static let matcherRevision = 877
+    private static let matcherRevisionKey = "madeira.covers.matcherRevision"
+
+    private init() {
+        let d = UserDefaults.standard
+        if d.integer(forKey: SteamCovers.matcherRevisionKey) < SteamCovers.matcherRevision {
+            d.removeObject(forKey: SteamCovers.negativeKey)
+            d.set(SteamCovers.matcherRevision, forKey: SteamCovers.matcherRevisionKey)
+        }
+    }
 
     // MARK: - Public API (call on the main thread)
 
@@ -309,12 +321,41 @@ final class SteamCovers: ObservableObject {
         for sub in SteamCovers.appIDSubfolders { dirs.append(game.folder.appendingPathComponent(sub)) }
         var seen: Set<String> = []
         for dir in dirs {
-            let url = dir.appendingPathComponent("steam_appid.txt")
-            let key = url.standardizedFileURL.path
+            let key = dir.standardizedFileURL.path
             if seen.contains(key) { continue }
             seen.insert(key)
-            guard let data = try? Data(contentsOf: url), data.count > 0, data.count < 256 else { continue }
-            if let n = SteamCovers.parseAppID(data), n > 0 { return n }
+            // ml877: the Goldberg emulator keeps it in steam_settings/.
+            for name in ["steam_appid.txt", "steam_settings/steam_appid.txt"] {
+                guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                      data.count > 0, data.count < 256 else { continue }
+                if let n = SteamCovers.parseAppID(data), n > 0 { return n }
+            }
+            // ml877: Steam emulators' and cracks' settings files: "AppId=1234".
+            for name in SteamCovers.appIDIniFiles {
+                guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                      data.count > 0, data.count < 65536,
+                      let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1)
+                else { continue }
+                if let n = SteamCovers.iniAppID(text) { return n }
+            }
+        }
+        return nil
+    }
+
+    /// ml877: settings files that carry the game's real Steam appid.
+    private static let appIDIniFiles = ["steam_emu.ini", "SmartSteamEmu.ini", "CODEX.ini", "cream_api.ini",
+                                        "OnlineFix.ini", "steam_api.ini", "ColdClientLoader.ini"]
+
+    /// ml877: the first "AppId = N" / "RealAppId=N" line (any case) of an ini file.
+    static func iniAppID(_ text: String) -> Int? {
+        for line in text.split(whereSeparator: \.isNewline) {
+            let l = line.trimmingCharacters(in: .whitespaces)
+            guard let r = l.range(of: #"^(real)?app[ _]?id\s*=\s*\d{1,9}\b"#,
+                                  options: [.regularExpression, .caseInsensitive]),
+                  let eq = l[r].firstIndex(of: "=") else { continue }
+            if let n = Int(l[l.index(after: eq)..<r.upperBound].trimmingCharacters(in: .whitespaces)), n > 0 {
+                return n
+            }
         }
         return nil
     }
@@ -506,8 +547,17 @@ final class SteamCovers: ObservableObject {
     private func searchCover(for game: LauncherGame) -> Match? {
         var bases: [String] = [SteamCovers.normalizeQuery(game.title),
                                SteamCovers.normalizeQuery(game.folder.lastPathComponent)]
+        // ml877: the name a Unity game gives itself, and the folder name with
+        // download-site junk removed (game.title is a user rename when set).
+        if let product = GameLibrary.unityProductName(exe: game.exe) {
+            bases.insert(SteamCovers.normalizeQuery(product), at: 0)
+        }
+        bases.append(SteamCovers.normalizeQuery(GameLibrary.prettyTitle(game.folder.lastPathComponent)))
         if let exe = game.exe {
-            bases.append(SteamCovers.normalizeQuery(exe.deletingPathExtension().lastPathComponent))
+            let stem = exe.deletingPathExtension().lastPathComponent
+            bases.append(SteamCovers.normalizeQuery(stem))
+            // ml877: "FieldsOfMistria" -> "Fields Of Mistria".
+            bases.append(SteamCovers.normalizeQuery(SteamCovers.splitCamelCase(stem)))
         }
         var attempts: [String] = []
         func add(_ q: String) {
@@ -523,11 +573,24 @@ final class SteamCovers: ObservableObject {
                 add(tokens.joined(separator: " "))
             }
         }
-        for q in attempts.prefix(7) {
+        for q in attempts.prefix(9) {
             let results = searchMatches(q)
             if let best = SteamCovers.bestMatch(query: q, in: results) { return best }
         }
         return nil
+    }
+
+    /// ml877: a word break before each capital that follows a lowercase
+    /// letter or digit: "FieldsOfMistria" -> "Fields Of Mistria".
+    static func splitCamelCase(_ s: String) -> String {
+        var out = ""
+        var prev: Character? = nil
+        for ch in s {
+            if let p = prev, ch.isUppercase, p.isLowercase || p.isNumber { out.append(" ") }
+            out.append(ch)
+            prev = ch
+        }
+        return out
     }
 
     // MARK: - Matching
