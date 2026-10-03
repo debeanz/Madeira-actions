@@ -1325,6 +1325,11 @@ private struct OptionsSheet: View {
                                      dismiss()
                                  }))
         }
+        // ml857: this game's logs and context, into the share sheet. No dismiss:
+        // the sheet presents over this menu and comes back to it.
+        out.append(OptionRow(id: "sendlog", title: "Send Log to Claude", systemImage: "paperplane",
+                             destructive: false, checked: false,
+                             action: { DebugReport.share(game: g) }))
         out.append(deleteRow(g))
         return out
     }
@@ -2061,5 +2066,149 @@ private struct SheetRowStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .opacity(configuration.isPressed ? 0.7 : 1.0)
+    }
+}
+
+// MARK: - Debug report (ml857)
+
+/// ml857: "Send Log to Claude" in a game's ⋯ menu. Packs what a diagnosis
+/// actually needs into the iOS share sheet: the user picks the Claude app (or
+/// AirDrop, Files, Mail…), the text lands in the message box where it can be
+/// edited, and the logs come along as attachments.
+///
+/// What goes in, and why:
+///  - madeira-log.txt — this run. Wine, FEX, DXMT and the app all write here.
+///  - madeira-log.prev.txt — the previous run. LogStore rotates the log at every
+///    launch, and the post-game alert (ml856) recommends relaunching, so after a
+///    crash and a restart the run that matters is this one.
+///  - the game's own log, for a Unity game. Unity writes its errors to
+///    LocalLow/<company>/<product>/Player.log (output_log.txt before 2019),
+///    never to our log. That file named the Goose abort (ml852) and Rhythm
+///    Doctor's missing DLL; nothing in madeira-log.txt would have.
+/// Mono/FNA games print to our stdout, so their output is already in
+/// madeira-log.txt.
+///
+/// Everything is snapshot-copied first: the live log keeps growing while the
+/// sheet is up, and each attachment gets a .txt name so every target opens it
+/// as text.
+enum DebugReport {
+    static func share(game: LauncherGame) {
+        // The marker lands in the log BEFORE the snapshot, so the report shows
+        // where in the run it was made.
+        LogStore.shared.log("Send Log to Claude: \(game.title)")
+        let ios = UIDevice.current.systemVersion
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (text, files) = Self.build(game: game, ios: ios)
+            DispatchQueue.main.async { Self.present(text: text, files: files) }
+        }
+    }
+
+    private static func build(game: LauncherGame, ios: String) -> (String, [URL]) {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = fm.temporaryDirectory.appendingPathComponent("MadeiraReport", isDirectory: true)
+        try? fm.removeItem(at: dir)          // last report's copies
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        var files: [URL] = []
+        var listed: [String] = []
+        func attach(_ src: URL, as name: String, what: String) {
+            let size = ((try? fm.attributesOfItem(atPath: src.path))?[.size] as? NSNumber)?.int64Value ?? 0
+            guard size > 0 else { return }   // missing or empty: nothing to say
+            let dst = dir.appendingPathComponent(name)
+            guard (try? fm.copyItem(at: src, to: dst)) != nil else { return }
+            files.append(dst)
+            listed.append("• \(name) — \(what)")
+        }
+        attach(docs.appendingPathComponent("madeira-log.txt"), as: "madeira-log.txt", what: "this run")
+        attach(docs.appendingPathComponent("madeira-log.prev.txt"), as: "madeira-log.prev.txt",
+               what: "the previous run (if Madeira was reopened after the problem, it is here)")
+        if let exe = game.exe, let unity = unityLog(exe: exe) {
+            attach(unity, as: "\(fileSafe(game.title)) - \(unity.lastPathComponent).txt",
+                   what: "the game's own Unity log")
+        }
+
+        var text = "Madeira debug report: \(game.title)\n\n"
+        text += "\(game.title) has a problem in Madeira (Windows games on iOS through Wine, FEX and DXMT). "
+        text += "Please read the attached logs and tell me what went wrong — a crash, low performance, "
+        text += "or a launch failure — and what to change.\n\n"
+        text += "Game: \(game.title)"
+        if !game.exeWindowsPath.isEmpty { text += " (\(game.exeWindowsPath))" }
+        text += "\nMadeira: \(ContentView.appVersionText)\n"
+        text += "Device: \(deviceModel) · iOS \(ios)\n"
+        text += listed.isEmpty ? "\nNo log files were found to attach.\n" : "\nAttached:\n" + listed.joined(separator: "\n") + "\n"
+        return (text, files)
+    }
+
+    /// The newest Player.log / output_log.txt under any profile's
+    /// AppData/LocalLow/<company>/<product>. Profiles disagree on the user name
+    /// (mobile, madeira, mythic), so every one is checked.
+    private static func unityLog(exe: URL) -> URL? {
+        guard let names = GameResolutionDefault.unityNames(exe: exe) else { return nil }
+        let fm = FileManager.default
+        let users = GameLibrary.driveC.appendingPathComponent("users", isDirectory: true)
+        guard let profiles = try? fm.contentsOfDirectory(at: users, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        var best: URL? = nil
+        var bestDate = Date.distantPast
+        for profile in profiles {
+            let folder = profile.appendingPathComponent("AppData/LocalLow", isDirectory: true)
+                .appendingPathComponent(names.company, isDirectory: true)
+                .appendingPathComponent(names.product, isDirectory: true)
+            for name in ["Player.log", "output_log.txt"] {
+                let url = folder.appendingPathComponent(name)
+                guard let date = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                      date > bestDate else { continue }
+                best = url
+                bestDate = date
+            }
+        }
+        return best
+    }
+
+    private static func present(text: String, files: [URL]) {
+        guard let top = topViewController() else {
+            LogStore.shared.log("Send Log to Claude: no screen to show the share sheet on", level: .error)
+            return
+        }
+        // A second press (a pad's A lands on the row underneath) must not stack
+        // another sheet on this one.
+        if top is UIActivityViewController { return }
+        let sheet = UIActivityViewController(activityItems: [text] + files, applicationActivities: nil)
+        if let pop = sheet.popoverPresentationController {   // iPad: anchor it, or UIKit throws
+            pop.sourceView = top.view
+            pop.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        top.present(sheet, animated: true)
+    }
+
+    /// The topmost controller of the APP window. Madeira keeps more windows
+    /// above it (touch controls at +101, the cursor), so take the normal-level
+    /// window rather than whichever happens to be key.
+    private static func topViewController() -> UIViewController? {
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+        let app = windows.first { $0.isKeyWindow && $0.windowLevel == .normal }
+            ?? windows.first { $0.windowLevel == .normal && $0.rootViewController != nil }
+        guard var vc = app?.rootViewController else { return nil }
+        while let next = vc.presentedViewController, !next.isBeingDismissed { vc = next }
+        return vc
+    }
+
+    /// "iPhone16,1" — the model identifier, which is what matters for a GPU or
+    /// memory question; the marketing name is not available without a table.
+    private static var deviceModel: String {
+        var u = utsname()
+        uname(&u)
+        return withUnsafeBytes(of: &u.machine) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+    }
+
+    private static func fileSafe(_ s: String) -> String {
+        String(s.map { "/\\:".contains($0) ? "-" : $0 })
     }
 }
