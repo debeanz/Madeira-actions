@@ -313,6 +313,10 @@ final class MetalBackedView: UIView {
     // simply do nothing.
     private var relCarryX: CGFloat = 0
     private var relCarryY: CGFloat = 0
+    /// ml884: motion sent for the owner finger while the game hides its cursor,
+    /// so a tap can take the finger's roll back before it clicks.
+    private var hiddenRollX: Int32 = 0
+    private var hiddenRollY: Int32 = 0
 
     private let F_MOVE: UInt32 = 0x1, F_LDOWN: UInt32 = 0x2, F_LUP: UInt32 = 0x4
     private let F_RDOWN: UInt32 = 0x8, F_RUP: UInt32 = 0x10
@@ -345,24 +349,26 @@ final class MetalBackedView: UIView {
     /// The one finger that is the mouse in direct touch; others are ignored.
     private weak var directFinger: UITouch?
 
-    /// ml856: the outer bands of the full-screen view, as a fraction of its
-    /// width, where a finger that LANDS does not drive the cursor. In landscape
-    /// the thumbs grip the phone by its sides — where the stick and buttons sit —
-    /// and a thumb landing just off a control fell through to this view and
-    /// dragged the pointer around. Only a finger that lands in the middle half is
-    /// a trackpad finger. The arrow can still reach every edge: the trackpad is
-    /// relative, so this limits where a drag starts, not where the pointer goes.
-    private static let cursorSideBand: CGFloat = 0.25
-
-    private func landsInCursorSideBand(_ t: UITouch) -> Bool {
+    /// ml856: a finger that LANDS outside the cursor zone does not drive the
+    /// cursor. In landscape the thumbs grip the phone by its sides, where the
+    /// stick and buttons sit, and a thumb landing just off a control fell through
+    /// to this view and dragged the pointer around. The arrow can still reach
+    /// every edge: the trackpad is relative, so this limits where a drag starts,
+    /// not where the pointer goes.
+    ///
+    /// ml884: the zone is the game picture (gameRect, the aspect-fit logical
+    /// screen) rather than the middle half of the view. The user asked for the
+    /// whole picture to move the cursor and for the black bars beside it not to:
+    /// with a 16:9 game the middle-half rule also refused the outer parts of the
+    /// picture itself.
+    private func landsOutsideCursorZone(_ t: UITouch) -> Bool {
         // Full screen only: that is where thumbs hold the sides. The small inline
         // desktop has no controls and keeps its whole area. Mouse-look is exempt —
         // there the finger is the camera, not a cursor, and a look drag often
         // starts at the right edge.
         guard TouchControlsModel.shared.fullScreen, !InputSettings.shared.relative,
               bounds.width > 0 else { return false }
-        let x = t.location(in: self).x
-        return x < bounds.width * Self.cursorSideBand || x > bounds.width * (1 - Self.cursorSideBand)
+        return !gameRect().contains(t.location(in: self))
     }
 
     private func envInt(_ name: String, _ def: Int) -> Int {
@@ -416,6 +422,16 @@ final class MetalBackedView: UIView {
         movedBeyondSlop = false
         ownerTapEligible = tapEligible
         relCarryX = 0; relCarryY = 0   // ml641: never carry motion across fingers
+        hiddenRollX = 0; hiddenRollY = 0   // ml884
+    }
+
+    /// ml884: the hidden-cursor twin of the cursorAtDown snap (ml808). A tap
+    /// clicks where the game's cursor was when the finger landed: take back the
+    /// motion the finger's roll already sent. There is no position to re-post in
+    /// this mode -- Self.cursor does not follow the game's cursor.
+    private func undoHiddenRoll() {
+        if hiddenRollX != 0 || hiddenRollY != 0 { winios_pointer(-hiddenRollX, -hiddenRollY, F_MOVE, 0) }
+        hiddenRollX = 0; hiddenRollY = 0
     }
 
     /// ml826: drop every in-flight surface gesture. Lets go of a long-press
@@ -429,6 +445,7 @@ final class MetalBackedView: UIView {
         rightClickPending = false
         scrollAccum = 0
         relCarryX = 0; relCarryY = 0
+        hiddenRollX = 0; hiddenRollY = 0   // ml884
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -446,11 +463,12 @@ final class MetalBackedView: UIView {
         if surfaceTouches.isEmpty && directFinger == nil && !dragActive {
             directTouch = TouchControlsModel.shared.dialogUp
         }
-        // ml856: a finger landing in a side band is not a pointer finger. It never
-        // becomes the owner or a second scroll finger, so a thumb resting by the
-        // controls cannot move, scroll or click the cursor.
+        // ml856: a finger landing outside the cursor zone (ml884: the black bars)
+        // is not a pointer finger. It never becomes the owner or a second scroll
+        // finger, so a thumb resting by the controls cannot move, scroll or click
+        // the cursor.
         let pointerTouches: Set<UITouch> = trackpadMode
-            ? touches.filter({ !landsInCursorSideBand($0) })
+            ? touches.filter({ !landsOutsideCursorZone($0) })
             : touches
         for t in pointerTouches where !surfaceTouches.contains(t) { surfaceTouches.append(t) }
         // Chrome tap keeps the old app-wide rule: no other finger anywhere (a
@@ -459,7 +477,7 @@ final class MetalBackedView: UIView {
         let othersDown = (event?.allTouches ?? []).contains {
             !touches.contains($0) && $0.phase != .ended && $0.phase != .cancelled
         }
-        // ml856: judged on every finger, side bands included, so a tap in a top
+        // ml856: judged on every finger, outside the cursor zone included, so a tap in a top
         // corner still brings the toolbar back. This used to read
         // `surfaceTouches.count == 1`; with side fingers kept out of that list the
         // same rule is "this is the only finger in the whole app".
@@ -478,7 +496,7 @@ final class MetalBackedView: UIView {
             winios_post_touch_down(x, y)
             return
         }
-        // ml856: only side-band fingers landed. Leave the owner's gesture exactly
+        // ml856: only fingers outside the cursor zone landed. Leave the owner's gesture exactly
         // as it was — bumping touchGeneration here would cancel its pending
         // long-press drag.
         guard !pointerTouches.isEmpty else { return }
@@ -599,6 +617,39 @@ final class MetalBackedView: UIView {
         }
 
         let sens = CGFloat(InputSettings.shared.sensAbs)   // desktop px per view pt
+
+        /* ml884 THE GAME DRAWS ITS OWN CURSOR: SEND MOTION.
+         *
+         * Prince of Persia: The Two Thrones hides the Windows cursor (DirectInput
+         * exclusive) and moves its own menu cursor by mouse DELTAS. We post a
+         * POSITION and wine derives the delta as x - cursor.x (the ml641 note
+         * above), from Self.cursor -- which clamps at the screen edges while the
+         * game's cursor is somewhere else entirely. Once Self.cursor reached an
+         * edge the delta toward it was 0, and the user saw an "invisible wall" in
+         * the middle of the screen that let them go back but not on; wandering
+         * away and returning bought a little room again.
+         *
+         * With the Windows cursor hidden there is no arrow of ours to keep in
+         * place (GameCursorHost is hidden too), so post device motion, as a real
+         * mouse does: the game gets every delta, and wine still moves and clamps
+         * its own cursor for a game that reads positions. Same sensitivity as
+         * the absolute pointer. Self.cursor is left alone; when the game shows
+         * its cursor again the arrow continues from where it was. */
+        if !desktopMode && GameCursorHost.gameHidesCursor {
+            relCarryX += dx * sens
+            relCarryY += dy * sens
+            let ix = Int32(max(-30000, min(30000, relCarryX)))
+            let iy = Int32(max(-30000, min(30000, relCarryY)))
+            relCarryX -= CGFloat(ix)
+            relCarryY -= CGFloat(iy)
+            if ix != 0 || iy != 0 {
+                winios_pointer(ix, iy, F_MOVE, 0)
+                hiddenRollX = hiddenRollX &+ ix
+                hiddenRollY = hiddenRollY &+ iy
+            }
+            return
+        }
+
         let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
         let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
         Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
@@ -710,15 +761,19 @@ final class MetalBackedView: UIView {
         if rightClickPending {
             rightClickPending = false
             if !movedBeyondSlop && now - twoFingerStartTime < 0.40 && !InputSettings.shared.relative {
-                // ml808: click where the arrow was when two-finger mode ended,
-                // not where the survivor's roll dragged it.
-                Self.cursor = cursorAtDown
-                postPointer(F_MOVE | F_ABS)
-                if !desktopMode {
-                    let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
-                    let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
-                    moveGameCursorOverlay(fracX: Self.cursor.x / max(maxX, 1),
-                                          fracY: Self.cursor.y / max(maxY, 1))
+                if !desktopMode && GameCursorHost.gameHidesCursor {
+                    undoHiddenRoll()   // ml884: no position to re-post in this mode
+                } else {
+                    // ml808: click where the arrow was when two-finger mode ended,
+                    // not where the survivor's roll dragged it.
+                    Self.cursor = cursorAtDown
+                    postPointer(F_MOVE | F_ABS)
+                    if !desktopMode {
+                        let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
+                        let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
+                        moveGameCursorOverlay(fracX: Self.cursor.x / max(maxX, 1),
+                                              fracY: Self.cursor.y / max(maxY, 1))
+                    }
                 }
                 postPointer(F_RDOWN)
                 postPointer(F_RUP)
@@ -731,16 +786,20 @@ final class MetalBackedView: UIView {
         if ownerTapEligible && !movedBeyondSlop && now - touchStartTime < 0.5
             && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
-            // ml808: click where the arrow was when the finger LANDED, not where
-            // the finger's roll dragged it. The position must be re-posted: a
-            // button-only event reuses the server's current cursor.
-            Self.cursor = cursorAtDown
-            postPointer(F_MOVE | F_ABS)
-            if !desktopMode {
-                let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
-                let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
-                moveGameCursorOverlay(fracX: Self.cursor.x / max(maxX, 1),
-                                      fracY: Self.cursor.y / max(maxY, 1))
+            if !desktopMode && GameCursorHost.gameHidesCursor {
+                undoHiddenRoll()   // ml884: no position to re-post in this mode
+            } else {
+                // ml808: click where the arrow was when the finger LANDED, not where
+                // the finger's roll dragged it. The position must be re-posted: a
+                // button-only event reuses the server's current cursor.
+                Self.cursor = cursorAtDown
+                postPointer(F_MOVE | F_ABS)
+                if !desktopMode {
+                    let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
+                    let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
+                    moveGameCursorOverlay(fracX: Self.cursor.x / max(maxX, 1),
+                                          fracY: Self.cursor.y / max(maxY, 1))
+                }
             }
             postPointer(F_LDOWN)
             postPointer(F_LUP)
@@ -748,7 +807,7 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        // ml856: was any of these a pointer finger? A side-band finger never was,
+        // ml856: was any of these a pointer finger? One outside the cursor zone never was,
         // and edge touches are exactly the ones the system cancels on its own (an
         // edge swipe), so that cancel must not tear down the middle finger's
         // gesture. Asked before the list below drops them.
@@ -1045,6 +1104,10 @@ enum GameCursorHost {
         windowsVisible = visible
         refreshHidden()
     }
+
+    /// ml884: the game has hidden the Windows cursor (it draws its own, or it
+    /// reads the mouse as motion only), so the trackpad sends motion.
+    static var gameHidesCursor: Bool { !windowsVisible }
 
     /// The app's own gate (leaving full screen, loading screen, desktop mode).
     static func setHidden(_ hidden: Bool) {
