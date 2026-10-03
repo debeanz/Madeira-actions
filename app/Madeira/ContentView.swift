@@ -1535,9 +1535,8 @@ struct ContentView: View {
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     /// Present pacing default (FrameCap raw value).
     @AppStorage(FrameCap.key) private var frameCapSetting: Int = 1
-    /// FEX_TSOENABLED=0: x86 memory-ordering OFF (Settings shows the inverse as
-    /// the "x86 memory-ordering" switch, ml875). Big CPU saving, not safe for
-    /// every title. Applied by runWineFullSequence.
+    /// FEX_TSOENABLED=0: skip x86 memory-ordering emulation. Big CPU saving,
+    /// not safe for every title. Applied by runWineFullSequence.
     @AppStorage("madeira.fexNoTSO") private var fexNoTSO = false
     /// ml829/ml830: DXMT shader cache on/off for every game (Settings → DXMT Renderer).
     /// ON by default; each game also has its own switch in its ⋯ menu.
@@ -3063,11 +3062,8 @@ struct ContentView: View {
                         Text("Stability").tag("Stability")
                         Text("Performance").tag("Performance")
                     }
-                    // ml875: named for what it is when ON (the default), the way the
-                    // compatibility site reports it ("x86 memory-ordering off"). The
-                    // stored key is still madeira.fexNoTSO, so the switch shows its inverse.
-                    Toggle("x86 memory-ordering", isOn: Binding(get: { !fexNoTSO }, set: { fexNoTSO = !$0 }))
-                    Text("Turning this off skips FEX's TSO emulation, which saves a lot of CPU and may improve performance in some games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch. If a game runs slowly, it is worth turning this off for just that game from its ⋯ menu.")
+                    Toggle("Skip x86 memory-ordering emulation", isOn: $fexNoTSO)
+                    Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch. Turning this on may improve performance in some games, so if one runs slowly, it is worth trying for just that game from its ⋯ menu.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     LabeledContent("Translation", value: "x86-64 → ARM64")

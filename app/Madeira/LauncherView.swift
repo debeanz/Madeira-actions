@@ -1458,21 +1458,19 @@ private struct OptionsSheet: View {
                                  library.updateSettings(for: id) { $0.resolution = next }
                              }))
 
-        // ml875: "x86 memory-ordering", On by default, the way the compatibility
-        // site reports it. noTSO == true is Off.
         let globalNoTSO: Bool = defaults.bool(forKey: "madeira.fexNoTSO")
         let tsoText: String
         switch s.noTSO {
-        case nil:          tsoText = "Default (\(globalNoTSO ? "Off" : "On"))"
-        case .some(true):  tsoText = "Off"
-        case .some(false): tsoText = "On"
+        case nil:          tsoText = "Default (\(globalNoTSO ? "On" : "Off"))"
+        case .some(true):  tsoText = "On"
+        case .some(false): tsoText = "Off"
         }
-        out.append(OptionRow(id: "notso", title: "x86 memory-ordering",
+        out.append(OptionRow(id: "notso", title: "Skip x86 memory-ordering emulation",
                              systemImage: "cpu",
                              destructive: false, checked: false,
                              trailing: tsoText,
                              disabled: busy,
-                             note: "Turning this off may improve performance in some games. If this game runs slowly, it is worth a try.",   // ml875
+                             note: "Turning this on may improve performance in some games. If this game runs slowly, it is worth a try.",   // ml872
                              action: {
                                  let next: Bool?
                                  switch s.noTSO {
