@@ -12,8 +12,8 @@ import Foundation
 //
 //   C:\madeira\agent.ready     written by the agent once services.exe is up
 //   C:\madeira\launch.txt      id= / exe= / dir= / args= lines, written here,
-//                              plus optional shadercache= (ml830), tso= (ml849)
-//                              and monosuspend= (ml868) lines
+//                              plus optional shadercache= (ml830), tso= (ml849),
+//                              monosuspend= (ml868) and monohook= (ml873) lines
 //   C:\madeira\launch.result   id= then "ok pid=N" or "err code=N"
 //
 // ml830: "shadercache=off" or "shadercache=<absolute unix dir>" gives this one
@@ -167,6 +167,11 @@ final class SessionLauncher {
             }
             if let monoSuspend = monoSuspend {
                 text += "monosuspend=\(monoSuspend)\r\n"     // ml868
+                // ml873: the same 32-bit .NET games get FEX's Wine Mono hook
+                // (MADEIRA_WINEMONO_BRIDGE=1): once FEX has seen Mono patch a call
+                // site, later patches are written and invalidated directly instead
+                // of each costing an access violation.
+                text += "monohook=on\r\n"
             }
             let tmp = self.agentDir.appendingPathComponent("launch.tmp")
             do {

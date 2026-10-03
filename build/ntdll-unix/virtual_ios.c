@@ -8716,6 +8716,22 @@ unsigned char ios_reclaim_page_vprot( unsigned long long va )
     return get_page_vprot( (const void *)(uintptr_t)va );
 }
 
+/* iOS-Madeira ml873: has FEX write-trapped this guest page?
+ *
+ * After compiling code from an RWX page FEX takes WRITE off it
+ * (InvalidationTracker::ReprotectRWXIntervals -> NtProtectVirtualMemory with
+ * PAGE_EXECUTE_READ, or PAGE_READONLY for a DEP-promoted page) so that the next
+ * write faults into HandleRWXAccessViolation and the stale translation is
+ * dropped. That LOGICAL protection is what is read here. Lock-free for the same
+ * reason as ios_reclaim_page_vprot: the Mach exception thread must never take
+ * virtual_mutex. */
+int ios_wow_page_write_trapped( unsigned long long va )
+{
+    BYTE vprot = get_page_vprot( (const void *)(uintptr_t)va );
+
+    return (vprot & VPROT_COMMITTED) && !(vprot & (VPROT_WRITE | VPROT_WRITECOPY));
+}
+
 
 /***********************************************************************
  *           get_host_page_vprot
@@ -10587,6 +10603,43 @@ static void *ios_share_probe_thread(void *arg)
  * legitimately log on normal threads stay silent on that one. */
 volatile int ios_in_mach_exc;
 
+/* iOS-Madeira ml873: HONOUR FEX'S WRITE-TRAP ON 32-BIT GUEST CODE.
+ *
+ * Celeste (32-bit Wine Mono, 0.1.137) spent a quarter of its main thread in
+ * Mono's jit-info lookups, called from its call trampolines: mono_arch_patch_
+ * callsite rewrites a call to go direct, but FEX never learned the code had
+ * changed, kept running its old translation, and every call went back through
+ * the trampoline -- two lookups and a re-patch, each time. FEX does ask to hear
+ * about such writes: after compiling from an RWX page it takes WRITE off the
+ * page (the [alias-own] "prot=r-x" lines). The ml640 path below left the host
+ * mapping alone, and ml867 had made it writable, so the write landed silently.
+ *
+ * Now, once any 4 KB guest page inside a 16 KB host page is trapped, the host
+ * page goes read-only, and the store emulator (signal_arm64_ios.c, ml873) turns
+ * a guest write to the trapped page into the access violation FEX handles.
+ * PROT_READ, not R+X: the host never executes a guest-window page (FEX runs its
+ * own translation), and a page ml867 made writable has been split from the pool
+ * (see ml638) and could not get X back anyway. */
+static void ios_wow_retrap_host_pages( void *base, size_t size )
+{
+    static unsigned long retrap_n;
+    uintptr_t p = (uintptr_t)ROUND_ADDR( base, host_page_mask );
+    uintptr_t end = (uintptr_t)base + size;
+
+    if (!ios_wow_addr_in_live_window( (unsigned long long)(uintptr_t)base )) return;
+    for (; p < end; p += host_page_size)
+    {
+        size_t off;
+
+        for (off = 0; off < host_page_size; off += page_size)
+            if (ios_wow_page_write_trapped( p + off )) break;
+        if (off < host_page_size && !mprotect( (void *)p, host_page_size, PROT_READ ) &&
+            ++retrap_n <= 8)
+            dprintf( 2, "[wow-smc] ml873 #%lu host page %p read-only: FEX trapped guest page %p\n",
+                     retrap_n, (void *)p, (void *)(p + off) );
+    }
+}
+
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
     /* ml247: catch WHO narrows maxprot on pool pages.
@@ -10835,6 +10888,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             (unix_prot & PROT_WRITE) ? 'w' : '-',
                             (unix_prot & PROT_EXEC)  ? 'x' : '-',
                             cov_rx, cov_rw);
+                ios_wow_retrap_host_pages( base, size );   /* ml873: 32-bit windows only */
                 return 0;
             }
         }

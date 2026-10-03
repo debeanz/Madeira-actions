@@ -1976,6 +1976,13 @@ static int ios_mach_deliver_guest_exception( thread_t thread, arm_thread_state64
                                              int exception, uintptr_t fault_addr,
                                              uintptr_t thread_teb );
 
+/* ml873: set around a delivery that is FEX's own write-trap firing (a guest store
+ * to 32-bit code FEX translated). That access violation is routine and FEX
+ * resolves it, so it skips the page machinery, the transient-retry debounce and
+ * the [av-detail]/[mach-deliver] reports. Only the single exception-server
+ * thread touches it. */
+static int ios_wow_smc_av;
+
 /* ml836: Wine TID of a registered TEB, read with mach_vm_read_overwrite so the
  * exception-server thread can never fault on it (a fault on that thread goes
  * to its OWN task exception port and freezes every thread in the app). */
@@ -3886,7 +3893,96 @@ static void *ios_mach_exception_thread( void *arg )
                                 (unsigned long long)fault_pc);
                     }
                 }
-                if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
+
+                /* ================ ml873 32-BIT GUEST CODE WRITES ================
+                 *
+                 * A store into a 32-bit process's anon RWX never goes through the
+                 * emulator below any more:
+                 *
+                 *  - into a page FEX has write-trapped (its logical protection lost
+                 *    WRITE when FEX compiled code from it -- virtual_ios.c ml873),
+                 *    made by translated guest code: delivered as the access violation
+                 *    FEX asked for. Its HandleRWXAccessViolation drops the stale
+                 *    translation and gives WRITE back, and the store re-runs. This is
+                 *    what lets Mono's call-site patches take effect; without it every
+                 *    patched call kept going through Mono's trampoline (Celeste).
+                 *
+                 *  - anything else: the host page is made writable and the store re-runs
+                 *    natively. Never through rw_addr: ml638 showed that a guest page
+                 *    once made writable is split from the pool, so a store through the
+                 *    pool alias would be lost. ml867 avoided that only because nothing
+                 *    ever made such a page read-only again; ml873 does.
+                 *
+                 * The 16 KB host page holds four 4 KB guest pages, so a write to an
+                 * untrapped one also lifts the trap on its neighbours until FEX
+                 * compiles from them again. A Mono patch missed in that window costs
+                 * one more trip through the trampoline, which re-patches -- and that
+                 * write is caught. Kill switch for A/B: MADEIRA_NO_WOW_SMC=1.
+                 *
+                 * ⛔ Not for an ALIGNMENT fault (kr 0x101): an unaligned atomic faults on
+                 * a writable page too, so "make it writable and re-run" would loop
+                 * forever. Those keep the emulator. */
+                if (rw_addr && !in_jit && fault_kr != 0x101 /* EXC_ARM_DA_ALIGN */)
+                {
+                    extern int ios_wow_addr_in_live_window( unsigned long long );
+                    extern int ios_wow_page_write_trapped( unsigned long long );
+                    extern int ios_jit_pool_addr_to_pe( uintptr_t addr, uintptr_t *pe_va );
+                    static int wow_smc_off = -1;
+
+                    if (wow_smc_off < 0)
+                    {
+                        const char *e = getenv( "MADEIRA_NO_WOW_SMC" );
+                        wow_smc_off = (e && e[0] == '1') ? 1 : 0;
+                        dprintf( 2, "[wow-smc] ml873 32-bit code-write tracking %s\n",
+                                 wow_smc_off ? "DISABLED (MADEIRA_NO_WOW_SMC)" : "enabled" );
+                    }
+                    if (!wow_smc_off && ios_wow_addr_in_live_window( (unsigned long long)fault_addr ))
+                    {
+                        static volatile unsigned long smc_av_n, smc_rw_n, smc_fail_n;
+                        const unsigned long long pg = (unsigned long long)fault_addr & ~0x3fffull;
+                        uintptr_t pe_va = 0;
+                        const int guest_code = rx && sz && fault_pc >= rx && fault_pc < rx + sz &&
+                                               !ios_jit_pool_addr_to_pe( (uintptr_t)fault_pc, &pe_va );
+                        const int trapped = ios_wow_page_write_trapped( (unsigned long long)fault_addr );
+
+                        if (trapped && guest_code)
+                        {
+                            ios_wow_smc_av = 1;
+                            handled = ios_mach_deliver_guest_exception( thread, &state,
+                                          &neon_state, have_neon, req->exception,
+                                          fault_addr, thread_teb );
+                            ios_wow_smc_av = 0;
+                            if (handled)
+                            {
+                                unsigned long n = __sync_add_and_fetch( &smc_av_n, 1 );
+                                if (n <= 8 || (n & 0xfff) == 0)
+                                    dprintf( 2, "[wow-smc] ml873 #%lu write to translated code -> FEX "
+                                                "pc=0x%llx addr=0x%llx tid=%04x (native retries %lu)\n",
+                                             n, (unsigned long long)fault_pc,
+                                             (unsigned long long)fault_addr,
+                                             ios_exc_tid_of_teb( thread_teb ), smc_rw_n );
+                            }
+                        }
+                        if (!handled)
+                        {
+                            if (mprotect( (void *)(uintptr_t)pg, 0x4000, PROT_READ | PROT_WRITE ) == 0)
+                            {
+                                /* pc unchanged: the thread re-runs the store natively */
+                                unsigned long n = __sync_add_and_fetch( &smc_rw_n, 1 );
+                                handled = 1;
+                                if (n <= 4 || (n & 0x3fff) == 0)
+                                    dprintf( 2, "[wow-smc] ml873 #%lu page 0x%llx -> RW, store re-runs natively "
+                                                "(trapped=%d guest_code=%d, to FEX %lu)\n",
+                                             n, pg, trapped, guest_code, smc_av_n );
+                            }
+                            else if (__sync_add_and_fetch( &smc_fail_n, 1 ) <= 4)
+                                dprintf( 2, "[wow-smc] ml873 mprotect(RW) FAILED page 0x%llx errno=%d "
+                                            "-- emulating as before\n", pg, errno );
+                        }
+                    }
+                }
+
+                if (!handled && rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
                     uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
                     int emulated = 0;
@@ -9009,7 +9105,8 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
          * never block on ios_tail_carve_lock from a fault handler. */
         {
             static unsigned long av_n;
-            unsigned long n = is_align ? 0 : ++av_n;   /* alignment faults are not AVs — see above */
+            /* alignment faults are not AVs — see above; ml873 write-traps are routine */
+            unsigned long n = (is_align || ios_wow_smc_av) ? 0 : ++av_n;
             if (n && (n <= 24 || (n % 4096) == 0))
             {
                 uint64_t hpc = (uint64_t)arm_thread_state64_get_pc( mc.__ss );
@@ -9119,8 +9216,9 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
         /* An alignment fault has no page to service, and this helper ENDS with
          * `rec->ExceptionCode = ret` — letting it run would overwrite the
          * 80000002 chosen above with c0000005 again. It still has to pass the
-         * guest-pc gate below, so no `goto dispatch` here. */
-        if (!is_align)
+         * guest-pc gate below, so no `goto dispatch` here.
+         * ml873: a write-trap is already known to be an access violation. */
+        if (!is_align && !ios_wow_smc_av)
         {
             st = ios_virtual_handle_fault_for_thread( &rec, teb );
             if (!st)
@@ -9154,8 +9252,10 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      * invalidation are fixed by re-execution and were free retries under
      * the decline regime. Dispatch only on the 3rd identical
      * (thread,pc,addr) fault — still well before the script's 8-stop kill.
-     * Single server thread services all messages: no atomics needed. */
-    if (!is_align)
+     * Single server thread services all messages: no atomics needed.
+     * ml873: not for a write-trap -- declining it to the BSD path just adds two
+     * round trips, and a burst of them on one page must not look like a livelock. */
+    if (!is_align && !ios_wow_smc_av)
     {
         static struct { uint64_t key; uint32_t n; } rep[16];
         uint64_t key = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
@@ -9223,12 +9323,15 @@ dispatch:
 
     *state = mc.__ss;
 
-    if (deliver_logs < 24 || (deliver_logs % 100) == 0)
-        dprintf( 2, "[mach-deliver] rev=ml369 #%d code=%08x pc=0x%llx excaddr=%p addr=0x%llx frame=%p teb=%p disp=%p\n",
-                 deliver_logs, (unsigned int)rec.ExceptionCode,
-                 (unsigned long long)pc, rec.ExceptionAddress,
-                 (unsigned long long)fault_addr, frame_addr, (void *)thread_teb, dispatcher );
-    deliver_logs++;
+    if (!ios_wow_smc_av)   /* ml873: [wow-smc] counts those */
+    {
+        if (deliver_logs < 24 || (deliver_logs % 100) == 0)
+            dprintf( 2, "[mach-deliver] rev=ml369 #%d code=%08x pc=0x%llx excaddr=%p addr=0x%llx frame=%p teb=%p disp=%p\n",
+                     deliver_logs, (unsigned int)rec.ExceptionCode,
+                     (unsigned long long)pc, rec.ExceptionAddress,
+                     (unsigned long long)fault_addr, frame_addr, (void *)thread_teb, dispatcher );
+        deliver_logs++;
+    }
 
     /* iOS-Madeira ml461 (#76): identical-fault redelivery TERMINAL. A host-C++
      * fault misdelivered down the guest SEH path can never be handled — the
