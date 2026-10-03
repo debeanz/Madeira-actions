@@ -24,9 +24,10 @@ takes a few minutes and needs no card.
 ## Day to day
 
 - **Logs** are in **Storage → logs**: a folder per game, named like its page
-  on the site, holding one plain-text file per report that attached a log —
-  `<date> <game> <report id>.txt`. The report's id is in the **reports** table.
-  The dashboard can't preview text: **Download**, then double-click.
+  on the site, holding one gzipped log per report that attached one —
+  `<date> <game> <report id>.txt.gz`. The report's id is in the **reports**
+  table. The dashboard can't preview them: **Download**, then **Extract All**
+  (Windows 11 opens .gz itself) or 7-Zip.
 - **Spam** — delete the row in **Table Editor → reports**; the website drops it
   on the next load.
 - **Pausing** — Supabase pauses free projects after a week without traffic.
