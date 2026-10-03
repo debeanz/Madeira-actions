@@ -329,7 +329,21 @@ final class MetalBackedView: UIView {
     /// Kept as a property so a future per-game "native touch" toggle can turn
     /// it off (the `guard trackpadMode else { … winios_post_touch_* }` fallback
     /// in the touch handlers is that path).
-    private var trackpadMode: Bool { true }
+    private var trackpadMode: Bool { !directTouch }
+
+    /// ml881: while a game session shows a dialog window (a launcher, a setup
+    /// window, a message box: GameDialogs.windowsOnScreen) a finger is the mouse
+    /// ON that window -- it presses where it lands, drags with the button held
+    /// and lets go on lift: the "native touch" path the handlers keep below.
+    /// With the trackpad a tap clicks wherever the pointer already is, fingers
+    /// landing in the side quarters are ignored and the game controls share the
+    /// glass, so Prince of Persia's launcher could not be pressed at all
+    /// (0.1.146). Chosen when a gesture starts and kept until its finger lifts,
+    /// so a window opening or closing mid-touch can neither strand a pressed
+    /// button nor hand a half-finished trackpad gesture over.
+    private var directTouch = false
+    /// The one finger that is the mouse in direct touch; others are ignored.
+    private weak var directFinger: UITouch?
 
     /// ml856: the outer bands of the full-screen view, as a fraction of its
     /// width, where a finger that LANDS does not drive the cursor. In landscape
@@ -428,6 +442,10 @@ final class MetalBackedView: UIView {
             if !liftedEarly.isEmpty { touchesEnded(Set(liftedEarly), with: event) }
         }
         surfaceTouches.removeAll { $0.phase == .ended || $0.phase == .cancelled }
+        // ml881: the touch model for this gesture, chosen only with no finger down.
+        if surfaceTouches.isEmpty && directFinger == nil && !dragActive {
+            directTouch = TouchControlsModel.shared.dialogUp
+        }
         // ml856: a finger landing in a side band is not a pointer finger. It never
         // becomes the owner or a second scroll finger, so a thumb resting by the
         // controls cannot move, scroll or click the cursor.
@@ -453,7 +471,8 @@ final class MetalBackedView: UIView {
             chromeTapTouch = nil       // a second finger is not a chrome tap
         }
         guard trackpadMode else {
-            guard let t = touches.first else { return }
+            guard directFinger == nil, let t = touches.first else { return }   // ml881: one mouse finger
+            directFinger = t
             let (x, y) = mapTouch(t)
             winios_post_touch_down(x, y)
             return
@@ -507,7 +526,7 @@ final class MetalBackedView: UIView {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard trackpadMode else {
-            guard let t = touches.first else { return }
+            guard let t = directFinger, touches.contains(t) else { return }
             let (x, y) = mapTouch(t)
             winios_post_touch_move(x, y)
             return
@@ -633,7 +652,8 @@ final class MetalBackedView: UIView {
             }
         }
         guard trackpadMode else {
-            guard let t = touches.first else { return }
+            guard let t = directFinger, touches.contains(t) else { return }
+            directFinger = nil
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
@@ -737,7 +757,8 @@ final class MetalBackedView: UIView {
         surfaceTouches.removeAll { touches.contains($0) || $0.phase == .ended || $0.phase == .cancelled }
         if let ct = chromeTapTouch, touches.contains(ct) { chromeTapTouch = nil }
         guard trackpadMode else {
-            guard let t = touches.first else { return }
+            guard let t = directFinger, touches.contains(t) else { return }
+            directFinger = nil
             let (x, y) = mapTouch(t)
             winios_post_touch_up(x, y)
             return
@@ -1734,6 +1755,12 @@ struct ContentView: View {
         // before fullScreenDesktop exists.
         .onChange(of: showLaunchOverlay, initial: true) { _, up in
             if touchControls.launchPanelUp != up { touchControls.launchPanelUp = up }
+        }
+        // ml881: a launcher or setup window is used by touch: the game's own
+        // controls and pointer step aside while one is on screen.
+        .onChange(of: gameDialogs.windowsOnScreen, initial: true) { _, up in
+            if touchControls.dialogUp != up { touchControls.dialogUp = up }
+            if up { GameCursorHost.setHidden(true) }
         }
         .onReceive(NotificationCenter.default.publisher(
             for: Notification.Name("MadeiraExitFullScreen"))) { _ in
@@ -5453,6 +5480,10 @@ final class TouchControlsModel: ObservableObject {
     /// ml827: the loading / "Closing game…" panel is up (ContentView.showLaunchOverlay).
     /// The controls, toolbar and performance HUD wait for the game's first frame.
     @Published var launchPanelUp = false        // transient
+    /// ml881: a game session shows a dialog window (launcher, setup window,
+    /// message box; GameDialogs.windowsOnScreen). The game controls step aside
+    /// so a finger reaches the window -- the toolbar stays, to close the game.
+    @Published var dialogUp = false             // transient
     /// ml861: the Games-tab game being played, for the toolbar ⋯ menu's
     /// "Close <game>"; nil in a Windows desktop session or between games.
     @Published var gameTitle: String? = nil     // transient
@@ -5617,7 +5648,7 @@ final class TouchControlsModel: ObservableObject {
     /// in this state. Editing hands the controls to SwiftUI; outside full screen
     /// nothing is live. ml827: nor over the loading panel — this going false
     /// releases every held key (ControlsInputView.syncFromModel).
-    var playing: Bool { fullScreen && visible && !editing && !launchPanelUp }
+    var playing: Bool { fullScreen && visible && !editing && !launchPanelUp && !dialogUp }
 }
 
 /// ml826: the ONE geometry for on-screen controls. Hit-testing (ControlsWindow),

@@ -303,6 +303,38 @@ static void send_reply( union generic_reply *reply )
         fatal_protocol_error( current, "reply write: %s\n", strerror( errno ));
 }
 
+/* ml881: what a 32-bit program looks for in the registry and does not find.
+ * Prince of Persia: The Two Thrones' launcher passes its hardware check (ml880)
+ * and then quits without starting the game. Ubisoft launchers of that era take
+ * the game folder from keys their installer wrote, and a game copied onto the
+ * device has none -- this says which keys and values it asked for. i386
+ * clients only (no 64-bit game is touched), failures only, a bounded count. */
+#define IOS_REG_MISS_MAX 200
+static void ios_log_registry_miss( enum request req )
+{
+    static int logged;
+    const WCHAR *w;
+    char name[256];
+    data_size_t i, n, len;
+
+    if (req != REQ_open_key && req != REQ_get_key_value) return;
+    if (current->error != STATUS_OBJECT_NAME_NOT_FOUND) return;
+    if (!current->process || current->process->machine != IMAGE_FILE_MACHINE_I386) return;
+    if (logged >= IOS_REG_MISS_MAX) return;
+    logged++;
+    w = get_req_data();
+    len = get_req_data_size() / sizeof(WCHAR);
+    for (i = n = 0; i < len && n < sizeof(name) - 1; i++)
+        name[n++] = (w[i] >= 0x20 && w[i] < 0x7f) ? (char)w[i] : '?';
+    name[n] = 0;
+    if (req == REQ_open_key)
+        ws_log( "[reg-miss] ml881 #%d pid %04x key \"%s\" under handle %#x", logged,
+                current->process->id, name, current->req.open_key_request.parent );
+    else
+        ws_log( "[reg-miss] ml881 #%d pid %04x value \"%s\" in key handle %#x", logged,
+                current->process->id, name, current->req.get_key_value_request.hkey );
+}
+
 /* call a request handler */
 static void call_req_handler( struct thread *thread )
 {
@@ -317,7 +349,10 @@ static void call_req_handler( struct thread *thread )
     if (debug_level) trace_request();
 
     if (req < REQ_NB_REQUESTS)
+    {
         req_handlers[req]( &current->req, &reply );
+        if (current) ios_log_registry_miss( req );   /* ml881 */
+    }
     else
         set_error( STATUS_NOT_IMPLEMENTED );
 
