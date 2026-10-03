@@ -45,6 +45,32 @@ final class SessionLauncher {
 
     var agentReady: Bool { FileManager.default.fileExists(atPath: readyURL.path) }
 
+    /// ml875: its own queue — a launch can sit on `queue` for minutes waiting
+    /// for the agent, and a controller notice must not wait behind it.
+    private let noticeQueue = DispatchQueue(label: "madeira.session-launcher.notice", qos: .utility)
+
+    /// ml875: tell the running session that the controller came or went. SDL
+    /// games (FNA: Celeste) re-scan XInput only on a Windows device-change
+    /// message, and nothing here sends one (Wine's plugplay service does not
+    /// run), so the agent sends it — see handle_devchange in madeira-agent.c.
+    /// The latest notice replaces an unread one; either way the game re-scans
+    /// and sees the current state. Nothing to do without a running agent.
+    func notifyDeviceChange(arrival: Bool) {
+        noticeQueue.async {
+            guard self.agentReady else { return }
+            let fm = FileManager.default
+            let url = self.agentDir.appendingPathComponent("devchange.txt")
+            let tmp = self.agentDir.appendingPathComponent("devchange.tmp")
+            do {
+                try (arrival ? "arrival\r\n" : "removal\r\n").write(to: tmp, atomically: false, encoding: .utf8)
+                try? fm.removeItem(at: url)
+                try fm.moveItem(at: tmp, to: url)
+            } catch {
+                try? fm.removeItem(at: tmp)
+            }
+        }
+    }
+
     /// ml868: Wine Mono's thread-suspend policy for one launch. A 32-bit .NET
     /// game gets "coop"; everything else nil (inherits Mono's default).
     ///

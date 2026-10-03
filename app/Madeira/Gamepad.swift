@@ -453,6 +453,9 @@ final class GamepadBridge: ObservableObject {
         if connected != lastConnected {
             lastConnected = connected
             madeira_xinput_set_connected(0, connected ? 1 : 0)
+            // ml875: SDL games only notice a pad that comes or goes mid-game
+            // when told; the session agent sends them the device-change message.
+            SessionLauncher.shared.notifyDeviceChange(arrival: connected)
         }
         guard connected else { return }
         let p = physicalPad ?? madeira_xinput_state()

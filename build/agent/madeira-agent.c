@@ -48,7 +48,9 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dbt.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -60,6 +62,7 @@
 #define READY_PATH   L"C:\\madeira\\agent.ready"
 #define LOG_PATH     L"C:\\madeira\\agent.log"
 #define EXIT_PATH    L"C:\\madeira\\exit.txt"
+#define DEVCHANGE_PATH L"C:\\madeira\\devchange.txt"   /* ml875 */
 
 /* ml797: programs we started, so their exit can be reported (the app's
  * Games tab turns "Resume" back into "Play"). */
@@ -539,6 +542,63 @@ static void handle_request( void )
     if (wcache) HeapFree( GetProcessHeap(), 0, wcache );
 }
 
+/* ml875: the app's controller came or went (C:\madeira\devchange.txt holds
+ * "arrival" or "removal") -- the touch controls' Xbox pad, or a paired
+ * controller.
+ *
+ * SDL (FNA games such as Celeste) re-scans XInput only when Windows sends
+ * WM_DEVICECHANGE to the message-only window it registered with
+ * RegisterDeviceNotification. Wine sends those from its plugplay service, which
+ * does not run in this session (no \pipe\wine_plugplay), so a pad that appeared
+ * after the game started was never seen: Celeste 0.1.138 with the Xbox preset
+ * switched on mid-game. Send the same message ourselves, to every message-only
+ * window in the session but ours. SendMessageTimeout, because WM_DEVICECHANGE
+ * carries a pointer that Wine copies into the receiving process only for a sent
+ * message; ABORTIFHUNG and a short timeout, so one stuck thread cannot stall the
+ * poll loop. SDL answers with a re-scan 300 ms and 2 s later. */
+static void handle_devchange( void )
+{
+    static const GUID hid_interface =
+        { 0x4d1e55b2, 0xf16f, 0x11cf, { 0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 } };
+    static const WCHAR name[] =
+        L"\\\\?\\HID#VID_045E&PID_028E&IG_00#madeira&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+    union
+    {
+        DEV_BROADCAST_DEVICEINTERFACE_W hdr;
+        BYTE bytes[offsetof( DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name ) + sizeof(name)];
+    } note;
+    char *text = read_text_file( DEVCHANGE_PATH );
+    BOOL arrival = !text || !strstr( text, "removal" );
+    HWND hwnd = NULL;
+    int sent = 0, silent = 0;
+
+    DeleteFileW( DEVCHANGE_PATH );
+    if (text) HeapFree( GetProcessHeap(), 0, text );
+
+    memset( &note, 0, sizeof(note) );
+    note.hdr.dbcc_size = sizeof(note);
+    note.hdr.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    note.hdr.dbcc_classguid = hid_interface;
+    memcpy( note.bytes + offsetof( DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name ), name, sizeof(name) );
+
+    while ((hwnd = FindWindowExW( HWND_MESSAGE, hwnd, NULL, NULL )))
+    {
+        DWORD pid = 0;
+        DWORD_PTR answer;
+
+        GetWindowThreadProcessId( hwnd, &pid );
+        if (pid == GetCurrentProcessId()) continue;
+        if (SendMessageTimeoutW( hwnd, WM_DEVICECHANGE,
+                                 arrival ? DBT_DEVICEARRIVAL : DBT_DEVICEREMOVECOMPLETE,
+                                 (LPARAM)&note, SMTO_ABORTIFHUNG, 250, &answer ))
+            sent++;
+        else
+            silent++;
+    }
+    agent_log( "devchange %s: WM_DEVICECHANGE to %d message-only window(s), %d did not answer",
+               arrival ? "arrival" : "removal", sent, silent );
+}
+
 int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
 {
     char ready[64];
@@ -547,6 +607,7 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
     DeleteFileW( READY_PATH );
     DeleteFileW( REQUEST_PATH );
     DeleteFileW( RESULT_PATH );
+    DeleteFileW( DEVCHANGE_PATH );   /* ml875: a notice from before this session */
     agent_log( "madeira-agent started, pid=%lu, cmdline=%ls", (unsigned long)GetCurrentProcessId(), cmdline );
 
     /* ml803: in game mode there is no explorer, so nothing owns the win32
@@ -647,6 +708,7 @@ int WINAPI wWinMain( HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show )
     {
         Sleep( 200 );
         if (GetFileAttributesW( REQUEST_PATH ) != INVALID_FILE_ATTRIBUTES) handle_request();
+        if (GetFileAttributesW( DEVCHANGE_PATH ) != INVALID_FILE_ATTRIBUTES) handle_devchange();   /* ml875 */
         if (g_child_n) reap_children();
     }
     return 0;
