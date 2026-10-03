@@ -313,28 +313,6 @@ final class GameLibrary: ObservableObject {
         GameLibrary.loadGameSettings()[id] ?? GameSettings()
     }
 
-    /// ml869: whether a game's exe is 32-bit x86, cached per exe path (it is a
-    /// header read, and the card asks on every render). Main thread only.
-    private var bitnessCache: [String: Bool] = [:]
-    func is32Bit(_ game: LauncherGame) -> Bool {
-        guard let exe = game.exe else { return false }
-        if let known = bitnessCache[exe.path] { return known }
-        let is32 = PEResources.machine(of: exe) == PEResources.machineI386
-        bitnessCache[exe.path] = is32
-        return is32
-    }
-
-    /// ml869: a 32-bit game that still runs x86 memory-ordering emulation — the
-    /// case the game's card and ⋯ menu recommend switching. Recommended, never
-    /// the default: a game that relies on strict ordering can crash or glitch
-    /// without it. Celeste went from ~6 fps (sliding into its catch-up spiral)
-    /// to ~40 with it off.
-    func recommendsSkipTSO(_ game: LauncherGame) -> Bool {
-        guard is32Bit(game) else { return false }
-        let skipping = settings(for: game.id).noTSO ?? UserDefaults.standard.bool(forKey: "madeira.fexNoTSO")
-        return !skipping
-    }
-
     /// Main thread. A game whose overrides are all back to Default drops out
     /// of the dictionary.
     func updateSettings(for id: String, _ change: (inout GameSettings) -> Void) {

@@ -729,11 +729,8 @@ struct LauncherView: View {
 
     private func card(_ game: LauncherGame, width: CGFloat, height: CGFloat) -> some View {
         // Keep the whole card on screen in landscape: the cover may not take
-        // more than the height left after title, details and buttons (ml869:
-        // and the 32-bit tip, when it shows).
-        let tsoTip: Bool = !isEnded && library.recommendsSkipTSO(game)
-        let reserved: CGFloat = 190 + (tsoTip ? GameCard.tsoTipHeight : 0)
-        let maxCoverW: CGFloat = max(160, (height - reserved) * LauncherPalette.coverAspect)
+        // more than the height left after title, details and buttons.
+        let maxCoverW: CGFloat = max(160, (height - 190) * LauncherPalette.coverAspect)
         let panelW: CGFloat = max(200, min(width - 32, 560, maxCoverW + 32))
         let coverW: CGFloat = panelW - 32
         let coverH: CGFloat = coverW / LauncherPalette.coverAspect
@@ -760,12 +757,6 @@ struct LauncherView: View {
                         panelWidth: panelW,
                         coverWidth: coverW,
                         coverHeight: coverH,
-                        recommendSkipTSO: tsoTip,
-                        onSkipTSO: {
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            library.updateSettings(for: id) { $0.noTSO = true }
-                            LogStore.shared.log("Games: Skip x86 memory-ordering emulation turned on for \(game.title) from its card")
-                        },
                         onPlay: { primaryAction(id: id) },
                         onMore: {
                             if let g = library.game(withID: id) { optionsGame = g }
@@ -1021,14 +1012,8 @@ private struct GameCard: View {
     let panelWidth: CGFloat
     let coverWidth: CGFloat
     let coverHeight: CGFloat
-    /// ml869: a 32-bit game that still runs x86 memory-ordering emulation.
-    var recommendSkipTSO: Bool = false
-    var onSkipTSO: () -> Void = {}
     let onPlay: () -> Void
     let onMore: () -> Void
-
-    /// ml869: the card's extra height while the 32-bit tip shows.
-    static let tsoTipHeight: CGFloat = 78
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -1047,10 +1032,6 @@ private struct GameCard: View {
                 .minimumScaleFactor(0.7)
                 .frame(maxWidth: .infinity, alignment: .leading)
             details
-            if recommendSkipTSO {
-                skipTSOTip
-                    .transition(.opacity)
-            }
             HStack(spacing: 12) {
                 CardPlayButton(state: playState, focused: focusedIndex == 0, action: onPlay)
                 CardMoreButton(focused: focusedIndex == 1, action: onMore)
@@ -1061,43 +1042,6 @@ private struct GameCard: View {
         .background(LauncherPalette.panelRaised, in: shape)
         .overlay(shape.stroke(Color.white.opacity(0.1), lineWidth: 1))
         .shadow(color: Color.black.opacity(0.5), radius: 24, y: 10)
-        .animation(.easeInOut(duration: 0.2), value: recommendSkipTSO)
-    }
-
-    /// ml869: recommended, never the default — the same setting as the ⋯ menu's
-    /// "Skip x86 memory-ordering emulation" row, for this game only. Touch only:
-    /// a controller reaches the row (and its recommendation) through ⋯.
-    private var skipTSOTip: some View {
-        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
-        return HStack(alignment: .center, spacing: 10) {
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(LauncherPalette.accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Recommended for 32-bit games")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
-                Text("Skip x86 memory-ordering emulation usually makes them much faster. If the game then crashes or glitches, turn it off in ⋯.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(LauncherPalette.textSecondary)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 4)
-            Button(action: onSkipTSO) {
-                Text("Turn On")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .frame(height: 32)
-                    .background(LauncherPalette.accent, in: Capsule())
-                    .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(10)
-        .background(LauncherPalette.panel, in: shape)
-        .overlay(shape.stroke(LauncherPalette.accent.opacity(0.35), lineWidth: 1))
     }
 
     private var details: some View {
@@ -1207,6 +1151,8 @@ private struct OptionRow: Identifiable {
     var trailing: String? = nil
     /// ml830: dimmed, and neither a tap nor A runs the action.
     var disabled: Bool = false
+    /// ml871: a plain line under the title.
+    var note: String? = nil
     let action: () -> Void
 }
 
@@ -1524,6 +1470,7 @@ private struct OptionsSheet: View {
                              destructive: false, checked: false,
                              trailing: tsoText,
                              disabled: busy,
+                             note: "If this game runs poorly, try turning this on or off.",   // ml871
                              action: {
                                  let next: Bool?
                                  switch s.noTSO {
@@ -1679,7 +1626,7 @@ private struct OptionsSheet: View {
             SheetRow(title: row.title, systemImage: row.systemImage,
                      destructive: row.destructive, checked: row.checked,
                      focused: focused, subtitle: nil, thumbnail: nil,
-                     trailing: row.trailing, disabled: disabled)
+                     trailing: row.trailing, disabled: disabled, note: row.note)
         }
         .buttonStyle(SheetRowStyle())
     }
@@ -1850,14 +1797,6 @@ private struct OptionsSheet: View {
                     Text(note)
                         .font(.caption)
                         .foregroundStyle(noteIsError ? LauncherPalette.danger : LauncherPalette.textSecondary)
-                        .lineLimit(2)
-                }
-                // ml869: the same recommendation as the card's tip, for the row below.
-                if !inSubMode && !confirmingDelete && library.recommendsSkipTSO(current) {
-                    Label("32-bit game: turning on Skip x86 memory-ordering emulation is recommended",
-                          systemImage: "bolt.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(LauncherPalette.accent)
                         .lineLimit(2)
                 }
             }
@@ -2103,6 +2042,9 @@ private struct SheetRow: View {
     var trailing: String? = nil
     /// ml830: drawn dimmed (the focus ring stays readable).
     var disabled: Bool = false
+    /// ml871: one plain line under the title (unlike `subtitle`, which is the
+    /// executable picker's path line and swaps the icon for a thumbnail box).
+    var note: String? = nil
 
     private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
@@ -2150,6 +2092,12 @@ private struct SheetRow: View {
                     Text(subtitle)
                         .font(.caption.monospaced())
                         .foregroundStyle(LauncherPalette.textSecondary)
+                }
+                if let note {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(LauncherPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 8)
