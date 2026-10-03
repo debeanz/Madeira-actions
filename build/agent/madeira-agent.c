@@ -16,6 +16,7 @@
  *     args=<optional>
  *     shadercache=off  or  shadercache=/abs/unix/dir    (optional, ml830)
  *     tso=off  or  tso=on                                 (optional, ml849)
+ *     monosuspend=coop|hybrid|preemptive                  (optional, ml868)
  *
  * The agent deletes the request, CreateProcess()es the game with its folder
  * as working directory, and answers in C:\madeira\launch.result:
@@ -317,12 +318,13 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
 static void handle_request( void )
 {
     char *text = read_text_file( REQUEST_PATH );
-    char id[128], exe[1024], dir[1024], args[2048], cache[2048], tso[16], result[256];
+    char id[128], exe[1024], dir[1024], args[2048], cache[2048], tso[16], mono[16], result[256];
     WCHAR *wexe, *wdir, *wargs, *wcache = NULL;
     DWORD pid, err = 0;
     int cache_mode = 0;   /* ml830: 0 = leave the environment alone, 1 = off, 2 = cache dir */
     int tso_mode = 0;     /* ml849: 0 = leave it, 1 = FEX_TSOENABLED=0 (off), 2 = FEX_TSOENABLED=1 (on) */
-    struct saved_env saved[3];
+    int mono_mode = 0;    /* ml868: 0 = leave it, 1 = MONO_THREADS_SUSPEND=<mono> */
+    struct saved_env saved[4];
 
     if (!text) return;
     /* Delete first so a failure cannot be retried forever. */
@@ -391,6 +393,16 @@ static void handle_request( void )
         if (!strcmp( tso, "off" )) tso_mode = 1;
         else if (!strcmp( tso, "on" )) tso_mode = 2;
         else agent_log( "tso=%s ignored: neither \"off\" nor \"on\"", tso );
+    }
+    /* ml868: Wine Mono's thread-suspend policy, which it reads from the game's
+     * environment at startup. The app sends "coop" for 32-bit .NET games: Mono's
+     * default stops threads with SuspendThread + GetThreadContext, which a 32-bit
+     * thread here cannot honour (see SessionLauncher.monoSuspend). */
+    if (get_field( text, "monosuspend", mono, sizeof(mono) ))
+    {
+        if (!strcmp( mono, "coop" ) || !strcmp( mono, "hybrid" ) || !strcmp( mono, "preemptive" ))
+            mono_mode = 1;
+        else agent_log( "monosuspend=%s ignored: not coop, hybrid or preemptive", mono );
     }
     HeapFree( GetProcessHeap(), 0, text );
 
@@ -461,6 +473,25 @@ static void handle_request( void )
         }
     }
 
+    /* ml868: MONO_THREADS_SUSPEND for this CreateProcessW only, same snapshot rule. */
+    if (mono_mode)
+    {
+        if (!save_env( &saved[3], L"MONO_THREADS_SUSPEND" ))
+        {
+            agent_log( "monosuspend override skipped: could not save the agent's environment" );
+            mono_mode = 0;
+        }
+        else
+        {
+            WCHAR wmono[16];
+            BOOL ok;
+            MultiByteToWideChar( CP_UTF8, 0, mono, -1, wmono, ARRAYSIZE(wmono) );
+            ok = SetEnvironmentVariableW( L"MONO_THREADS_SUSPEND", wmono );
+            agent_log( "monosuspend=%s: MONO_THREADS_SUSPEND=%s%s (agent had %ls)", mono, mono,
+                       ok ? "" : " FAILED", saved[3].value ? saved[3].value : L"<unset>" );
+        }
+    }
+
     pid = start_process( wexe, wargs, wdir );
     if (!pid) err = GetLastError();
     if (cache_mode)
@@ -470,6 +501,7 @@ static void handle_request( void )
         restore_env( &saved[1] );
     }
     if (tso_mode) restore_env( &saved[2] );   /* ml849 */
+    if (mono_mode) restore_env( &saved[3] );  /* ml868 */
     if (pid) snprintf( result, sizeof(result), "id=%s\r\nok pid=%lu\r\n", id, (unsigned long)pid );
     else     snprintf( result, sizeof(result), "id=%s\r\nerr code=%lu\r\n", id, (unsigned long)err );
     agent_log( "%s", result );

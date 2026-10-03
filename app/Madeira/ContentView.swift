@@ -1891,10 +1891,12 @@ struct ContentView: View {
             // ml830: this game's own shader cache (or "off") goes to the agent with
             // the launch, because the runtime's environment was fixed when it started.
             let cache = ShaderCache.launchValue(for: game)
+            let monoSuspend = SessionLauncher.monoSuspend(forExe: exe)   // ml868
             logStore.log("Games: launching \(game.title) → \(exePath) (shader cache: "
                          + (cache == "off" ? "off" : ShaderCache.dirName(forGameID: game.id))
                          + ", TSO emulation " + (effectiveNoTSO ? "off" : "on")
-                         + (perGame.noTSO != nil ? " for this game" : "") + ")")
+                         + (perGame.noTSO != nil ? " for this game" : "")
+                         + (monoSuspend.map { ", 32-bit .NET: MONO_THREADS_SUSPEND=\($0)" } ?? "") + ")")
             if !args.isEmpty {
                 logStore.log("Games: \(game.title) — "
                              + (perGame.resolution != nil ? "this game's resolution" : "first launch")
@@ -1902,7 +1904,7 @@ struct ContentView: View {
             }
             // ml837: args = GameResolutionDefault's Unity screen options, or "".
             SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, args: args, shaderCache: cache,
-                                          noTSO: effectiveNoTSO) { outcome in
+                                          noTSO: effectiveNoTSO, monoSuspend: monoSuspend) { outcome in
                 switch outcome {
                 case .started(let pid):
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)
@@ -2341,7 +2343,8 @@ struct ContentView: View {
                 selectedTab = .desktop
             }
             GameLibrary.shared.markPlayed(game)
-            SessionLauncher.shared.launch(exe: game.exeWindowsPath, dir: game.dirWindowsPath) { outcome in
+            SessionLauncher.shared.launch(exe: game.exeWindowsPath, dir: game.dirWindowsPath,
+                                          monoSuspend: SessionLauncher.monoSuspend(forExe: game.exe)) { outcome in   // ml868
                 switch outcome {
                 case .started(let pid):
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)

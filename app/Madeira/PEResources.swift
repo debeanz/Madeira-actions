@@ -29,6 +29,33 @@ enum PEResources {
         return r.u16(pe + 4)
     }
 
+    /// ml868: a .NET assembly's CLR header flags (IMAGE_COR20_HEADER.Flags), or
+    /// nil when the file is not .NET. The CLR header is data directory 14
+    /// (IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR); Flags sits at +16.
+    static func clrFlags(of url: URL) -> UInt32? {
+        guard let d = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        let r = Reader(d)
+        guard let pe = r.peHeaderOffset() else { return nil }
+        let opt = pe + 24
+        let magic = r.u16(opt)
+        guard magic == 0x10b || magic == 0x20b else { return nil }
+        guard r.u32(opt + (magic == 0x20b ? 108 : 92)) > 14 else { return nil }   // NumberOfRvaAndSizes
+        let dir = opt + (magic == 0x20b ? 112 : 96) + 14 * 8
+        let rva = r.u32(dir), size = r.u32(dir + 4)
+        guard rva != 0, size >= 72,
+              let off = r.fileOffset(rva: rva, in: r.sections(pe: pe)) else { return nil }
+        return r.u32(off + 16)
+    }
+
+    /// ml868: true when this exe runs as a 32-bit .NET process under Wine Mono —
+    /// an i386 assembly that requires or prefers 32-bit, or is not IL-only. An
+    /// IL-only "AnyCPU" assembly (no 32-bit flags) runs 64-bit and is not one.
+    static func isManaged32(_ url: URL) -> Bool {
+        guard machine(of: url) == machineI386, let flags = clrFlags(of: url) else { return false }
+        let ilOnly = flags & 0x1 != 0, required32 = flags & 0x2 != 0, preferred32 = flags & 0x20000 != 0
+        return required32 || preferred32 || !ilOnly
+    }
+
     static func icon(of url: URL) -> UIImage? {
         guard let d = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         guard let ico = Reader(d).mainIconICO() else { return nil }

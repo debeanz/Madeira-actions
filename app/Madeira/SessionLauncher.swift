@@ -12,7 +12,8 @@ import Foundation
 //
 //   C:\madeira\agent.ready     written by the agent once services.exe is up
 //   C:\madeira\launch.txt      id= / exe= / dir= / args= lines, written here,
-//                              plus an optional shadercache= line (ml830)
+//                              plus optional shadercache= (ml830), tso= (ml849)
+//                              and monosuspend= (ml868) lines
 //   C:\madeira\launch.result   id= then "ok pid=N" or "err code=N"
 //
 // ml830: "shadercache=off" or "shadercache=<absolute unix dir>" gives this one
@@ -43,6 +44,23 @@ final class SessionLauncher {
     private var resultURL: URL { agentDir.appendingPathComponent("launch.result") }
 
     var agentReady: Bool { FileManager.default.fileExists(atPath: readyURL.path) }
+
+    /// ml868: Wine Mono's thread-suspend policy for one launch. A 32-bit .NET
+    /// game gets "coop"; everything else nil (inherits Mono's default).
+    ///
+    /// Why: Mono's default (hybrid) stops a running thread for every garbage
+    /// collection with SuspendThread + GetThreadContext, and neither works for a
+    /// 32-bit thread here — the suspend is a counter (the thread keeps running,
+    /// see wineserver mach_ios.c ml730) and the server's context read only knows
+    /// the ARM64EC CPU area, so Mono gets Esp=0, resumes, and retries forever.
+    /// Celeste 0.1.134 froze exactly so: 4,608+ suspend/resume rounds of its main
+    /// thread from the loading thread's first collection. In "coop" mode a
+    /// running thread stops itself at the next JIT-inserted safepoint and a
+    /// thread in native code counts as already stopped, so neither call is made.
+    static func monoSuspend(forExe exe: URL?) -> String? {
+        guard let exe = exe, PEResources.isManaged32(exe) else { return nil }
+        return "coop"
+    }
 
     /// Call before starting a new desktop so a marker from a previous session
     /// (same prefix, app relaunched) cannot pass for the new agent.
@@ -112,8 +130,11 @@ final class SessionLauncher {
     /// `noTSO`: ml849 — true/false sends "tso=off"/"tso=on", which the agent
     /// turns into FEX_TSOENABLED=0/1 around this game's CreateProcessW; nil
     /// sends nothing (the game inherits the runtime's setting).
+    /// `monoSuspend`: ml868 — "coop" sends "monosuspend=coop", which the agent
+    /// turns into MONO_THREADS_SUSPEND=coop around this game's CreateProcessW;
+    /// nil sends nothing. See monoSuspend(forExe:).
     func launch(exe: String, dir: String, args: String = "", shaderCache: String? = nil,
-                noTSO: Bool? = nil,
+                noTSO: Bool? = nil, monoSuspend: String? = nil,
                 readyTimeout: TimeInterval = 120,
                 completion: @escaping (Outcome) -> Void) {
         queue.async {
@@ -143,6 +164,9 @@ final class SessionLauncher {
             }
             if let noTSO = noTSO {
                 text += "tso=\(noTSO ? "off" : "on")\r\n"   // ml849
+            }
+            if let monoSuspend = monoSuspend {
+                text += "monosuspend=\(monoSuspend)\r\n"     // ml868
             }
             let tmp = self.agentDir.appendingPathComponent("launch.tmp")
             do {
