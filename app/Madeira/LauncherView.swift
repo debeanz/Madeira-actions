@@ -2270,10 +2270,10 @@ enum GameLogSaver {
 /// (never read) a log. Empty until that project exists; the form then says so
 /// and will not send.
 enum ReportService {
-    static let projectURL = ""
+    static let projectURL = "https://qhzndkrulgmmyjjjqtic.supabase.co"
     /// The project's publishable key (sb_publishable_…) or legacy anon key —
     /// public by design; supabase/schema.sql on main fixes what it allows.
-    static let anonKey = ""
+    static let anonKey = "sb_publishable_fgSjPcB3ZrdiuvTZan1Yqg_HxGXSvDi"
     static let siteURL = "https://debeanz.github.io/Madeira-actions/"
 
     static var isConfigured: Bool { !projectURL.isEmpty && !anonKey.isEmpty }
