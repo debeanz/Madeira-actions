@@ -52,7 +52,9 @@ create policy "anyone can read reports" on public.reports
   for select to anon, authenticated using (true);
 
 -- Column privileges: the public key may write only these columns and read
--- everything except client_id. created_at is always the server's clock.
+-- everything except client_id. created_at is always the server's clock. Every
+-- grant is explicit, so this works with "Automatically expose new tables" off.
+grant usage on schema public to anon, authenticated;
 revoke all on public.reports from anon, authenticated;
 grant insert (id, game, steam_app_id, rating, issues, fps, description,
               madeira_version, device, ios, arch, settings, has_log, client_id)

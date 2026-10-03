@@ -3,7 +3,7 @@
 // what they allow is fixed by supabase/schema.sql. supabaseAnonKey takes the
 // publishable key (sb_publishable_…) or a legacy anon key.
 window.MADEIRA_CONFIG = {
-  supabaseUrl: "",
-  supabaseAnonKey: "",
+  supabaseUrl: "https://qhzndkrulgmmyjjjqtic.supabase.co",
+  supabaseAnonKey: "sb_publishable_fgSjPcB3ZrdiuvTZan1Yqg_HxGXSvDi",
   repo: "https://github.com/debeanz/Madeira-actions",
 };
