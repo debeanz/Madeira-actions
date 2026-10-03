@@ -17571,6 +17571,52 @@ NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZ
  * diagnostic, and it only ever goes false -> true in practice. */
 int ios_dep_disabled;
 
+/* iOS-Madeira ml888: virtual_set_force_exec()'s sweep over a VirtualAlloc view, for
+ * COMMITTED host pages only. Returns how many fully decommitted host pages it left alone.
+ *
+ * The sweep exists to add PROT_EXEC to committed readable pages (which iOS refuses anyway,
+ * see mprotect_exec's [force-exec] note). Re-deriving a DECOMMITTED page from the page table
+ * can only give PROT_NONE -- but decommit_pages() deliberately leaves decommitted pages
+ * readable and writable on this port, because FEX's VirtualDontNeed() is a bare MEM_DECOMMIT
+ * whose pages FEX keeps using: the LookupCache L1 array after every code-cache clear. So a
+ * 32-bit program that turned DEP off AFTER its first code-cache clear lost its dispatcher's
+ * L1 array. Celeste on 0.1.153: [gen] alloc#2, then [dep-off], then 2000 identical
+ * redeliveries of an L1 read (ldp at the dispatcher's LoopTop, region prot=0 while the wine
+ * view says committed RW); on every earlier run [dep-off] had come first. A page that was
+ * never committed is PROT_NONE already, so nothing else changes. Only 32-bit processes reach
+ * the sweep (process_ios.c refuses ProcessExecuteFlags for 64-bit ones). */
+static unsigned long ios_force_exec_committed( void *base, size_t size )
+{
+    char *addr = ROUND_ADDR( base, host_page_mask );
+    size_t i, n = ROUND_SIZE( base, size, host_page_mask ) / host_page_size;
+    char *run = NULL;
+    int run_prot = 0;
+    unsigned long kept = 0;
+
+    for (i = 0; i <= n; i++)   /* i == n closes the last run */
+    {
+        char *page = addr + i * host_page_size;
+        BYTE vprot = i < n ? get_host_page_vprot( page ) : 0;
+        int prot = (vprot & VPROT_COMMITTED) ? get_unix_prot( vprot ) : -1;
+
+        if (run && prot != run_prot)
+        {
+            mprotect_exec( run, page - run, run_prot );
+            run = NULL;
+        }
+        if (prot == -1)
+        {
+            if (i < n) kept++;
+        }
+        else if (!run)
+        {
+            run = page;
+            run_prot = prot;
+        }
+    }
+    return kept;
+}
+
 void virtual_set_force_exec( BOOL enable )
 {
     struct file_view *view;
@@ -17589,12 +17635,22 @@ void virtual_set_force_exec( BOOL enable )
                     "InvalidationTracker, reached via BTCpuNotifyProcessExecuteFlagsChange\n",
                  enable ? "DISABLED" : "re-enabled", enable );
 
-        WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
         {
-            /* file mappings are always accessible */
-            BYTE commit = is_view_valloc( view ) ? 0 : VPROT_COMMITTED;
+            unsigned long kept = 0;
 
-            mprotect_range( view->base, view->size, commit, 0 );
+            WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+            {
+                /* file mappings are always accessible */
+                BYTE commit = is_view_valloc( view ) ? 0 : VPROT_COMMITTED;
+
+                /* ml888: a VirtualAlloc view re-applies its committed pages only */
+                if (commit) mprotect_range( view->base, view->size, commit, 0 );
+                else kept += ios_force_exec_committed( view->base, view->size );
+            }
+            if (kept)
+                dprintf( 2, "[dep-off] ml888 left %lu decommitted host page(s) as they were instead of "
+                            "PROT_NONE (decommit keeps pages usable on this port; FEX's lookup caches "
+                            "are among them)\n", kept );
         }
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
