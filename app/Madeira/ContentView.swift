@@ -327,6 +327,27 @@ final class MetalBackedView: UIView {
     /// it off (the `guard trackpadMode else { … winios_post_touch_* }` fallback
     /// in the touch handlers is that path).
     private var trackpadMode: Bool { true }
+
+    /// ml856: the outer bands of the full-screen view, as a fraction of its
+    /// width, where a finger that LANDS does not drive the cursor. In landscape
+    /// the thumbs grip the phone by its sides — where the stick and buttons sit —
+    /// and a thumb landing just off a control fell through to this view and
+    /// dragged the pointer around. Only a finger that lands in the middle half is
+    /// a trackpad finger. The arrow can still reach every edge: the trackpad is
+    /// relative, so this limits where a drag starts, not where the pointer goes.
+    private static let cursorSideBand: CGFloat = 0.25
+
+    private func landsInCursorSideBand(_ t: UITouch) -> Bool {
+        // Full screen only: that is where thumbs hold the sides. The small inline
+        // desktop has no controls and keeps its whole area. Mouse-look is exempt —
+        // there the finger is the camera, not a cursor, and a look drag often
+        // starts at the right edge.
+        guard TouchControlsModel.shared.fullScreen, !InputSettings.shared.relative,
+              bounds.width > 0 else { return false }
+        let x = t.location(in: self).x
+        return x < bounds.width * Self.cursorSideBand || x > bounds.width * (1 - Self.cursorSideBand)
+    }
+
     private func envInt(_ name: String, _ def: Int) -> Int {
         guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
         return i
@@ -404,14 +425,24 @@ final class MetalBackedView: UIView {
             if !liftedEarly.isEmpty { touchesEnded(Set(liftedEarly), with: event) }
         }
         surfaceTouches.removeAll { $0.phase == .ended || $0.phase == .cancelled }
-        for t in touches where !surfaceTouches.contains(t) { surfaceTouches.append(t) }
+        // ml856: a finger landing in a side band is not a pointer finger. It never
+        // becomes the owner or a second scroll finger, so a thumb resting by the
+        // controls cannot move, scroll or click the cursor.
+        let pointerTouches: Set<UITouch> = trackpadMode
+            ? touches.filter({ !landsInCursorSideBand($0) })
+            : touches
+        for t in pointerTouches where !surfaceTouches.contains(t) { surfaceTouches.append(t) }
         // Chrome tap keeps the old app-wide rule: no other finger anywhere (a
         // held stick/button suppresses it), so tap-to-click while walking does
         // not keep bringing the toolbar back.
         let othersDown = (event?.allTouches ?? []).contains {
             !touches.contains($0) && $0.phase != .ended && $0.phase != .cancelled
         }
-        if surfaceTouches.count == 1, !othersDown, let t = touches.first {
+        // ml856: judged on every finger, side bands included, so a tap in a top
+        // corner still brings the toolbar back. This used to read
+        // `surfaceTouches.count == 1`; with side fingers kept out of that list the
+        // same rule is "this is the only finger in the whole app".
+        if touches.count == 1, !othersDown, let t = touches.first {
             chromeTapTouch = t
             chromeTapStart = t.location(in: self)
             chromeTapTime = now
@@ -424,6 +455,10 @@ final class MetalBackedView: UIView {
             winios_post_touch_down(x, y)
             return
         }
+        // ml856: only side-band fingers landed. Leave the owner's gesture exactly
+        // as it was — bumping touchGeneration here would cancel its pending
+        // long-press drag.
+        guard !pointerTouches.isEmpty else { return }
         touchGeneration += 1
         if surfaceTouches.count >= 2 {
             if !twoFingerActive {
@@ -434,7 +469,7 @@ final class MetalBackedView: UIView {
                 rightClickPending = false
                 // A right-click tap needs both fingers to be taps: they landed
                 // together, or the first was still a fresh, still touch.
-                twoFingerTapEligible = touches.count >= 2
+                twoFingerTapEligible = pointerTouches.count >= 2
                     || (ownerTouch != nil && ownerTapEligible && !movedBeyondSlop
                         && now - touchStartTime < 0.40)
             }
@@ -444,7 +479,7 @@ final class MetalBackedView: UIView {
             // a drag started by the first finger stays active; harmless
             return
         }
-        guard let t = touches.first else { return }
+        guard let t = pointerTouches.first else { return }
         twoFingerActive = false        // ml826: a lone finger is never in two-finger mode
         rightClickPending = false
         adoptOwner(t, now: now, tapEligible: true)
@@ -689,6 +724,13 @@ final class MetalBackedView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // ml856: was any of these a pointer finger? A side-band finger never was,
+        // and edge touches are exactly the ones the system cancels on its own (an
+        // edge swipe), so that cancel must not tear down the middle finger's
+        // gesture. Asked before the list below drops them.
+        let tracked = touches.contains { t in
+            surfaceTouches.contains(t) || t === ownerTouch || t === dragTouch
+        }
         surfaceTouches.removeAll { touches.contains($0) || $0.phase == .ended || $0.phase == .cancelled }
         if let ct = chromeTapTouch, touches.contains(ct) { chromeTapTouch = nil }
         guard trackpadMode else {
@@ -697,6 +739,7 @@ final class MetalBackedView: UIView {
             winios_post_touch_up(x, y)
             return
         }
+        guard tracked else { return }
         // Log scripts grep for the "[trackpad] CANCELLED (dragActive=" prefix.
         fputs("[trackpad] CANCELLED (dragActive=\(dragActive) left=\(surfaceTouches.count))\n", stderr)
         resetSurfaceGesture()
@@ -1458,6 +1501,12 @@ struct ContentView: View {
     /// A game already ran in this process and the runtime cannot be started
     /// again: offer to quit so the next game gets a fresh launch.
     @State private var showRelaunchAlert = false
+    /// ml856: a game just ended — recommend a fresh start before the next one.
+    /// On this port quitting a game does not give everything back: each launch
+    /// leaks part of FEX's address band (the third can take the whole app down),
+    /// and a crash leaves threads behind that can hold a lock the next game
+    /// blocks on (ml812). Advice, not a block: "Not Now" keeps the warm session.
+    @State private var showRestartAfterGameAlert = false
     @State private var showActivityLogs = false
     @State private var showRuntimeStatus = false
     @State private var prefixSizeText = "Calculating…"
@@ -1575,6 +1624,14 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Games launched from the Games tab run on their own, without the Windows desktop, and the runtime can only be started once per launch. Quit and reopen Madeira, then use Start Desktop before playing a game.")
+        }
+        .alert("Restart Madeira before your next game", isPresented: $showRestartAfterGameAlert) {
+            Button("Close Madeira", role: .destructive) { quitApp() }
+            Button("Not Now", role: .cancel) {}
+        } message: {
+            Text("Quitting a game doesn't free everything it used — some memory and background "
+                 + "threads stay behind until Madeira closes. For the best performance and to avoid "
+                 + "crashes, close Madeira and reopen it before playing again.")
         }
         .onAppear {
             jit_install_trap_handler()
@@ -1698,6 +1755,7 @@ struct ContentView: View {
                 launchingGame = nil
                 desktopFullScreen = false
                 selectedTab = .games
+                recommendRestartAfterGame()      // ml856
             }
         }
     }
@@ -2081,6 +2139,7 @@ struct ContentView: View {
                 self.launchingGame = nil
                 self.desktopFullScreen = false
                 self.selectedTab = .games
+                self.recommendRestartAfterGame()   // ml856
             }
         }
         SessionLauncher.shared.waitForExit(pid: pid) { code in
@@ -2107,6 +2166,7 @@ struct ContentView: View {
                 launchingGame = nil
                 desktopFullScreen = false
                 selectedTab = .games
+                recommendRestartAfterGame()   // ml856
             }
         }
     }
@@ -2311,6 +2371,20 @@ struct ContentView: View {
         logStore.log("Quitting Madeira at the user's request")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             _exit(0)
+        }
+    }
+
+    /// ml856: called from each place a game's session ends and the Games tab
+    /// comes back — its exit report, the stall watchdog, and the force-close
+    /// timeout. All three are guarded on `.playing`, so exactly one fires per
+    /// game. The alert waits for the Games tab to be on screen rather than being
+    /// raised mid-swap out of the full-screen game view, and is dropped if the
+    /// user has already started another game.
+    private func recommendRestartAfterGame() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            guard launcherSession == .idle, !desktopFullScreen else { return }
+            logStore.log("Recommending a restart of Madeira before the next game")
+            showRestartAfterGameAlert = true
         }
     }
 
