@@ -4931,11 +4931,28 @@ static void *ios_mach_exception_thread( void *arg )
                              * was executed natively) is skipped. No registry: the mapping
                              * is the state, and an exec fault on a demoted guest page is
                              * already handled by the anon-alias RX redirect.
-                             * Kill switch for A/B: MADEIRA_NO_PAGE_DEMOTE=1. */
+                             * Kill switch for A/B: MADEIRA_NO_PAGE_DEMOTE=1.
+                             *
+                             * ============ ml867 ALL OF A 32-BIT GUEST'S RWX ============
+                             *
+                             * Celeste 0.1.133 (32-bit, Wine Mono x86): 2-10 fps and a
+                             * loading screen that never finished -- 40,000 emulated stores
+                             * a second, 99% on the game's main thread, all into anon RWX
+                             * (Mono's code chunks and its PAGE_EXECUTE_READWRITE heap; Wine
+                             * also drops DEP for the whole process when any module lacks
+                             * NX_COMPAT). The same reasoning as above holds for EVERY such
+                             * page of a 32-bit process, not just a Boehm heap: i386 code is
+                             * only ever run from FEX's translations (the host never executes
+                             * a guest-window page -- see mprotect_exec's force-exec note in
+                             * virtual_ios.c), this path never invalidated FEX either (ml635),
+                             * and the ml648 Mono bridge refuses 32-bit callers, so trapping
+                             * buys nothing there. Demote on the first emulated write. */
                             if (!in_jit)
                             {
                                 extern int ios_jit_anon_alias_is_boehm( uintptr_t );
+                                extern int ios_wow_addr_in_live_window( unsigned long long );
                                 static int demote_off = -1;
+                                int wow_page = 0;
                                 if (demote_off < 0)
                                 {
                                     const char *e = getenv( "MADEIRA_NO_PAGE_DEMOTE" );
@@ -4943,10 +4960,12 @@ static void *ios_mach_exception_thread( void *arg )
                                     dprintf( 2, "[demote] ml847 GC-heap page demotion %s\n",
                                              demote_off ? "DISABLED (MADEIRA_NO_PAGE_DEMOTE)" : "enabled" );
                                 }
-                                if (!demote_off && ios_jit_anon_alias_is_boehm( (uintptr_t)fault_addr ))
+                                if (!demote_off &&
+                                    (ios_jit_anon_alias_is_boehm( (uintptr_t)fault_addr ) ||
+                                     (wow_page = ios_wow_addr_in_live_window( (unsigned long long)fault_addr ))))
                                 {
                                     unsigned long long pg = (unsigned long long)fault_addr & ~0x3fffull;
-                                    static volatile unsigned demoted_n, failed_n, sticky_n;
+                                    static volatile unsigned demoted_n, failed_n, sticky_n, wow_n;
                                     int q, sticky = 0;
                                     for (q = 0; q < IOS_WX_MAX; q++)
                                         if (ios_wx_pages[q].page == pg) { sticky = ios_wx_pages[q].sticky; break; }
@@ -4955,10 +4974,12 @@ static void *ios_mach_exception_thread( void *arg )
                                     else if (mprotect( (void *)(uintptr_t)pg, 0x4000, PROT_READ | PROT_WRITE ) == 0)
                                     {
                                         unsigned d = __sync_add_and_fetch( &demoted_n, 1 );
+                                        unsigned w = wow_page ? __sync_add_and_fetch( &wow_n, 1 ) : wow_n;
                                         if (d <= 8 || (d & 0x3ff) == 0)
-                                            dprintf( 2, "[demote] ml847 #%u GC-heap page 0x%llx -> RW on first "
-                                                        "emulated write (failed=%u sticky=%u)\n",
-                                                     d, pg, failed_n, sticky_n );
+                                            dprintf( 2, "[demote] ml847 #%u %s page 0x%llx -> RW on first "
+                                                        "emulated write (32-bit=%u failed=%u sticky=%u)\n",
+                                                     d, wow_page ? "ml867 32-bit guest" : "GC-heap", pg,
+                                                     w, failed_n, sticky_n );
                                     }
                                     else
                                     {

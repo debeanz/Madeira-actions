@@ -6800,6 +6800,17 @@ int ios_wow_in_window( const void *addr )
     return base && (ULONG_PTR)addr >= base && (ULONG_PTR)addr < base + IOS_WOW_WINDOW_SIZE;
 }
 
+/* ml867: is `addr` inside a LIVE 32-bit guest window -- whoever is asking?
+ *
+ * For the Mach exception server's store emulator (signal_arm64_ios.c), which
+ * runs on a thread that belongs to no pseudo-process, so ios_wow_in_window()
+ * (the CALLER's window) cannot answer it.  Unlocked like ios_prof_wow_window:
+ * a torn read can only send one fault down the old, emulated path. */
+int ios_wow_addr_in_live_window( unsigned long long addr )
+{
+    return ios_wow_live_slot_for_addr( (const void *)(uintptr_t)addr ) != NULL;
+}
+
 ULONG ios_wow_guest_addr( const void *host )
 {
     ULONG_PTR base = ios_wow_base();
@@ -7858,6 +7869,7 @@ ULONG_PTR ios_wow_base_for_peb( void *peb_id ) { return 0; }
 void *ios_session_peb_get(void) { return NULL; }
 ULONG_PTR ios_wow_base(void) { return 0; }
 int ios_wow_in_window( const void *addr ) { return 0; }
+int ios_wow_addr_in_live_window( unsigned long long addr ) { return 0; }
 ULONG ios_wow_guest_addr( const void *host ) { return PtrToUlong( host ); }
 void ios_wow_translate_limits( ULONG_PTR *l, ULONG_PTR *h ) { }
 NTSTATUS ios_wow_window_reserve(void) { return STATUS_NOT_SUPPORTED; }
