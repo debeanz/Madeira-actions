@@ -2594,6 +2594,10 @@ struct ReportSheet: View {
     @State private var savedPadHandler: ((GamepadNavAction) -> Void)? = nil
     @State private var savedPadOwner: AnyObject? = nil
     @FocusState private var textFocused: Bool
+    /// The "What happened?" box, in the form's coordinate space: a tap anywhere
+    /// else closes the keyboard.
+    @State private var textBox: CGRect = .zero
+    private static let formSpace = "reportForm"
     @Environment(\.openURL) private var openURL
 
     init(game: LauncherGame, note: String?, presetIssues: Set<String> = [], close: @escaping () -> Void) {
@@ -2620,6 +2624,13 @@ struct ReportSheet: View {
                     }
                 }
                 .padding(20)
+                // Tapping outside the text box closes the keyboard. Simultaneous, so
+                // the chips and buttons still get their tap.
+                .contentShape(Rectangle())
+                .simultaneousGesture(SpatialTapGesture(coordinateSpace: NamedCoordinateSpace.named(Self.formSpace)).onEnded { tap in
+                    if textFocused && !textBox.contains(tap.location) { textFocused = false }
+                })
+                .coordinateSpace(NamedCoordinateSpace.named(Self.formSpace))
             }
             .scrollDismissesKeyboard(.interactively)
             .background(LinearGradient(colors: [LauncherPalette.bgTop, LauncherPalette.bgBottom],
@@ -2718,6 +2729,12 @@ struct ReportSheet: View {
                 }
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(LauncherPalette.panel))
+                .background(GeometryReader { g in
+                    let box = g.frame(in: NamedCoordinateSpace.named(Self.formSpace))
+                    Color.clear
+                        .onAppear { textBox = box }
+                        .onChange(of: box) { _, new in textBox = new }
+                })
                 Text("\(text.count) / 2000")
                     .font(.caption2)
                     .foregroundStyle(LauncherPalette.textSecondary)
