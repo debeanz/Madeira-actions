@@ -1222,6 +1222,8 @@ private struct OptionsSheet: View {
     @State private var deleting: Bool = false
     @State private var deleteError: String? = nil
     @State private var folderBytes: Int64? = nil
+    /// ml862: the game's folder size for the header; nil until measured off main.
+    @State private var gameBytes: Int64? = nil
     /// ml857: Save Log in progress, then what it did ("Saved: Celeste (…)").
     @State private var savingLog: Bool = false
     @State private var saveLogResult: String? = nil
@@ -1658,6 +1660,7 @@ private struct OptionsSheet: View {
         .onAppear {
             configure(list.count)
             loadCacheSize()
+            loadGameSize()   // ml862
             let m: SheetRowsModel = model
             GamesFocus.shared.overlayOwner = m
             GamesFocus.shared.overlayHandler = { [weak m] (action: GamepadNavAction) in
@@ -1730,7 +1733,24 @@ private struct OptionsSheet: View {
                 return ("Remove from library", path, reason)
             }
         }
-        return (g.title, g.exeWindowsPath, deleteError)
+        return (g.title, g.exeWindowsPath, deleteError ?? sizeNote(g))
+    }
+
+    /// ml862: "Size: 1.2 GB" under the game's path, or nil when the game's folder
+    /// is not its own (GameLibrary.sizeFolder).
+    private func sizeNote(_ g: LauncherGame) -> String? {
+        guard library.sizeFolder(for: g) != nil else { return nil }
+        return "Size: " + (gameBytes.map { ShaderCache.text($0) } ?? "measuring…")
+    }
+
+    /// ml862: measured each time the menu opens, off the main thread — a big
+    /// game is tens of thousands of files, and its size can change between opens.
+    private func loadGameSize() {
+        guard gameBytes == nil, let folder = library.sizeFolder(for: current) else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let bytes: Int64 = ShaderCache.sizeBytes(of: folder)
+            DispatchQueue.main.async { gameBytes = bytes }
+        }
     }
 
     private var header: some View {

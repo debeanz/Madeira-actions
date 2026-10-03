@@ -451,6 +451,23 @@ final class GameLibrary: ObservableObject {
         return nil
     }
 
+    /// ml862: the folder whose size the game's options menu shows, or nil when
+    /// that folder is not the game's own — the drive itself, a container such as
+    /// Program Files or Games, or a Windows folder — where measuring would count
+    /// other games and Wine itself. Display-only, so unlike deletePlan it accepts
+    /// a hand-added game's folder too.
+    func sizeFolder(for game: LauncherGame) -> URL? {
+        let rel = relative(game.folder, to: GameLibrary.driveC)
+        guard !rel.hasPrefix("/") else { return nil }   // drive_c itself, or outside it
+        let comps = rel.split(separator: "/").map { $0.lowercased() }
+        guard let first = comps.first else { return nil }
+        if ["windows", "users", "programdata"].contains(first) { return nil }
+        if comps.count == 1, GameLibrary.containerRoots.contains(where: { $0.lowercased() == first }) {
+            return nil
+        }
+        return game.folder
+    }
+
     /// Last plan handed out (main thread). The options sheet asks several times
     /// per redraw and every answer resolves the paths of the whole library, so
     /// an answer is reused for 2 s while the library looks the same. delete()
