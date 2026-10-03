@@ -1511,7 +1511,7 @@ struct ContentView: View {
     /// "Save Log" alert offers to keep, and that alert's headline. nil otherwise.
     @State private var crashLogGame: LauncherGame? = nil
     @State private var crashLogTitle = ""
-    /// ml859: what saving it did ("Log saved as Celeste 3 …"), shown at the top
+    /// ml859: what saving it did ("Log saved as Celeste (…) …"), shown at the top
     /// of the restart alert that follows.
     @State private var crashLogResult: String? = nil
     @State private var showActivityLogs = false
@@ -1633,7 +1633,7 @@ struct ContentView: View {
             Text("Games launched from the Games tab run on their own, without the Windows desktop, and the runtime can only be started once per launch. Quit and reopen Madeira, then use Start Desktop before playing a game.")
         }
         // ml859: after a crash, hang or failed start — save THAT game's log as
-        // "<title> <n>.txt" in Documents/logs. Either answer leads into the
+        // "<title> (<date>).txt" in Documents/logs. Either answer leads into the
         // restart advice below.
         .alert(Text(crashLogTitle),
                isPresented: Binding(get: { crashLogGame != nil },
@@ -1643,7 +1643,7 @@ struct ContentView: View {
             Button("Not Now", role: .cancel) { recommendRestartAfterGame() }
         } message: { _ in
             Text("Save a log of what happened so the problem can be looked at? It goes to "
-                 + "Files › Madeira › logs, named after the game and numbered.")
+                 + "Files › Madeira › logs, named after the game and the date.")
         }
         .alert("Restart Madeira before your next game", isPresented: $showRestartAfterGameAlert) {
             Button("Close Madeira", role: .destructive) { quitApp() }
@@ -6492,7 +6492,7 @@ extension Notification.Name {
     /// ml858: the in-game toolbar's Save Log button. ContentView answers it,
     /// because only it knows which game is running (launchingGame).
     static let madeiraSaveLog = Notification.Name("MadeiraSaveLog")
-    /// ml858: the save finished; userInfo["name"] is the file's name ("Celeste 3"),
+    /// ml858: the save finished; userInfo["name"] is the file's name without .txt,
     /// absent when there was no log to save.
     static let madeiraLogSaved = Notification.Name("MadeiraLogSaved")
 }
@@ -6507,7 +6507,7 @@ struct TouchControlsOverlay: View {
     @State private var chromeVisible = true
     @State private var chromeHideWork: DispatchWorkItem?
     private var chromeShown: Bool { chromeVisible || m.editing }
-    /// ml858: what the toolbar's Save Log did ("Saved: Celeste 3"), shown under
+    /// ml858: what the toolbar's Save Log did ("Saved: Celeste (…)"), shown under
     /// the toolbar for a few seconds.
     @State private var logToast: String? = nil
     @State private var logToastHide: DispatchWorkItem?

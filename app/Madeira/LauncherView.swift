@@ -1222,7 +1222,7 @@ private struct OptionsSheet: View {
     @State private var deleting: Bool = false
     @State private var deleteError: String? = nil
     @State private var folderBytes: Int64? = nil
-    /// ml857: Save Log in progress, then what it did ("Saved: Celeste 3").
+    /// ml857: Save Log in progress, then what it did ("Saved: Celeste (…)").
     @State private var savingLog: Bool = false
     @State private var saveLogResult: String? = nil
     @State private var folderSizing: Bool = false
@@ -1328,7 +1328,7 @@ private struct OptionsSheet: View {
                                      dismiss()
                                  }))
         }
-        // ml857: a numbered copy of this game's log in Documents/logs. No dismiss:
+        // ml857: a dated copy of this game's log in Documents/logs. No dismiss:
         // the row itself says where the file went (an alert would leave the pad dead).
         out.append(OptionRow(id: "savelog", title: "Save Log", systemImage: "doc.text",
                              destructive: false, checked: false,
@@ -2083,8 +2083,8 @@ private struct SheetRowStyle: ButtonStyle {
 // MARK: - Save Log (ml857)
 
 /// ml857: "Save Log" in a game's ⋯ menu writes one file per press into
-/// Documents/logs (Files › Madeira › logs), named after the game and numbered —
-/// "Celeste 1.txt", "Celeste 2.txt", … — so the newest has the highest number.
+/// Documents/logs (Files › Madeira › logs), named after the game and when it was
+/// saved: "Celeste (2026-10-03 14.05).txt".
 ///
 /// Which run it saves: the session this game last ran in. LogStore rotates
 /// madeira-log.txt into madeira-log.prev.txt at every launch, and the post-game
@@ -2152,13 +2152,14 @@ enum GameLogSaver {
 
         let dir = docs.appendingPathComponent("logs", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        // ml860: "<title> <n> (<yyyy-MM-dd HH.mm>).txt". n counts up per game, so
-        // "Celeste 3" stays the short way to name one; the date and time say when
-        // at a glance in the Files app.
+        // ml860: "<title> (yyyy-MM-dd HH.mm).txt" — the game and when, nothing
+        // else (the user dropped the per-game number). A second save in the same
+        // minute gets the seconds too, rather than replacing the first.
         let base = fileSafe(title)
-        let existing = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-        let highest = existing.compactMap { number(in: $0, base: base) }.max() ?? 0
-        let name = "\(base) \(highest + 1) (\(fileStamp.string(from: date)))"
+        var name = "\(base) (\(fileStamp.string(from: date)))"
+        if fm.fileExists(atPath: dir.appendingPathComponent(name + ".txt").path) {
+            name = "\(base) (\(fileStampSeconds.string(from: date)))"
+        }
         do {
             try out.write(to: dir.appendingPathComponent(name + ".txt"), options: .atomic)
         } catch {
@@ -2167,26 +2168,17 @@ enum GameLogSaver {
         return name
     }
 
-    /// The n in "<base> <n> (<date>).txt", or in "<base> <n>.txt" (the shape
-    /// 0.1.121 saved), else nil. The number must be followed by exactly " (" or
-    /// ".txt", so a game called "Celeste 64" is never counted as Celeste's 64th log.
-    private static func number(in file: String, base: String) -> Int? {
-        guard file.hasPrefix(base + " "), file.hasSuffix(".txt") else { return nil }
-        let rest = file.dropFirst(base.count + 1)
-        let digits = rest.prefix { $0.isASCII && $0.isNumber }
-        guard !digits.isEmpty, let n = Int(digits) else { return nil }
-        let after = rest.dropFirst(digits.count)
-        return (after == ".txt" || after.hasPrefix(" (")) ? n : nil
-    }
-
     /// "2026-10-03 14.05": sorts by date, 24-hour like the log's own timestamps,
     /// and no colon, which the Files app does not allow in a name.
-    private static let fileStamp: DateFormatter = {
+    private static let fileStamp = stampFormatter("yyyy-MM-dd HH.mm")
+    private static let fileStampSeconds = stampFormatter("yyyy-MM-dd HH.mm.ss")
+
+    private static func stampFormatter(_ format: String) -> DateFormatter {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd HH.mm"
+        f.dateFormat = format
         return f
-    }()
+    }
 
     /// The newest Player.log / output_log.txt under any profile's
     /// AppData/LocalLow/<company>/<product>. Profiles disagree on the user name
