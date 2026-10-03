@@ -70,8 +70,8 @@ struct GameSettings: Codable, Equatable {
     /// otherwise). A Unity game also gets it as -screen-width/-height on every
     /// launch; another game sees it as the display size.
     var resolution: String? = nil
-    /// Skip x86 memory-ordering emulation for this game (FEX_TSOENABLED=0),
-    /// sent to the agent as the tso= line.
+    /// true = "x86 memory-ordering" Off for this game (FEX_TSOENABLED=0), false =
+    /// On; sent to the agent as the tso= line.
     var noTSO: Bool? = nil
     /// FrameCap raw value for this game; Settings' cap comes back when it ends.
     var frameCap: Int? = nil
