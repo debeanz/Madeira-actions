@@ -23,8 +23,10 @@ takes a few minutes and needs no card.
 
 ## Day to day
 
-- **Logs** are in **Storage → logs**, one `<report id>.txt.gz` per report that
-  attached one. The report's id is in the **reports** table.
+- **Logs** are in **Storage → logs**: a folder per game, named like its page
+  on the site, holding one plain-text file per report that attached a log —
+  `<date> <game> <report id>.txt`. The report's id is in the **reports** table.
+  The dashboard can't preview text: **Download**, then double-click.
 - **Spam** — delete the row in **Table Editor → reports**; the website drops it
   on the next load.
 - **Pausing** — Supabase pauses free projects after a week without traffic.

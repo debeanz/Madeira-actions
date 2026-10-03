@@ -103,15 +103,25 @@ select game_key                                             as key,
 grant select on public.game_summary to anon, authenticated;
 
 -- ── Log files ────────────────────────────────────────────────────────────────
+-- Plain text, one folder per game (named like its page on the site), and a
+-- name that sorts by date and says which game and which report:
+--   untitled-goose-game/2026-10-03 12.16 Untitled Goose Game 84f5d6f0-….txt
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values ('logs', 'logs', false, 15728640, array['application/gzip'])
+values ('logs', 'logs', false, 52428800, array['text/plain'])
 on conflict (id) do update
-  set public = false, file_size_limit = 15728640, allowed_mime_types = array['application/gzip'];
+  set public = false, file_size_limit = 52428800, allowed_mime_types = array['text/plain'];
 
 drop policy if exists "anyone can upload a report log" on storage.objects;
 create policy "anyone can upload a report log" on storage.objects
   for insert to anon, authenticated
-  with check (bucket_id = 'logs' and name ~ '^[0-9a-f-]{36}\.txt\.gz$');
+  with check (
+    bucket_id = 'logs'
+    and char_length(name) <= 300
+    and name ~ ('^[a-z0-9]+(-[a-z0-9]+)*/'                                        -- folder
+                || '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}\.[0-9]{2} '                  -- date
+                || '[A-Za-z0-9 ._()&'',!+-]{1,100} '                                 -- game
+                || '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$')  -- report id
+  );
 -- No select, update or delete policies: uploads cannot be read, replaced or
 -- removed with the public key. Download them from Storage in the dashboard.
