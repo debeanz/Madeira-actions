@@ -1226,7 +1226,7 @@ private struct OptionsSheet: View {
     @State private var gameBytes: Int64? = nil
     /// ml863: the Report Compatibility form, over this menu.
     @State private var showReport: Bool = false
-    /// ml857: Save Log in progress, then what it did ("Saved: Celeste (…)").
+    /// ml857: Save Log in progress, then what it did ("Saved to logs › Celeste").
     @State private var savingLog: Bool = false
     @State private var saveLogResult: String? = nil
     @State private var folderSizing: Bool = false
@@ -1332,8 +1332,9 @@ private struct OptionsSheet: View {
                                      dismiss()
                                  }))
         }
-        // ml857: a dated copy of this game's log in Documents/logs. No dismiss:
-        // the row itself says where the file went (an alert would leave the pad dead).
+        // ml857: a dated copy of this game's log in Documents/logs (ml866: in the
+        // game's folder). No dismiss: the row itself says where the file went (an
+        // alert would leave the pad dead).
         out.append(OptionRow(id: "savelog", title: "Save Log", systemImage: "doc.text",
                              destructive: false, checked: false,
                              trailing: savingLog ? "Saving…" : saveLogResult,
@@ -1342,7 +1343,9 @@ private struct OptionsSheet: View {
                                  savingLog = true
                                  GameLogSaver.save(game: g) { name in
                                      savingLog = false
-                                     saveLogResult = name.map { "Saved: \($0)" } ?? "No log to save"
+                                     saveLogResult = name.map { _ in
+                                         "Saved to logs › \(GameLogSaver.folder(for: g.title))"
+                                     } ?? "No log to save"
                                  }
                              }))
         // ml863: rate this game for the compatibility site, log attached.
@@ -2112,8 +2115,8 @@ private struct SheetRowStyle: ButtonStyle {
 // MARK: - Save Log (ml857)
 
 /// ml857: "Save Log" in a game's ⋯ menu writes one file per press into
-/// Documents/logs (Files › Madeira › logs), named after the game and when it was
-/// saved: "Celeste (2026-10-03 14.05).txt".
+/// Documents/logs (Files › Madeira › logs), ml866: in a folder per game, named
+/// after the game and when it was saved: "Celeste/Celeste (2026-10-03 14.05).txt".
 ///
 /// Which run it saves: the session this game last ran in. LogStore rotates
 /// madeira-log.txt into madeira-log.prev.txt at every launch, and the post-game
@@ -2149,23 +2152,33 @@ enum GameLogSaver {
             let name = Self.write(title: title, exe: exe, header: header, at: now)
             DispatchQueue.main.async {
                 if let name = name {
-                    LogStore.shared.log("Saved log for \(title): logs/\(name).txt")
+                    LogStore.shared.log("Saved log for \(title): logs/\(Self.folder(for: title))/\(name).txt")
                 }
                 done(name)
             }
         }
     }
 
+    /// ml866: the game's folder inside logs — Files › Madeira › logs › <this>.
+    static func folder(for title: String) -> String { fileSafe(title) }
+
+    private static var logsDir: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("logs", isDirectory: true)
+    }
+
     private static func write(title: String, exe: URL?, header: String, at date: Date) -> String? {
         let fm = FileManager.default
-        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         guard let out = buildLog(title: title, exe: exe, header: header) else { return nil }
 
-        let dir = docs.appendingPathComponent("logs", isDirectory: true)
+        sortLooseLogs()
+        // ml866: a folder per game, as the compatibility site's logs are.
+        let dir = logsDir.appendingPathComponent(folder(for: title), isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         // ml860: "<title> (yyyy-MM-dd HH.mm).txt" — the game and when, nothing
         // else (the user dropped the per-game number). A second save in the same
-        // minute gets the seconds too, rather than replacing the first.
+        // minute gets the seconds too, rather than replacing the first. ml866: the
+        // title stays in the name, so a log shared on its own still says whose it is.
         let base = fileSafe(title)
         var name = "\(base) (\(fileStamp.string(from: date)))"
         if fm.fileExists(atPath: dir.appendingPathComponent(name + ".txt").path) {
@@ -2177,6 +2190,37 @@ enum GameLogSaver {
             return nil
         }
         return name
+    }
+
+    /// ml866: logs saved loose in logs/ by 0.1.121–0.1.131 move into their game's
+    /// folder. The game comes from the file's own first line ("Madeira log —
+    /// <title>", which every version wrote) — the names alone are ambiguous:
+    /// "Portal 2 (…).txt" may be Portal's second log from 0.1.122. Anything
+    /// else, and anything whose place is already taken, stays where it is.
+    /// Blocking; runs at launch (off the main thread) and before each save.
+    static func sortLooseLogs() {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: logsDir, includingPropertiesForKeys: [.isRegularFileKey])
+        else { return }
+        let prefix = "Madeira log — "
+        for file in items where file.pathExtension == "txt" {
+            guard (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
+                  let handle = try? FileHandle(forReadingFrom: file) else { continue }
+            let head = try? handle.read(upToCount: 512)
+            try? handle.close()
+            guard let head = head, !head.isEmpty else { continue }
+            let firstLine = String(decoding: head, as: UTF8.self)
+                .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+                .first.map { String($0) } ?? ""
+            guard firstLine.hasPrefix(prefix) else { continue }
+            let title = String(firstLine.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+            guard !title.isEmpty else { continue }
+            let dir = logsDir.appendingPathComponent(folder(for: title), isDirectory: true)
+            let dest = dir.appendingPathComponent(file.lastPathComponent)
+            guard !fm.fileExists(atPath: dest.path) else { continue }
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? fm.moveItem(at: file, to: dest)
+        }
     }
 
     /// ml863: the log's content without writing it — the header, the session

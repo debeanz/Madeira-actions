@@ -1511,8 +1511,8 @@ struct ContentView: View {
     /// "Save Log" alert offers to keep, and that alert's headline. nil otherwise.
     @State private var crashLogGame: LauncherGame? = nil
     @State private var crashLogTitle = ""
-    /// ml859: what saving it did ("Log saved as Celeste (…) …"), shown at the top
-    /// of the restart alert that follows.
+    /// ml859: what saving it did ("Log saved in Files › Madeira › logs › Celeste."),
+    /// shown at the top of the restart alert that follows.
     @State private var crashLogResult: String? = nil
     /// ml863: the Report Compatibility form over the Games tab — opened from the
     /// crash alert or the in-game ⋯ menu (the Games tab's own ⋯ opens its own).
@@ -1655,7 +1655,7 @@ struct ContentView: View {
             Button("Not Now", role: .cancel) { recommendRestartAfterGame() }
         } message: { _ in
             Text("Save a log of what happened, or report it with the log so the game can be fixed. "
-                 + "Saved logs go to Files › Madeira › logs, named after the game and the date.")
+                 + "Saved logs go to Files › Madeira › logs, in a folder for each game.")
         }
         .sheet(item: $reportRequest, onDismiss: {
             // ml863: after a crash, the restart advice still comes — once the form is gone.
@@ -1740,9 +1740,11 @@ struct ContentView: View {
         // launchingGame stays set for the whole session the game runs in — or,
         // in a Windows desktop session with no Games-tab game, the run as "Desktop".
         .onReceive(NotificationCenter.default.publisher(for: .madeiraSaveLog)) { _ in
+            // ml866: the toast names the game's folder in logs.
+            let folder = GameLogSaver.folder(for: launchingGame?.title ?? "Desktop")
             let done: (String?) -> Void = { name in
                 NotificationCenter.default.post(name: .madeiraLogSaved, object: nil,
-                                                userInfo: name.map { ["name": $0] as [AnyHashable: Any] })
+                                                userInfo: name.map { ["name": $0, "folder": folder] as [AnyHashable: Any] })
             }
             if let game = launchingGame {
                 GameLogSaver.save(game: game, done: done)
@@ -2534,8 +2536,9 @@ struct ContentView: View {
     private func saveCrashLog(_ game: LauncherGame) {
         // The alert's headline ("Celeste crashed") goes into the file's header.
         GameLogSaver.save(game: game, note: crashLogTitle) { name in
-            crashLogResult = name.map { "Log saved as \($0) in Files › Madeira › logs." }
-                ?? "The log could not be saved."
+            crashLogResult = name.map { _ in
+                "Log saved in Files › Madeira › logs › \(GameLogSaver.folder(for: game.title))."
+            } ?? "The log could not be saved."
             recommendRestartAfterGame()
         }
     }
@@ -6828,8 +6831,9 @@ struct TouchControlsOverlay: View {
         .onChange(of: m.launchPanelUp) { _, up in if !up { showChrome() } }
         // ml858: the save the toolbar asked for is done.
         .onReceive(NotificationCenter.default.publisher(for: .madeiraLogSaved)) { note in
-            if let name = note.userInfo?["name"] as? String {
-                showLogToast("Saved: \(name)  ·  Files › Madeira › logs", for: 4)
+            if note.userInfo?["name"] is String {
+                let folder = (note.userInfo?["folder"] as? String).map { " › \($0)" } ?? ""
+                showLogToast("Saved to Files › Madeira › logs\(folder)", for: 4)
             } else {
                 showLogToast("No log to save")
             }

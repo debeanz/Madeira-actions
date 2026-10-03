@@ -17,6 +17,8 @@ final class MadeiraAppDelegate: NSObject, UIApplicationDelegate {
         // bare Mach port, which makes SwiftUI/touch-control cost visible.
         pthread_setname_np("app-main")
         ShaderCache.registerDefault()   // ml829: before any view reads the switch
+        // ml866: logs saved before the folder-per-game layout move into theirs.
+        DispatchQueue.global(qos: .utility).async { GameLogSaver.sortLooseLogs() }
         return true
     }
 
