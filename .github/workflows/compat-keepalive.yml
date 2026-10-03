@@ -27,6 +27,11 @@ jobs:
             echo "docs/config.js has no Supabase project yet; nothing to keep awake."
             exit 0
           fi
-          curl -fsS "${url%/}/rest/v1/game_summary?select=key&limit=1" \
-            -H "apikey: $key" -H "Authorization: Bearer $key" > /dev/null
+          endpoint="${url%/}/rest/v1/game_summary?select=key&limit=1"
+          # A publishable key (sb_publishable_…) goes on apikey alone; a legacy
+          # anon key also goes in Authorization.
+          case "$key" in
+            sb_*) curl -fsS "$endpoint" -H "apikey: $key" > /dev/null ;;
+            *)    curl -fsS "$endpoint" -H "apikey: $key" -H "Authorization: Bearer $key" > /dev/null ;;
+          esac
           echo "Database answered."

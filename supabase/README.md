@@ -8,12 +8,16 @@ takes a few minutes and needs no card.
    Any name and region; keep the database password somewhere safe.
 2. Open **SQL Editor → New query**, paste all of [`schema.sql`](schema.sql),
    and press **Run**.
-3. Open **Project Settings → API** and copy two values:
-   - **Project URL** — `https://<something>.supabase.co`
-   - **anon public** key — a long `eyJ…` string
+3. Copy two values:
+   - **Project URL** — `https://<something>.supabase.co` (the project's
+     **Connect** button, or **Project Settings → Data API**)
+   - **Publishable key** — `sb_publishable_…`, under **Project Settings →
+     API Keys**. A legacy **anon** key (a long `eyJ…` string) works too, but
+     Supabase retires those at the end of 2026.
 
    Both are meant to be public. What they allow is fixed by `schema.sql`:
-   filing and reading reports, and uploading (never reading) logs.
+   filing and reading reports, and uploading (never reading) logs. Never use
+   the **secret** / **service_role** key here — that one bypasses all of it.
 4. Put them in [`docs/config.js`](../docs/config.js) for the website and in
    `ReportService` (`app/Madeira/LauncherView.swift`) for the app.
 

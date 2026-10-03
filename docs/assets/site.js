@@ -245,9 +245,15 @@
   // ── Data ───────────────────────────────────────────────────────────────────
 
   function configured() { return Boolean(cfg.supabaseUrl && cfg.supabaseAnonKey); }
+  // A publishable key (sb_publishable_…) goes on apikey alone: it isn't a JWT,
+  // and Supabase rejects one sent as a Bearer token. A legacy anon key wants both.
+  function keyHeaders() {
+    var key = cfg.supabaseAnonKey;
+    return key.indexOf("sb_") === 0 ? { apikey: key } : { apikey: key, Authorization: "Bearer " + key };
+  }
   function api(path) {
     return fetch(cfg.supabaseUrl.replace(/\/+$/, "") + "/rest/v1/" + path, {
-      headers: { apikey: cfg.supabaseAnonKey, Authorization: "Bearer " + cfg.supabaseAnonKey }
+      headers: keyHeaders()
     }).then(function (res) {
       if (!res.ok) throw new Error("The compatibility database answered " + res.status + ".");
       return res.json();
