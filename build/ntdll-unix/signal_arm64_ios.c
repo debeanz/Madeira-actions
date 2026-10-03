@@ -17363,6 +17363,85 @@ static void gp_count( uint64_t key )
 /* key layout: top 4 bits = kind (1 guest-module, 2 guest-jit, 3 native, 4 host-pc, 5 host-lr),
  * low 60 bits = address >> 6 (64-byte buckets). */
 #define GP_KEY(kind, addr) (((uint64_t)(kind) << 60) | (((uint64_t)(addr) >> 6) & ((1ull << 60) - 1)))
+/* ml870: kinds 6 (guest-module) and 7 (guest-jit) hold an EXACT guest block address
+ * (no 64-byte bucketing): a block entry is what gets disassembled. */
+#define GP_KEY_X(kind, addr) (((uint64_t)(kind) << 60) | ((uint64_t)(addr) & ((1ull << 60) - 1)))
+
+/* ml870: the guest basic block that is ACTUALLY running, not the last indirect jump.
+ *
+ * ThreadState RIP (x28+0x18) is stored only on an UNLINKED exit: once FEX links a
+ * direct branch the next block runs without updating it, and a callret return never
+ * does. So it names the last INDIRECT branch target, and everything executed after it
+ * lands in that bucket -- Celeste's profile put 67% on Mono's struct-copy barrier that
+ * way. FEX itself stores the running compiled unit's JITCodeHeader at x28+0
+ * (CPUState::InlineJITBlockHeader, written by every EmitEntryPoint), and the unit's
+ * tail maps host-PC offsets (from the header) to guest entry-point offsets: a
+ * JITCodeTail { u64 Size, RIP, GuestSize; u32 NumberOfRIPEntries, OffsetToRIPEntries,
+ * SpinLockFutex; u8 SingleInst; pad[3] } then vl64pair-coded deltas
+ * (FEXCore/Source/Interface/Core/JIT/JIT.cpp CompileCode, Utils/variable_length_integer.h
+ * in 125hz/FEX 51f5444). Resolve pc to the guest entry point it follows. 0 when pc is
+ * not inside that unit (dispatcher, thunks, a header stored by another unit). */
+static uint64_t gp_block_rip( uint64_t x28, uint64_t pc )
+{
+    uint64_t header = 0, tail_at, size, rip, entries_at, host = 0, guest = 0, best = 0;
+    uint32_t off_tail = 0, nentries, off_entries, i;
+    unsigned char tail[40], buf[2048];
+    size_t have, at = 0;
+
+    if (x28 <= 0x10000 || !ios_tlse_read( (uintptr_t)x28, &header, 8 )) return 0;
+    if (header <= 0x10000 || pc < header || pc - header > (64u << 20)) return 0;
+    if (!ios_tlse_read( (uintptr_t)header, &off_tail, 4 ) || !off_tail) return 0;
+    tail_at = header + off_tail;
+    if (pc >= tail_at || !ios_tlse_read( (uintptr_t)tail_at, tail, sizeof(tail) )) return 0;
+    memcpy( &size, tail, 8 );
+    memcpy( &rip, tail + 8, 8 );
+    memcpy( &nentries, tail + 24, 4 );
+    memcpy( &off_entries, tail + 28, 4 );
+    if (!rip || pc >= header + size || !nentries || nentries > 4096) return 0;
+    entries_at = tail_at + off_entries;
+    if (entries_at >= header + size) return 0;
+    have = (size_t)(header + size - entries_at);
+    if (have > sizeof(buf)) have = sizeof(buf);
+    if (!ios_tlse_read( (uintptr_t)entries_at, buf, have )) return 0;
+
+    for (i = 0; i < nentries && at < have; i++)
+    {
+        unsigned char b = buf[at];
+        int64_t d_host, d_guest;
+        if (!(b & 0x80))                              /* vl8: arm 4 bits, rip 3 bits */
+        {
+            d_host = ((int64_t)(b & 0xf) + 1) << 2;
+            d_guest = (int64_t)((b >> 4) & 7) + 1;
+            at += 1;
+        }
+        else if ((b & 0xc0) == 0x80)                  /* vl16: signed 6-bit rip, int8 arm << 2 */
+        {
+            if (at + 2 > have) break;
+            d_guest = (int64_t)((int8_t)(b << 2) >> 2);
+            d_host = (int64_t)(int8_t)buf[at + 1] * 4;
+            at += 2;
+        }
+        else if (b == 0xc0)                           /* vl32 */
+        {
+            int32_t a, r;
+            if (at + 9 > have) break;
+            memcpy( &a, buf + at + 1, 4 ); memcpy( &r, buf + at + 5, 4 );
+            d_host = a; d_guest = r;
+            at += 9;
+        }
+        else                                          /* vl64 */
+        {
+            if (at + 17 > have) break;
+            memcpy( &d_host, buf + at + 1, 8 ); memcpy( &d_guest, buf + at + 9, 8 );
+            at += 17;
+        }
+        host += (uint64_t)d_host;
+        guest += (uint64_t)d_guest;
+        if (header + host > pc) break;               /* pc lies before this entry point */
+        best = rip + guest;
+    }
+    return best;
+}
 
 static void *ios_gprof_thread( void *arg )
 {
@@ -17372,7 +17451,7 @@ static void *ios_gprof_thread( void *arg )
     extern size_t ios_jit_pool_size_global;
     mach_port_t self = pthread_mach_thread_np( pthread_self() );
     mach_port_t cur = MACH_PORT_NULL;
-    unsigned iter = 0, n = 0, n_guest = 0, n_native = 0, n_host = 0, n_nostate = 0;
+    unsigned iter = 0, n = 0, n_guest = 0, n_native = 0, n_host = 0, n_nostate = 0, n_exact = 0;
     char tname[48] = "";
     (void)arg;
     pthread_setname_np( "wine-gprof" );
@@ -17418,7 +17497,7 @@ static void *ios_gprof_thread( void *arg )
                     mach_port_mod_refs( mach_task_self(), best, MACH_PORT_RIGHT_SEND, 1 );
                     cur = best;
                     memset( gp_hist, 0, sizeof(gp_hist) );
-                    n = n_guest = n_native = n_host = n_nostate = 0;
+                    n = n_guest = n_native = n_host = n_nostate = n_exact = 0;
                     dprintf( 2, "[gprof] ml848 following '%s' port=0x%x cpu=%d\n", tname, cur, (int)best_cpu );
                 }
                 for (k = 0; k < tc; k++) mach_port_deallocate( mach_task_self(), tl[k] );
@@ -17448,14 +17527,26 @@ static void *ios_gprof_thread( void *arg )
                     gp_count( GP_KEY( 3, pe ) );
                 }
                 else
-                {   /* FEX translation: block-granular guest RIP from ThreadState */
-                    uint64_t grip = 0;
+                {   /* FEX translation. ml870: the running guest basic block from FEX's
+                     * own block metadata; the old ThreadState RIP (the last indirect
+                     * branch target) only when that cannot be resolved. */
+                    extern unsigned long long ios_prof_wow_window(void);
+                    uint64_t grip = gp_block_rip( x28, pc );
+                    int exact = grip != 0;
                     n_guest++;
-                    if (x28 > 0x10000 && ios_tlse_read( (uintptr_t)x28 + 0x18, &grip, 8 ) && grip > 0x10000)
+                    if (exact) n_exact++;
+                    else if (!(x28 > 0x10000 && ios_tlse_read( (uintptr_t)x28 + 0x18, &grip, 8 ))) grip = 0;
+                    if (grip > 0x10000)
                     {
+                        /* A 32-bit guest address names its module only through the
+                         * window: libmono at guest 0x7a540000 is host B+0x7a540000. */
+                        uint64_t B = grip < 0x100000000ull ? ios_prof_wow_window() : 0;
                         uintptr_t mb = 0;
-                        if (gp_module_for( (uintptr_t)grip, &mb )) gp_count( GP_KEY( 1, grip ) );
-                        else if (ios_jit_anon_alias_lookup( (uintptr_t)grip )) gp_count( GP_KEY( 2, grip & ~0xfffull ) );
+                        if (gp_module_for( (uintptr_t)(grip + B), &mb ))
+                            gp_count( exact ? GP_KEY_X( 6, grip + B ) : GP_KEY( 1, grip + B ) );
+                        else if (exact) gp_count( GP_KEY_X( 7, grip ) );
+                        else if (ios_jit_anon_alias_lookup( (uintptr_t)(grip + B) ))
+                            gp_count( GP_KEY( 2, grip & ~0xfffull ) );
                         else gp_count( GP_KEY( 2, grip ) );
                     }
                     else gp_count( GP_KEY( 2, 0 ) );
@@ -17476,9 +17567,11 @@ static void *ios_gprof_thread( void *arg )
         if (n && (n % 600) == 0)
         {
             char line[900];
-            int len, rank, i;
-            len = snprintf( line, sizeof(line), "[gprof] ml848 '%s' n=%u guest=%u%% native=%u%% host=%u%% nostate=%u | top:",
-                            tname, n, n_guest * 100 / n, n_native * 100 / n, n_host * 100 / n, n_nostate );
+            int len, rank, i, ndump = 0;
+            uint64_t dump[2];
+            len = snprintf( line, sizeof(line), "[gprof] ml848 '%s' n=%u guest=%u%% exact=%u%% native=%u%% host=%u%% nostate=%u | top:",
+                            tname, n, n_guest * 100 / n, n_guest ? n_exact * 100 / n_guest : 0,
+                            n_native * 100 / n, n_host * 100 / n, n_nostate );
             for (rank = 0; rank < 14 && len < (int)sizeof(line) - 80; rank++)
             {
                 int best = -1; uint32_t bc = 0;
@@ -17488,16 +17581,18 @@ static void *ios_gprof_thread( void *arg )
                 for (i = 0; i < GP_SLOTS; i++) if (gp_hist[i].n > bc) { bc = gp_hist[i].n; best = i; }
                 if (best < 0 || bc < 3) break;
                 key = gp_hist[best].key; gp_hist[best].n = 0;
-                kind = (unsigned)(key >> 60); addr = (key & ((1ull << 60) - 1)) << 6;
+                kind = (unsigned)(key >> 60);
+                addr = (kind == 6 || kind == 7) ? (key & ((1ull << 60) - 1)) : (key & ((1ull << 60) - 1)) << 6;
                 switch (kind)
                 {
-                case 1: case 3:
+                case 1: case 3: case 6:
                     nm = gp_module_for( (uintptr_t)addr, &mb );
                     len += snprintf( line + len, sizeof(line) - len, " %s%s+0x%llx*%u", kind == 3 ? "ec:" : "",
                                      nm ? nm : "?", (unsigned long long)(addr - mb), bc );
                     break;
-                case 2:
+                case 2: case 7:
                     len += snprintf( line + len, sizeof(line) - len, " jit@0x%llx*%u", (unsigned long long)addr, bc );
+                    if (kind == 7 && bc >= 20 && ndump < 2) dump[ndump++] = addr;
                     break;
                 default:
                 {
@@ -17512,8 +17607,25 @@ static void *ios_gprof_thread( void *arg )
                 }
             }
             dprintf( 2, "%s\n", line );
+            /* ml870: the guest bytes of the hottest generated-code blocks (Mono's JIT
+             * output has no module to disassemble from offline), once per block. */
+            for (i = 0; i < ndump; i++)
+            {
+                extern unsigned long long ios_prof_wow_window(void);
+                static uint64_t dumped[32];
+                static int ndumped;
+                unsigned char code[96];
+                char hex[96 * 3 + 1];
+                uint64_t B = dump[i] < 0x100000000ull ? ios_prof_wow_window() : 0;
+                int q, seen = 0;
+                for (q = 0; q < ndumped; q++) if (dumped[q] == dump[i]) seen = 1;
+                if (seen || ndumped >= 32 || !ios_tlse_read( (uintptr_t)(dump[i] + B), code, sizeof(code) )) continue;
+                dumped[ndumped++] = dump[i];
+                for (q = 0; q < (int)sizeof(code); q++) snprintf( hex + q * 3, 4, "%02x ", code[q] );
+                dprintf( 2, "[gprof] ml870 code jit@0x%llx: %s\n", (unsigned long long)dump[i], hex );
+            }
             for (i = 0; i < GP_SLOTS; i++) gp_hist[i].n >>= 1;
-            n = n_guest = n_native = n_host = 0;   /* per-window split */
+            n = n_guest = n_native = n_host = n_exact = 0;   /* per-window split */
         }
     }
     return NULL;
