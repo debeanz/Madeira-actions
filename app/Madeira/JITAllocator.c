@@ -430,6 +430,14 @@ static void sigtrap_handler(int sig, siginfo_t *info, void *context) {
     uc->uc_mcontext->__ss.__x[0] = 0;
 }
 
+static void install_sigtrap_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = sigtrap_handler;
+    sigaction(SIGTRAP, &sa, NULL);
+}
+
 void jit_install_trap_handler(void) {
     // Only install if no debugger is attached.
     // When StikDebug is attached, it handles BRK/SIGTRAP directly.
@@ -438,12 +446,15 @@ void jit_install_trap_handler(void) {
         jit_log("Debugger attached — skipping SIGTRAP handler (debugger handles BRK)");
         return;
     }
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_flags = SA_SIGINFO;
-    sa.sa_sigaction = sigtrap_handler;
-    sigaction(SIGTRAP, &sa, NULL);
+    install_sigtrap_handler();
     jit_log("SIGTRAP handler installed (no debugger)");
+}
+
+// ml872: after the app lets StikDebug go itself. CS_DEBUGGED stays set after a
+// detach, so the check above would still skip.
+void jit_install_trap_handler_detached(void) {
+    install_sigtrap_handler();
+    jit_log("SIGTRAP handler installed (debugger detached)");
 }
 
 // iOS 26 BRK-based JIT syscalls.

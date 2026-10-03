@@ -1435,7 +1435,9 @@ struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
-    @State private var debuggerAttached = isDebuggerAttached()
+    // ml872: "JIT ready" — a debugger is attached, or the pool it granted is
+    // held. StikDebug is let go right after the pool, at startup.
+    @State private var debuggerAttached = isDebuggerAttached() || StikJITHelper.poolReady
     @ObservedObject private var input = InputSettings.shared
     @ObservedObject private var touchControls = TouchControlsModel.shared
     @ObservedObject private var gamepad = GamepadBridge.shared
@@ -1688,6 +1690,12 @@ struct ContentView: View {
             // ml791: controller drives the Games grid while that tab shows.
             GamepadBridge.shared.onNavigate = { GamesFocus.shared.handle($0) }
             syncGamepadUIMode()
+            // ml872: take the JIT pool while StikDebug is still attached.
+            StikJITHelper.allocateEarly()
+        }
+        // ml872: and when coming back from StikDebug after Enable JIT.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            StikJITHelper.allocateEarly()
         }
         .onChange(of: selectedTab) { _, tab in
             // Both surfaces are window-level views above the whole SwiftUI
@@ -2288,7 +2296,9 @@ struct ContentView: View {
     /// polls forever, so a 90 s deadline turns "nothing happened" into a
     /// logged failure instead of a launcher stuck on "Enabling JIT".
     private func ensureJIT(_ completion: @escaping (Bool) -> Void) {
-        if jit_check_debugged() {
+        // ml872: a held pool needs no debugger; otherwise one must be attached
+        // NOW. CS_DEBUGGED stays set after StikDebug leaves, so it can't say.
+        if StikJITHelper.poolReady || isDebuggerAttached() {
             completion(true)
             return
         }
@@ -3053,7 +3063,7 @@ struct ContentView: View {
                         Text("Performance").tag("Performance")
                     }
                     Toggle("Skip x86 memory-ordering emulation", isOn: $fexNoTSO)
-                    Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch. If a game runs poorly, try turning this on or off for just that game from its ⋯ menu.")
+                    Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch. Turning this on may improve performance in some games, so if one runs slowly, it is worth trying for just that game from its ⋯ menu.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     LabeledContent("Translation", value: "x86-64 → ARM64")
@@ -3444,7 +3454,7 @@ struct ContentView: View {
         .padding(.top, 4)
         .padding(.bottom, 8)
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
-            debuggerAttached = isDebuggerAttached()
+            debuggerAttached = isDebuggerAttached() || StikJITHelper.poolReady
         }
     }
 
@@ -4195,7 +4205,7 @@ struct ContentView: View {
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
     private func runWineFullSequence() {
-        guard jit_check_debugged() else {
+        guard StikJITHelper.poolReady || isDebuggerAttached() else {   // ml872
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             return
         }
@@ -4323,14 +4333,8 @@ struct ContentView: View {
             // so it can be swapped between runs without a rebuild, and deleting
             // the file reverts to the proven default. Clamped to sane values --
             // a typo here would otherwise move the VA floor with it.
-            var poolSizeMB = 896
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
-               let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
-               mb >= 256, mb <= 1152 {
-                poolSizeMB = mb
-                logStore.log("JIT pool overridden to \(mb)MB via madeira-pool.txt")
-            }
+            // ml872: read in StikJITHelper, which also allocates at startup.
+            let poolSizeMB = StikJITHelper.configuredPoolMB()
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off
             // comparison needs one rebuild, not two. The previous gate read
@@ -4548,12 +4552,17 @@ struct ContentView: View {
             }
 
             winios_phase("pool-alloc-begin")
-            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
+            // ml872: usually taken at startup already (StikJITHelper.allocateEarly).
+            let poolFromStartup = StikJITHelper.poolReady
+            logStore.log(poolFromStartup ? "JIT pool: using the one taken at startup"
+                                         : "Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             winios_phase("pool-ready")
-            logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+            if !poolFromStartup {
+                logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+            }
 
             // ml762: remote Metal backend. Documents/madeira-remote.txt holds
             // "<host-ip> <token>" and routes winemetal to a Metal daemon on that
@@ -4659,10 +4668,9 @@ struct ContentView: View {
                 // wrong conclusion I wrote into the source. A run without the pool can
                 // only manufacture misleading secondary crashes, so refuse to start one.
                 logStore.log("JIT pool allocation FAILED — not starting Wine.", level: .error)
-                logStore.log("  All placements landed in the forbidden guest 64G window.", level: .info)
-                logStore.log("  Force-quit and relaunch: placement is chosen by the kernel", level: .info)
-                logStore.log("  and depends on current memory layout, so a fresh process", level: .info)
-                logStore.log("  usually lands somewhere valid.", level: .info)
+                // ml872: allocatePool logs the real reason; the old canned
+                // "guest 64G window" text here was wrong for every other one.
+                logStore.log("  The [jit-pool] lines above say why.", level: .info)
                 logStore.uiPaused = false
                 return
             }
@@ -4697,10 +4705,14 @@ struct ContentView: View {
             let earlyDetach = true
             if earlyDetach, pool != nil {
                 let dt0 = CFAbsoluteTimeGetCurrent()
-                StikJITHelper.detachDebugger()
-                let dms = (CFAbsoluteTimeGetCurrent() - dt0) * 1000.0
-                logStore.log(String(format: "[early-detach] rev=ml524 took %.0f ms", dms),
-                             level: dms > 5000 ? .error : .success)
+                if StikJITHelper.detachDebugger() {
+                    let dms = (CFAbsoluteTimeGetCurrent() - dt0) * 1000.0
+                    logStore.log(String(format: "[early-detach] rev=ml524 took %.0f ms", dms),
+                                 level: dms > 5000 ? .error : .success)
+                } else {
+                    // ml872: let go at startup, right after the pool.
+                    logStore.log("[early-detach] nothing to do — StikDebug is already gone")
+                }
             } else if !earlyDetach {
                 logStore.log("[early-detach] rev=ml524 DISABLED — debugger stays attached all run")
             }
@@ -4863,7 +4875,7 @@ struct ContentView: View {
             Thread.sleep(forTimeInterval: 2.0)
 
             // Step 6: Detach debugger — main thread should have zero accumulated hang time
-            logStore.log("Detaching debugger...")
+            // (ml872: a no-op when it already happened, which is the usual case)
             StikJITHelper.detachDebugger()
 
             DispatchQueue.main.async { heartbeat.invalidate() }

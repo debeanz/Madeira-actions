@@ -1470,7 +1470,7 @@ private struct OptionsSheet: View {
                              destructive: false, checked: false,
                              trailing: tsoText,
                              disabled: busy,
-                             note: "If this game runs poorly, try turning this on or off.",   // ml871
+                             note: "Turning this on may improve performance in some games. If this game runs slowly, it is worth a try.",   // ml872
                              action: {
                                  let next: Bool?
                                  switch s.noTSO {

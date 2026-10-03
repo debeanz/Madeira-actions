@@ -56,17 +56,92 @@ enum StikJITHelper {
         }
     }
 
-    /// Poll every 0.5s until CS_DEBUGGED is set, then call completion.
+    /// Poll every 0.5s until a debugger is attached, then call completion.
     private static func pollForJIT(completion: @escaping (Bool) -> Void) {
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
-            if jit_check_debugged() {
+            // ml872: P_TRACED, not CS_DEBUGGED. CS_DEBUGGED stays set after
+            // StikDebug leaves, so on a re-enable it passed at once — before
+            // StikDebug had attached — and the pool BRK that followed reached nobody.
+            if isDebuggerAttached() {
                 timer.invalidate()
                 // ml962: a fresh attach re-arms BRK servicing, so a pool CAN be
                 // allocated again after an earlier detach.
                 debuggerDetached = false
                 unsetenv("MADEIRA_DETACHED")
-                LogStore.shared.log("JIT enabled! (CS_DEBUGGED set)", level: .success)
+                LogStore.shared.log("JIT enabled! (debugger attached)", level: .success)
                 completion(true)
+            }
+        }
+    }
+
+    // ── ml872: take the pool while StikDebug is still here ──────────────────
+    //
+    // 0.1.137 froze on "the first launch after an update": Celeste was tapped
+    // 50 s after StikDebug opened Madeira, and the log ends on the pin chunk —
+    // the allocation BRK after it was never answered. StikDebug does not stay:
+    // it spends its background CPU budget in ~52 s and iOS ends it ([early-detach]
+    // ml524 measured that), and a BRK nobody services freezes the whole app.
+    // Every launch that worked had started its game within 17 s, which is why it
+    // looked tied to updates: after an update you look around before you play.
+    //
+    // So the pool no longer waits for a game. While a debugger is attached and
+    // no pool exists, take it now and let StikDebug go at once — what the launch
+    // path did 3.5 s into every game. Every launch after that reuses the cached
+    // pool (ml962) and needs no debugger at all.
+    private static var earlyInFlight = false
+    private static let earlyLock = NSLock()
+
+    /// True once this run holds a JIT pool. Games can start from then on even
+    /// though StikDebug is gone (CachedPool note below).
+    private(set) static var poolReady = false
+
+    /// True once StikDebug has been let go (or left) this run.
+    static var isDetached: Bool { debuggerDetached }
+
+    /// The pool size every allocation uses: 896MB, or Documents/madeira-pool.txt
+    /// (ml668; the history of the number is in ContentView.runWineFullSequence).
+    static func configuredPoolMB() -> Int {
+        if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+           let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
+           let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
+           mb >= 256, mb <= 1152 {
+            LogStore.shared.log("JIT pool overridden to \(mb)MB via madeira-pool.txt")
+            return mb
+        }
+        return 896
+    }
+
+    /// Allocate the pool now if a debugger is attached and none exists yet, then
+    /// detach. Safe to call any time; it does nothing in every other case.
+    static func allocateEarly() {
+        earlyLock.lock()
+        let go = !earlyInFlight && !poolReady && !debuggerDetached && isDebuggerAttached()
+        if go { earlyInFlight = true }
+        earlyLock.unlock()
+        guard go else { return }
+        // The BRK freezes the whole process for ~3.5 s; let the frame being
+        // drawn now reach the screen first.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
+            defer {
+                earlyLock.lock()
+                earlyInFlight = false
+                earlyLock.unlock()
+            }
+            if poolReady { return }
+            LogStore.shared.log("[jit-pool] ml872 StikDebug is attached — taking the JIT pool now, " +
+                                "before it leaves (~52 s after it opens Madeira)")
+            let t0 = CFAbsoluteTimeGetCurrent()
+            guard allocatePool(poolSize: configuredPoolMB() * 1024 * 1024) != nil else {
+                LogStore.shared.log("[jit-pool] ml872 no pool yet — the first game launch will ask again",
+                                    level: .error)
+                return
+            }
+            LogStore.shared.log("BRK suspension lasted \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t0))s")
+            if detachDebugger() && wine_process_is_running() == 0 {
+                // CS_DEBUGGED stays set, so the startup jit_install_trap_handler
+                // skipped this; a stray BRK before Wine's own handlers exist
+                // would otherwise end the app.
+                jit_install_trap_handler_detached()
             }
         }
     }
@@ -171,6 +246,7 @@ enum StikJITHelper {
                 "[jit-pool] cached pool RX=%p RW=%p is no longer intact (rx_ok=%d rw_ok=%d) — allocating a new one",
                 Int(bitPattern: p.rx), Int(bitPattern: p.rw), rxOK ? 1 : 0, rwOK ? 1 : 0), level: .error)
             cachedPool = nil
+            poolReady = false
         }
 
         if debuggerDetached || getenv("MADEIRA_DETACHED") != nil {
@@ -181,6 +257,17 @@ enum StikJITHelper {
                 "no pool to reuse. Only the debugger can bless executable pages.", level: .error)
             LogStore.shared.log("  Press 'Enable JIT' to re-attach StikDebug, then launch again. " +
                 "The app stays usable — nothing is being killed.")
+            return nil
+        }
+
+        // ml872: CS_DEBUGGED cannot say whether anyone will answer the BRK below
+        // (it stays set after StikDebug leaves); P_TRACED can. An unanswered BRK
+        // freezes or ends the app, so ask only when a debugger is there.
+        guard isDebuggerAttached() else {
+            debuggerDetached = true
+            setenv("MADEIRA_DETACHED", "1", 1)
+            LogStore.shared.log("[jit-pool] NO POOL: StikDebug is no longer attached — it leaves on its own " +
+                "~52 s after opening Madeira. Open Madeira from StikDebug again.", level: .error)
             return nil
         }
 
@@ -478,6 +565,7 @@ enum StikJITHelper {
         // ml962: this pool now belongs to the APP RUN, not to this session. Every
         // later launch gets it back from the cache above — see the CachedPool note.
         cachedPool = CachedPool(rx: rxPtr, rw: rwPtr, size: poolSize)
+        poolReady = true
         LogStore.shared.log(String(format:
             "[jit-pool] placed at RX=%p RW=%p size=%dMB after %d attempt(s) (session %d) — held for the app's lifetime",
             rxAddr, Int(bitPattern: rwPtr), poolSize / 1024 / 1024, attempts, session), level: .success)
@@ -487,8 +575,27 @@ enum StikJITHelper {
         return (rx: rxPtr, rw: rwPtr, size: poolSize)
     }
 
-    /// Detach the debugger. Call this after Wine is done loading PE DLLs.
-    static func detachDebugger() {
+    private static let detachLock = NSLock()
+
+    /// Detach the debugger. Returns true when this call did it.
+    ///
+    /// ml872: idempotent. The pool is taken at startup now, so the launch path
+    /// and the end-of-run step usually find StikDebug already gone, and a detach
+    /// BRK that reaches nobody ends the app before Wine's handlers exist.
+    @discardableResult
+    static func detachDebugger() -> Bool {
+        detachLock.lock()
+        defer { detachLock.unlock() }
+        if debuggerDetached {
+            LogStore.shared.log("Debugger already detached.")
+            return false
+        }
+        guard isDebuggerAttached() else {
+            debuggerDetached = true
+            setenv("MADEIRA_DETACHED", "1", 1)
+            LogStore.shared.log("StikDebug already left — nothing to detach.")
+            return false
+        }
         LogStore.shared.log("Detaching debugger...")
         jit26_detach()
         // ml962: remember it. CS_DEBUGGED stays SET after detach, so csops cannot
@@ -499,5 +606,6 @@ enum StikJITHelper {
         // is sticky post-detach, so an env flag is the reliable signal.
         setenv("MADEIRA_DETACHED", "1", 1)
         LogStore.shared.log("Debugger detached.", level: .success)
+        return true
     }
 }

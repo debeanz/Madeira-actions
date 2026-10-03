@@ -64,6 +64,11 @@ bool jit_check_debugged(void);
 // when no debugger is attached. Must be called before any jit26_* functions.
 void jit_install_trap_handler(void);
 
+// The same handler, installed unconditionally: for after jit26_detach(), when
+// CS_DEBUGGED is still set but nobody services BRK any more. Not once Wine
+// runs — its own SIGTRAP handler must stay.
+void jit_install_trap_handler_detached(void);
+
 // iOS 26 BRK-based protocol: Ask attached debugger (StikDebug) to
 // prepare a memory region for JIT execution.
 // Returns the prepared address (may differ from input on allocation).
