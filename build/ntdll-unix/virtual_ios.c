@@ -7515,21 +7515,38 @@ static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
  * begins exactly at B+4 GB, so the guard cannot be reserved separately.
  *
  * Never fatal: a slot that cannot be reserved is reported and skipped, and
- * ios_wow_window_try() still has its original reserve-on-demand path. */
+ * ios_wow_window_try() still has its original reserve-on-demand path.
+ *
+ * ml883: HIGHEST SLOT FIRST. Reserved lowest first, slot 0 took 4 GB plus its
+ * OWN FB3 guard page -- and that guard page is the first page of slot 1, so
+ * slot 1 could never be reserved afterwards ("B=0x500000000 REJECTED: 4GB+guard
+ * unavailable", every session on a small-address-space phone, whose low band
+ * [0x400000000, 0x600000000) is meant to hold two). A second LIVE 32-bit
+ * process therefore never got a window: a launcher that stays running while
+ * its game plays (Prince of Persia: The Two Thrones' PrinceOfPersia.exe waits
+ * for pop3.exe) could not start the game. Top-down, slot 1 takes its own guard
+ * above itself and slot 0 borrows slot 1's page 0 -- exactly what slot 0 does
+ * with the [cage] holdback in the high band, and safe for the same reason:
+ * IOS_WOW_GUEST_FLOOR keeps every placement above guest 0x110000, so that page
+ * is PROT_NONE for the life of the session (see ios_wow_carve_holdback_slots).
+ * Nothing else changes: ios_wow_window_pick() still hands out the LOWEST free
+ * slot, so a lone 32-bit process gets the same B as before, and in the high
+ * band the upper candidate is the holdback, rejected exactly as before. */
 static void ios_wow_reserve_placeholders(void)
 {
     ULONG_PTR floor, ceil;
-    ULONG_PTR cand;
+    ULONG_PTR first, cand;
 
-    /* same candidate rule as ios_wow_window_pick(): 4 GB-aligned, lowest first,
-     * inside the furniture band and below the CEF pools */
+    /* same candidate rule as ios_wow_window_pick(): 4 GB-aligned, inside the
+     * furniture band and below the CEF pools -- walked from the top (ml883) */
     ios_wow_band( &floor, &ceil );
     if (ceil <= floor || ceil - floor < IOS_WOW_WINDOW_SIZE) return;
+    first = (floor + IOS_WOW_WINDOW_SIZE - 1) & ~(IOS_WOW_WINDOW_SIZE - 1);
+    if (first < floor || first + IOS_WOW_WINDOW_SIZE > ceil) return;
+    cand = first + ((ceil - first - IOS_WOW_WINDOW_SIZE) / IOS_WOW_WINDOW_SIZE) * IOS_WOW_WINDOW_SIZE;
 
     pthread_mutex_lock( &ios_wow_mutex );
-    for (cand = (floor + IOS_WOW_WINDOW_SIZE - 1) & ~(IOS_WOW_WINDOW_SIZE - 1);
-         cand >= floor && cand + IOS_WOW_WINDOW_SIZE <= ceil;
-         cand += IOS_WOW_WINDOW_SIZE)
+    for (;; cand -= IOS_WOW_WINDOW_SIZE)
     {
         unsigned guard_owned = 0;
 
@@ -7542,17 +7559,20 @@ static void ios_wow_reserve_placeholders(void)
                         "occupant is the [cage] holdback, a SECOND concurrent 32-bit process "
                         "carves this slot out of it on demand (ios_wow_carve_holdback_slots)\n",
                      (void *)cand );
-            continue;
         }
-        ios_wow_placeholders[ios_wow_placeholder_count].base        = cand;
-        ios_wow_placeholders[ios_wow_placeholder_count].guard_owned = guard_owned;
-        ios_wow_placeholders[ios_wow_placeholder_count].adopted     = 0;
-        ios_wow_placeholder_count++;
-        dprintf( 2, "[wow-window] placeholder reserved B=%p..%p (+guard %s) slot %u — held "
-                    "PROT_NONE for the first 32-bit pseudo-process of this session\n",
-                 (void *)cand, (void *)(cand + IOS_WOW_WINDOW_SIZE),
-                 guard_owned ? "owned" : "borrowed (from the neighbouring PROT_NONE region)",
-                 ios_wow_placeholder_count - 1 );
+        else
+        {
+            ios_wow_placeholders[ios_wow_placeholder_count].base        = cand;
+            ios_wow_placeholders[ios_wow_placeholder_count].guard_owned = guard_owned;
+            ios_wow_placeholders[ios_wow_placeholder_count].adopted     = 0;
+            ios_wow_placeholder_count++;
+            dprintf( 2, "[wow-window] placeholder reserved B=%p..%p (+guard %s) slot %u — held "
+                        "PROT_NONE for a 32-bit pseudo-process of this session\n",
+                     (void *)cand, (void *)(cand + IOS_WOW_WINDOW_SIZE),
+                     guard_owned ? "owned" : "borrowed (from the neighbouring PROT_NONE region)",
+                     (unsigned)((cand - first) / IOS_WOW_WINDOW_SIZE) );
+        }
+        if (cand == first) break;
     }
     pthread_mutex_unlock( &ios_wow_mutex );
 }

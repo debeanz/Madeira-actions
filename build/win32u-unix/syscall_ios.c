@@ -218,11 +218,10 @@ static HWND WINAPI ios_NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *cla
      * `class` only feeds the TRACE and CREATESTRUCT.lpszClass; with NULL,
      * win32u puts the class NAME there (NtUserGetClassName), which is what
      * every 32-bit window got before ml878 (B + atom was never IS_INTRESOURCE).
-     * With the atom, every window Prince of Persia's launcher created from an
-     * atom class -- COM's apartment window above all -- had two of its 32-bit
-     * callbacks fault (reads at guest 0x81/0x82) and failed with "error 0",
-     * so its COM was unusable (0.1.143-0.1.147; pop3.exe's COM window, made
-     * before ml878, was fine). 64-bit callers keep upstream's atom. */
+     * 64-bit callers keep upstream's atom. (ml882 blamed the atom for the
+     * callback faults at guest 0x81/0x82 in Prince of Persia's launcher; they
+     * stayed in 0.1.148 and were winproc handles, see ml883 below. The class
+     * name is kept: it is what 32-bit programs always got here.) */
     if (atom != class) class = NULL;
     ret = NtUserCreateWindowEx( ex_style, class_name, version, window_name, style, x, y, cx, cy,
                                 parent, menu, instance, params, flags, client_instance, class, ansi );
@@ -257,6 +256,83 @@ static HANDLE WINAPI ios_NtUserRemoveProp( HWND hwnd, const WCHAR *str )
     return NtUserRemoveProp( hwnd, ios_wow_atom( str, "NtUserRemoveProp" ));
 }
 
+/***********************************************************************
+ *           ml883: WINDOW PROCEDURE HANDLES THAT CROSS THE 32-BIT BRIDGE
+ *
+ * GetWindowLongPtrA(GWLP_WNDPROC) on a window whose class has only a Unicode
+ * procedure (or W on an ANSI-only one) does not return that procedure: win32u
+ * hands out a winproc HANDLE, 0xffff0000 | index, that only CallWindowProc
+ * understands -- as Windows does. wow64win.dll's CallWindowProc thunk converts
+ * its target with guest_ptr32(), so the handle reaches win32u as B + 0xffff00xx.
+ * That is no longer a handle (handle_to_proc wants 0xffff in the top half), so
+ * win32u finds no procedure for it and gives it back as the function to call,
+ * and 32-bit user32 CALLS 0xffff00xx: the guest runs whatever lies at the top
+ * of its window. Prince of Persia: The Two Thrones' launcher faulted reading
+ * guest 0x81/0x82 (eip 0xffff004e) in every such call; the user callback
+ * swallowed the exception, returned 0, and the window being created failed.
+ *
+ * MFC does exactly that for each top-level window a thread creates while its
+ * CBT hook is installed (always, in an MFC .exe): _AfxCbtFilterHook keeps
+ * GetWindowLongPtr(GWLP_WNDPROC) as the "AfxOldWndProc423" property and
+ * subclasses with _AfxActivationWndProc, which forwards every message through
+ * CallWindowProc(old). An ANSI MFC program creating a Unicode-class window --
+ * COM's apartment window (OleMainThreadWndClass), the IME windows, comctl32's
+ * tooltips -- got a handle, so all of them failed (0.1.143-0.1.148:
+ * "apartment_createwindowifneeded CreateWindow failed", [wow-cw] "Wine IME"
+ * error 1400). CWnd::DefWindowProc forwards through CallWindowProc(m_pfnSuper)
+ * for every control MFC subclasses, so a comctl32 control in an ANSI MFC
+ * dialog lost its default handling the same way.
+ *
+ * The top 64 KB of a 32-bit address space is never mapped, so B + 0xffffxxxx
+ * is never a guest function: it is taken back to the handle. Two thunks
+ * convert a WNDPROC with guest_ptr32(): CallWindowProc (NtUserMessageCall,
+ * type NtUserCallWindowProc) and RegisterClassEx (a class registered with the
+ * procedure GetClassInfo returned, the usual way to superclass). SetWindowLong
+ * (Ptr) and SetClassLong(Ptr) pass the 32-bit value through as it is, and
+ * dialog procedures go through NtUserCallTwoParam unconverted, so those were
+ * never affected. 64-bit callers (B = 0) keep upstream behaviour exactly. */
+static WNDPROC ios_wow_proc( WNDPROC proc, const char *where )
+{
+    static int logged;
+    ULONG_PTR base, off;
+
+    if (!proc || !(base = ios_wow_base())) return proc;
+    off = (ULONG_PTR)proc - base;
+    if (off >> 16 != 0xffff) return proc;
+    if (__atomic_add_fetch( &logged, 1, __ATOMIC_RELAXED ) <= 8)
+        dprintf( 2, "[wow-proc] ml883 %s: %p from a 32-bit caller is winproc handle %#lx (B=%p)\n",
+                 where, proc, (unsigned long)off, (void *)base );
+    return (WNDPROC)off;
+}
+
+static LRESULT WINAPI ios_NtUserMessageCall( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
+                                             void *result_info, DWORD type, BOOL ansi )
+{
+    if (type == NtUserCallWindowProc && result_info)
+    {
+        struct win_proc_params *params = result_info;
+        params->func = ios_wow_proc( params->func, "CallWindowProc" );
+    }
+    return NtUserMessageCall( hwnd, msg, wparam, lparam, result_info, type, ansi );
+}
+
+static ATOM WINAPI ios_NtUserRegisterClassExWOW( const WNDCLASSEXW *wc, UNICODE_STRING *name,
+                                                 UNICODE_STRING *version,
+                                                 struct client_menu_name *client_menu_name,
+                                                 DWORD fnid, DWORD flags, DWORD *wow )
+{
+    WNDCLASSEXW copy;
+    WNDPROC proc;
+
+    if (wc && (proc = ios_wow_proc( wc->lpfnWndProc, "RegisterClassEx" )) != wc->lpfnWndProc)
+    {
+        copy = *wc;
+        copy.lpfnWndProc = proc;
+        wc = &copy;
+    }
+    return NtUserRegisterClassExWOW( wc, name, version, client_menu_name, fnid, flags, wow );
+}
+
 static void ios_swap_syscall( ULONG_PTR orig, ULONG_PTR hook, const char *name )
 {
     unsigned int i;
@@ -269,7 +345,7 @@ static void ios_swap_syscall( ULONG_PTR orig, ULONG_PTR hook, const char *name )
         return;
     }
     dprintf( 2, "[wow-atom] ml878 %s is not in the win32u syscall table -- "
-                "atoms from 32-bit callers stay unconverted there\n", name );
+                "values from 32-bit callers stay unconverted there\n", name );
 }
 
 NTSTATUS win32u_unix_lib_init(void)
@@ -281,6 +357,10 @@ NTSTATUS win32u_unix_lib_init(void)
     ios_swap_syscall( (ULONG_PTR)NtUserGetProp, (ULONG_PTR)ios_NtUserGetProp, "NtUserGetProp" );
     ios_swap_syscall( (ULONG_PTR)NtUserSetProp, (ULONG_PTR)ios_NtUserSetProp, "NtUserSetProp" );
     ios_swap_syscall( (ULONG_PTR)NtUserRemoveProp, (ULONG_PTR)ios_NtUserRemoveProp, "NtUserRemoveProp" );
+    ios_swap_syscall( (ULONG_PTR)NtUserMessageCall, (ULONG_PTR)ios_NtUserMessageCall,
+                      "NtUserMessageCall" );   /* ml883 */
+    ios_swap_syscall( (ULONG_PTR)NtUserRegisterClassExWOW, (ULONG_PTR)ios_NtUserRegisterClassExWOW,
+                      "NtUserRegisterClassExWOW" );   /* ml883 */
     status = win32u_unix_lib_init_upstream();
 
     /* The task-global is dead here; win32u_zero_bits() answers per

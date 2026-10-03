@@ -607,6 +607,113 @@ static DWORD start_process( const WCHAR *exe, const WCHAR *args, const WCHAR *di
     return pid;
 }
 
+/* ml883: THE INSTALL KEY A COPIED GAME LACKS.
+ *
+ * Prince of Persia: The Two Thrones' launcher (PrinceOfPersia.exe) starts the
+ * game from the folder its installer recorded in
+ *     HKLM\SOFTWARE\Ubisoft\Prince of Persia The Two Thrones\1.00.999
+ * (Product_Path; the launcher is 32-bit, so it reads the Wow6432Node view). A
+ * folder copied onto the device has no such key: the launcher passes its
+ * hardware check (ml880), hides its window, fails to start pop3.exe and quits
+ * with exit code 0 -- "closed before it started" (0.1.146-0.1.148: "Ubisoft"
+ * missing under HKLM\Software twice, and no process creation for pop3.exe ever
+ * reached Wine). PCGamingWiki's fix for the same symptom on Windows ("Launcher
+ * not working") is that key with Product_Path and Profiles_Path set to the
+ * game's folder; the other three values are what the retail installer writes.
+ *
+ * Written just before such a launch, so it follows the folder wherever the game
+ * is kept, and only for the files listed here (the launcher name plus a file
+ * beside it that identifies the game). Values the key already has are kept,
+ * except the folder paths, which must name the folder being launched. */
+struct install_value
+{
+    const WCHAR *name;
+    const WCHAR *data;   /* NULL: the launched program's folder */
+};
+
+static const struct install_value pop_two_thrones_values[] =
+{
+    { L"Product_Path", NULL },
+    { L"Profiles_Path", NULL },
+    { L"Product_Executable", L"PrinceOfPersia.exe" },
+    { L"Product_Language", L"9" },
+    { L"Product_Release", L"Retail EMEA" },
+};
+
+static const struct install_key
+{
+    const WCHAR *exe;      /* the launched file's name */
+    const WCHAR *marker;   /* a file beside it that identifies the game */
+    const WCHAR *key;      /* under HKLM\Software, in the 32-bit view */
+    const struct install_value *values;
+    unsigned int count;
+} install_keys[] =
+{
+    { L"PrinceOfPersia.exe", L"pop3.exe", L"Ubisoft\\Prince of Persia The Two Thrones\\1.00.999",
+      pop_two_thrones_values, ARRAYSIZE(pop_two_thrones_values) },
+};
+
+static void write_install_key( const WCHAR *exe )
+{
+    const WCHAR *name = exe, *p;
+    WCHAR folder[MAX_PATH], path[MAX_PATH + 32], keypath[256], have[MAX_PATH];
+    unsigned int i, j;
+    size_t len;
+
+    for (p = exe; *p; p++) if (*p == '\\' || *p == '/') name = p + 1;
+    len = name - exe;
+    if (len < 2 || len > MAX_PATH) return;
+    memcpy( folder, exe, (len - 1) * sizeof(WCHAR) );   /* without the separator */
+    folder[len - 1] = 0;
+
+    for (i = 0; i < ARRAYSIZE(install_keys); i++)
+    {
+        const struct install_key *k = &install_keys[i];
+        BOOL wow_view;
+        DWORD disp;
+        HKEY hkey;
+        LONG err;
+
+        if (_wcsicmp( name, k->exe )) continue;
+        swprintf( path, ARRAYSIZE(path), L"%ls\\%ls", folder, k->marker );
+        if (GetFileAttributesW( path ) == INVALID_FILE_ATTRIBUTES) continue;
+
+        /* The server shows a 32-bit program HKLM\Software\Wow6432Node in place
+         * of HKLM\Software whenever that key exists; this agent is 64-bit and
+         * always gets the plain view, so it names the node itself. */
+        wow_view = !RegOpenKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Wow6432Node", 0, KEY_READ, &hkey );
+        if (wow_view) RegCloseKey( hkey );
+        swprintf( keypath, ARRAYSIZE(keypath), L"Software\\%ls%ls", wow_view ? L"Wow6432Node\\" : L"", k->key );
+        err = RegCreateKeyExW( HKEY_LOCAL_MACHINE, keypath, 0, NULL, REG_OPTION_NON_VOLATILE,
+                               KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &hkey, &disp );
+        if (err)
+        {
+            agent_log( "install key HKLM\\%ls: create failed, error %ld", keypath, err );
+            continue;
+        }
+        agent_log( "install key HKLM\\%ls (%s) for %ls", keypath,
+                   disp == REG_CREATED_NEW_KEY ? "created" : "already there", name );
+        for (j = 0; j < k->count; j++)
+        {
+            const WCHAR *want = k->values[j].data ? k->values[j].data : folder;
+            DWORD type, size = sizeof(have) - sizeof(WCHAR);
+
+            memset( have, 0, sizeof(have) );
+            if (!RegQueryValueExW( hkey, k->values[j].name, NULL, &type, (BYTE *)have, &size ) &&
+                type == REG_SZ && (k->values[j].data || !_wcsicmp( have, folder )))
+            {
+                agent_log( "install key   %ls=%ls (kept)", k->values[j].name, have );
+                continue;
+            }
+            err = RegSetValueExW( hkey, k->values[j].name, 0, REG_SZ, (const BYTE *)want,
+                                  (DWORD)((wcslen( want ) + 1) * sizeof(WCHAR)) );
+            agent_log( "install key   %ls=%ls%s", k->values[j].name, want,
+                       err ? " -- FAILED" : "" );
+        }
+        RegCloseKey( hkey );
+    }
+}
+
 static void handle_request( void )
 {
     char *text = read_text_file( REQUEST_PATH );
@@ -811,6 +918,7 @@ static void handle_request( void )
         }
     }
 
+    write_install_key( wexe );   /* ml883 */
     pid = start_process( wexe, wargs, wdir );
     if (!pid) err = GetLastError();
     if (cache_mode)

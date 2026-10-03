@@ -308,25 +308,39 @@ static void send_reply( union generic_reply *reply )
  * and then quits without starting the game. Ubisoft launchers of that era take
  * the game folder from keys their installer wrote, and a game copied onto the
  * device has none -- this says which keys and values it asked for. i386
- * clients only (no 64-bit game is touched), failures only, a bounded count. */
-#define IOS_REG_MISS_MAX 200
+ * clients only (no 64-bit game is touched), failures only, a bounded count.
+ *
+ * ml883: each name once per program. 0.1.148 spent its 200 lines on repeats (COM's
+ * "TreatAs" 60 times, one INI file's mapping key 40 times) and ran out before
+ * the launcher's last second, the part that mattered. */
+#define IOS_REG_MISS_MAX 300
+#define IOS_REG_MISS_SEEN 256
 static void ios_log_registry_miss( enum request req )
 {
     static int logged;
+    static unsigned int seen_hash[IOS_REG_MISS_SEEN], seen_n;
     const WCHAR *w;
     char name[256];
     data_size_t i, n, len;
+    unsigned int hash = 2166136261u, s;
 
     if (req != REQ_open_key && req != REQ_get_key_value) return;
     if (current->error != STATUS_OBJECT_NAME_NOT_FOUND) return;
     if (!current->process || current->process->machine != IMAGE_FILE_MACHINE_I386) return;
     if (logged >= IOS_REG_MISS_MAX) return;
-    logged++;
     w = get_req_data();
     len = get_req_data_size() / sizeof(WCHAR);
     for (i = n = 0; i < len && n < sizeof(name) - 1; i++)
         name[n++] = (w[i] >= 0x20 && w[i] < 0x7f) ? (char)w[i] : '?';
     name[n] = 0;
+    /* FNV-1a over the process, the request type and the name, case-folded */
+    hash = (hash ^ (unsigned int)current->process->id) * 16777619u;
+    hash = (hash ^ (unsigned int)req) * 16777619u;
+    for (i = 0; i < n; i++)
+        hash = (hash ^ (unsigned char)((name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i])) * 16777619u;
+    for (s = 0; s < seen_n; s++) if (seen_hash[s] == hash) return;
+    if (seen_n < IOS_REG_MISS_SEEN) seen_hash[seen_n++] = hash;
+    logged++;
     /* ml882: stderr, like the other server diagnostics ([srv-own]): ws_log's
      * file stops reaching the session log shortly after the server starts, so
      * 0.1.147 printed these where nobody could read them. */
