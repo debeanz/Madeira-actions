@@ -1345,6 +1345,9 @@ private struct OptionRow: Identifiable {
     var header: String? = nil
     /// ml889: indented under the row above it (a key bind under "Send as keyboard").
     var indent: Bool = false
+    /// ml899: one of a set of choices: the checkmark's room is kept when it is
+    /// not checked, so checking it never re-wraps the row's text.
+    var radio: Bool = false
     let action: () -> Void
 }
 
@@ -1659,7 +1662,7 @@ private struct OptionsSheet: View {
         let defaults = UserDefaults.standard
         var out: [OptionRow] = []
 
-        let globalRes: String = defaults.string(forKey: "madeira.desktopResolution") ?? "960x540"
+        let globalRes: String = defaults.string(forKey: "madeira.desktopResolution") ?? GameResolutionDefault.settingDefault
         let resOptions: [String?] = [nil] + GameSettings.resolutionOptions.map { Optional($0) }
         out.append(OptionRow(id: "resolution", title: "Resolution",
                              systemImage: "rectangle.expand.vertical",
@@ -1719,8 +1722,8 @@ private struct OptionsSheet: View {
                                  }
                              }))
 
-        // ml896: how the picture fills the screen, and sharp pixels. Both apply
-        // at once when this game is the one playing.
+        // ml896: how the picture fills the screen; applies at once when this
+        // game is the one playing.
         let scaleOptions: [String?] = [nil] + ScreenScaling.allCases.map { Optional($0.rawValue) }
         let scaleText: String = s.scaling.flatMap { ScreenScaling(rawValue: $0) }?.label
             ?? "Default (\(ScreenScaling.saved.label))"
@@ -1733,28 +1736,6 @@ private struct OptionsSheet: View {
                                  let cur: Int = scaleOptions.firstIndex(where: { $0 == s.scaling }) ?? 0
                                  let next: String? = scaleOptions[(cur + 1) % scaleOptions.count]
                                  library.updateSettings(for: id) { $0.scaling = next }
-                                 ScreenScaling.reapply()
-                             }))
-        let sharpText: String
-        switch s.sharpPixels {
-        case nil:          sharpText = "Default (\(ScreenScaling.savedSharp ? "On" : "Off"))"
-        case .some(true):  sharpText = "On"
-        case .some(false): sharpText = "Off"
-        }
-        out.append(OptionRow(id: "sharppixels", title: "Sharp pixels",
-                             systemImage: "square.grid.3x3",
-                             destructive: false, checked: false,
-                             trailing: sharpText,
-                             disabled: false,
-                             note: "For pixel-art games: no smoothing when the picture is scaled up.",
-                             action: {
-                                 let next: Bool?
-                                 switch s.sharpPixels {
-                                 case nil:          next = true
-                                 case .some(true):  next = false
-                                 case .some(false): next = nil
-                                 }
-                                 library.updateSettings(for: id) { $0.sharpPixels = next }
                                  ScreenScaling.reapply()
                              }))
         return out
@@ -1776,25 +1757,26 @@ private struct OptionsSheet: View {
 
         out.append(OptionRow(id: "touch-off", title: "Off", systemImage: "nosign",
                              destructive: false, checked: touchNow == .off,
-                             section: "Controls", header: "Touch screen controls",
+                             section: "Controls", header: "Touch screen controls", radio: true,
                              action: { touch.setChoice(.off, forGame: id) }))
         out.append(OptionRow(id: "touch-xbox", title: "Xbox controller (XInput)", systemImage: "gamecontroller",
                              destructive: false, checked: touchNow == .xbox,
-                             note: "A fixed layout.",
+                             note: "A fixed layout.", radio: true,
                              action: { touch.setChoice(.xbox, forGame: id) }))
         out.append(OptionRow(id: "touch-keyboard", title: "Keyboard layout", systemImage: "keyboard",
                              destructive: false, checked: touchNow == .custom,
-                             note: "Arrange it with the pencil while playing.",
+                             note: "Arrange it with the pencil while playing.", radio: true,
                              action: { touch.setChoice(.custom, forGame: id) }))
 
         out.append(OptionRow(id: "pad-xinput", title: "XInput", systemImage: "gamecontroller.fill",
                              destructive: false, checked: sendsXbox,
                              note: "The game sees an Xbox controller.",
-                             header: "Physical controller",
+                             header: "Physical controller", radio: true,
                              action: { pad.setSendsXbox(true, forGame: id) }))
         out.append(OptionRow(id: "pad-keyboard", title: "Send as keyboard", systemImage: "keyboard",
                              destructive: false, checked: !sendsXbox,
                              note: "For games without controller support: each button sends a key you choose.",
+                             radio: true,
                              action: { pad.setSendsXbox(false, forGame: id) }))
         guard !sendsXbox else { return out }
         // ml890: the binds are a page of their own, so the menu stays short.
@@ -2014,7 +1996,8 @@ private struct OptionsSheet: View {
             SheetRow(title: row.title, systemImage: row.systemImage,
                      destructive: row.destructive, checked: row.checked,
                      focused: focused, subtitle: nil, thumbnail: nil,
-                     trailing: row.trailing, disabled: disabled, note: row.note)
+                     trailing: row.trailing, disabled: disabled, note: row.note,
+                     radio: row.radio)
         }
         .buttonStyle(SheetRowStyle())
     }
@@ -2477,11 +2460,14 @@ private struct SheetRow: View {
     /// ml871: one plain line under the title (unlike `subtitle`, which is the
     /// executable picker's path line and swaps the icon for a thumbnail box).
     var note: String? = nil
+    /// ml899: keep the checkmark's room when unchecked (OptionRow.radio).
+    var radio: Bool = false
 
     private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
     var body: some View {
         content
+            .transaction { $0.animation = nil }   // ml899: text never slides; only the focus ring animates
             .opacity(disabled ? 0.45 : 1.0)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -2544,6 +2530,10 @@ private struct SheetRow: View {
                 Image(systemName: "checkmark")
                     .font(.body.weight(.semibold))
                     .foregroundStyle(LauncherPalette.accent)
+            } else if radio {
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold))
+                    .hidden()
             }
         }
     }
@@ -3311,7 +3301,7 @@ struct ReportSheet: View {
     /// actually ran with.
     private func gatherAutomaticInfo() {
         let s = GameLibrary.shared.settings(for: game.id)
-        let resolution = s.resolution ?? (UserDefaults.standard.string(forKey: "madeira.desktopResolution") ?? "960x540")
+        let resolution = s.resolution ?? (UserDefaults.standard.string(forKey: "madeira.desktopResolution") ?? GameResolutionDefault.settingDefault)
         let noTSO = s.noTSO ?? UserDefaults.standard.bool(forKey: "madeira.fexNoTSO")
         let cap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
         settings = ["resolution": resolution, "x86MemoryOrdering": !noTSO, "frameCap": cap.label]

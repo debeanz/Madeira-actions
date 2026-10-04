@@ -75,18 +75,18 @@ struct GameSettings: Codable, Equatable {
     var noTSO: Bool? = nil
     /// FrameCap raw value for this game; Settings' cap comes back when it ends.
     var frameCap: Int? = nil
-    /// ml896: ScreenScaling raw value, and sharp pixels, for this game.
+    /// ml896: ScreenScaling raw value for this game. (ml899: its sharp-pixels
+    /// switch is gone; an old saved value is simply not decoded.)
     var scaling: String? = nil
-    var sharpPixels: Bool? = nil
 
     var isEmpty: Bool {
-        resolution == nil && noTSO == nil && frameCap == nil && scaling == nil && sharpPixels == nil
+        resolution == nil && noTSO == nil && frameCap == nil && scaling == nil
     }
 
     /// The resolutions Settings offers; the per-game row cycles the same list.
+    /// ml899: smallest first; 800x600 added, 960x540 and 1280x960 removed.
     static let resolutionOptions = [
-        "960x540", "1280x720", "1600x900", "1920x1080", "2048x1084", "2796x1290",
-        "1024x768", "1280x960",
+        "800x600", "1024x768", "1280x720", "1600x900", "1920x1080", "2048x1084", "2796x1290",
     ]
 
     static func size(_ s: String) -> (w: Int, h: Int)? {
@@ -117,6 +117,7 @@ final class GameLibrary: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        GameLibrary.dropRemovedResolutions()   // ml899
         gameSettings = GameLibrary.loadGameSettings()
         favorites = Set(defaults.stringArray(forKey: GameLibrary.favoritesKey) ?? [])
         if let raw = defaults.dictionary(forKey: GameLibrary.playSecondsKey) {
@@ -319,6 +320,28 @@ final class GameLibrary: ObservableObject {
     // MARK: Per-game settings (ml849)
 
     private static let gameSettingsKey = "madeira.launcher.gameSettings"
+
+    /// ml899: a resolution no longer offered (960x540, 1280x960) falls back to
+    /// the default -- Settings' to 1920x1080, a game's own to Default.
+    private static func dropRemovedResolutions() {
+        let defaults = UserDefaults.standard
+        let offered = Set(GameSettings.resolutionOptions)
+        if let r = defaults.string(forKey: GameResolutionDefault.settingKey), !offered.contains(r) {
+            defaults.removeObject(forKey: GameResolutionDefault.settingKey)
+        }
+        var all = loadGameSettings()
+        var changed = false
+        for (id, var s) in all {
+            if let r = s.resolution, !offered.contains(r) {
+                s.resolution = nil
+                if s.isEmpty { all.removeValue(forKey: id) } else { all[id] = s }
+                changed = true
+            }
+        }
+        if changed, let data = try? JSONEncoder().encode(all) {
+            defaults.set(data, forKey: gameSettingsKey)
+        }
+    }
 
     /// Reads UserDefaults, not the @Published copy: safe off the main thread.
     static func loadGameSettings() -> [String: GameSettings] {
@@ -1198,12 +1221,12 @@ final class GameLibrary: ObservableObject {
 enum GameResolutionDefault {
     /// Same key and default as ContentView's desktopResolution (Settings > Screen).
     static let settingKey = "madeira.desktopResolution"
-    static let settingDefault = "960x540"
+    static let settingDefault = "1920x1080"   // ml899: the first-install default
 
     /// "WxH" -> size, with ContentView.desktopSize's fallback.
     static func size(fromSetting setting: String) -> (w: Int, h: Int) {
         let parts = setting.split(separator: "x").compactMap { Int($0) }
-        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (960, 540) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (1920, 1080) }
         return (parts[0], parts[1])
     }
 

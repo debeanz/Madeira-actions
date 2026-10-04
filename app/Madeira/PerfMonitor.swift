@@ -3,14 +3,15 @@ import SwiftUI
 import UIKit
 
 /// DXMT present pacing (g_madeira_vsync_mode). Raw values are the mode
-/// numbers the unix side switches on; 3 and 4 come from
-/// build/dxmt-ios/patch_present_cap.py.
+/// numbers the unix side switches on (build/dxmt-ios/patch_present_cap.py).
+/// ml899: four caps -- 60 (default), 30, 120 and uncapped. 40 is gone: on a
+/// panel left at 60 Hz its 25 ms wait landed on every second refresh, i.e. 30.
+/// 120 and uncapped also ask the panel for 120 Hz (ProMotionIntent).
 enum FrameCap: Int32, CaseIterable, Identifiable {
     case locked60 = 1
-    case cap40 = 4
     case cap30 = 3
-    case max = 0
-    case raw = 2
+    case cap120 = 0      // was "display max": now paced at 1/120 s
+    case uncapped = 2    // the game runs free; shown at up to the panel rate
 
     static let key = "madeira.frameCap"
 
@@ -18,42 +19,38 @@ enum FrameCap: Int32, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .locked60: return "60"
-        case .cap40:    return "40"
-        case .cap30:    return "30"
-        case .max:      return "MAX(\(UIScreen.main.maximumFramesPerSecond))"
-        case .raw:      return "RAW"
+        case .locked60: return "60 fps"
+        case .cap30:    return "30 fps"
+        case .cap120:   return "120 fps"
+        case .uncapped: return "Uncapped"
         }
     }
 
     var settingsLabel: String {
         switch self {
         case .locked60: return "60 fps"
-        case .cap40:    return "40 fps (cooler)"
-        case .cap30:    return "30 fps (coolest)"
-        case .max:      return "Display max (\(UIScreen.main.maximumFramesPerSecond) Hz)"
-        case .raw:      return "Unthrottled (benchmark)"
+        case .cap30:    return "30 fps (cooler)"
+        case .cap120:   return "120 fps"
+        case .uncapped: return "Uncapped"
         }
     }
 
     var color: Color {
         switch self {
         case .locked60: return .cyan
-        case .cap40:    return .mint
         case .cap30:    return .green
-        case .max:      return .pink
-        case .raw:      return .orange
+        case .cap120:   return .pink
+        case .uncapped: return .orange
         }
     }
 
-    /// Pill tap order: 60 → 40 → 30 → MAX → RAW → 60.
+    /// Tap order: 60 → 30 → 120 → uncapped → 60.
     var next: FrameCap {
         switch self {
-        case .locked60: return .cap40
-        case .cap40:    return .cap30
-        case .cap30:    return .max
-        case .max:      return .raw
-        case .raw:      return .locked60
+        case .locked60: return .cap30
+        case .cap30:    return .cap120
+        case .cap120:   return .uncapped
+        case .uncapped: return .locked60
         }
     }
 
@@ -69,7 +66,7 @@ enum FrameCap: Int32, CaseIterable, Identifiable {
 
     static func apply(_ cap: FrameCap, persist: Bool) {
         madeira_set_vsync_locked(cap.rawValue)
-        ProMotionIntent.shared.setActive(cap == .max || cap == .raw)
+        ProMotionIntent.shared.setActive(cap == .cap120 || cap == .uncapped)
         if persist { UserDefaults.standard.set(Int(cap.rawValue), forKey: key) }
     }
 

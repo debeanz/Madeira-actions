@@ -98,28 +98,24 @@ enum ScreenScaling: String, CaseIterable, Identifiable {
     }
 
     static let key = "madeira.screenScaling"
-    static let sharpKey = "madeira.sharpPixels"
 
-    /// The Settings defaults.
+    /// The Settings default.
     static var saved: ScreenScaling {
         ScreenScaling(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .fit
     }
-    static var savedSharp: Bool { UserDefaults.standard.bool(forKey: sharpKey) }
 
     /// The Games-tab game running now (ContentView's session hook), nil outside one.
     static var currentGameID: String?
 
-    /// A game's own scaling and sharp pixels, else the Settings defaults.
-    static func effective(for gameID: String?) -> (ScreenScaling, Bool) {
+    /// A game's own scaling, else the Settings default.
+    static func effective(for gameID: String?) -> ScreenScaling {
         let own: GameSettings? = gameID.flatMap { GameLibrary.shared.gameSettings[$0] }
-        let mode: ScreenScaling = own?.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? saved
-        return (mode, own?.sharpPixels ?? savedSharp)
+        return own?.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? saved
     }
 
     /// Put the running game's (else Settings') scaling on screen.
     static func reapply() {
-        let (mode, sharp) = effective(for: currentGameID)
-        MetalBackedView.applyScaling(mode, sharp: sharp)
+        MetalBackedView.applyScaling(effective(for: currentGameID))
     }
 }
 
@@ -236,15 +232,11 @@ final class MetalBackedView: UIView {
 
     /// ml896: the live scaling -- the running game's own, else Settings'.
     private(set) static var scaling: ScreenScaling = .fit
-    private(set) static var sharpPixels = false
 
-    static func applyScaling(_ mode: ScreenScaling, sharp: Bool) {
-        let changed = mode != scaling || sharp != sharpPixels
+    static func applyScaling(_ mode: ScreenScaling) {
+        guard mode != scaling else { return }
         scaling = mode
-        sharpPixels = sharp
-        MetalHostView.shared.metalLayer.magnificationFilter = sharp ? .nearest : .linear
-        guard changed else { return }
-        LogStore.shared.log("[screen] ml896 scaling \(mode.rawValue)" + (sharp ? ", sharp pixels" : ""))
+        LogStore.shared.log("[screen] ml896 scaling \(mode.rawValue)")
         liveTarget()?.setNeedsLayout()
     }
 
@@ -1844,7 +1836,6 @@ struct ContentView: View {
     @State private var freeSpaceText = "Calculating…"   // ml893: System status
     /// ml896: Settings › Screen defaults (a game's ⋯ menu can override them).
     @AppStorage(ScreenScaling.key) private var screenScalingSetting: String = ScreenScaling.fit.rawValue
-    @AppStorage(ScreenScaling.sharpKey) private var sharpPixelsSetting: Bool = false
     @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
@@ -1863,7 +1854,7 @@ struct ContentView: View {
     /// the display games see: the win32u shim lists every standard mode up
     /// to this size, so it also bounds what a game's own resolution menu
     /// can offer.
-    @AppStorage("madeira.desktopResolution") private var desktopResolution = "960x540"
+    @AppStorage("madeira.desktopResolution") private var desktopResolution = "1920x1080"   // ml899
     /// ml849: one list, shared with each game's own Resolution row.
     private static let desktopResolutions = GameSettings.resolutionOptions
     /// Version of the Wine Mono runtime CI placed in the bundle's mono/
@@ -1886,7 +1877,7 @@ struct ContentView: View {
 
     private var desktopSize: (w: Int, h: Int) {
         let parts = desktopResolution.split(separator: "x").compactMap { Int($0) }
-        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (960, 540) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (1920, 1080) }
         return (parts[0], parts[1])
     }
     @Namespace private var pointerNS
@@ -3429,9 +3420,7 @@ struct ContentView: View {
                         }
                     }
                     .onChange(of: screenScalingSetting) { _, _ in ScreenScaling.reapply() }
-                    Toggle("Sharp pixels", isOn: $sharpPixelsSetting)
-                        .onChange(of: sharpPixelsSetting) { _, _ in ScreenScaling.reapply() }
-                    Text("Fit shows the whole picture with black bars, Fill covers the screen and crops the edges, Stretch fills it out of shape, and Whole-number scales by exactly 2x, 3x and so on, so pixel art stays even. Sharp pixels turns off the smoothing. A game's ⋯ menu can change both for that game.")
+                    Text("Fit shows the whole picture with black bars, Fill covers the screen and crops the edges, Stretch fills it out of shape, and Whole-number scales by exactly 2x, 3x and so on, so pixel art stays even. A game's ⋯ menu can change it for that game.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -7894,7 +7883,7 @@ struct TouchControlsOverlay: View {
 
     // MARK: ml898 the running game's picture and frame rate (toolbar ⋯)
 
-    /// Screen scaling, sharp pixels and the frame rate cap of the game being
+    /// Screen scaling and the frame rate cap of the game being
     /// played. Each row cycles Default (Settings') and the values, applies at
     /// once and is saved for this game: the same values as its ⋯ menu in the
     /// Games tab. The menu stays open, so a tap shows the result right away.
@@ -7903,10 +7892,6 @@ struct TouchControlsOverlay: View {
         let s: GameSettings = library.gameSettings[id] ?? GameSettings()
         panelRow("Screen scaling", system: "arrow.up.left.and.arrow.down.right", value: scalingText(s)) {
             cycleScaling(id, s)
-        }
-        Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
-        panelRow("Sharp pixels", system: "square.grid.3x3", value: sharpText(s)) {
-            cycleSharp(id, s)
         }
         Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
         panelRow("Frame rate cap", system: "speedometer", value: capText(s)) {
@@ -7919,28 +7904,12 @@ struct TouchControlsOverlay: View {
         return "Default (" + ScreenScaling.saved.label + ")"
     }
 
-    private func sharpText(_ s: GameSettings) -> String {
-        switch s.sharpPixels {
-        case nil:          return "Default (" + (ScreenScaling.savedSharp ? "On" : "Off") + ")"
-        case .some(true):  return "On"
-        case .some(false): return "Off"
-        }
-    }
-
     private func capText(_ s: GameSettings) -> String {
         if let raw = s.frameCap, let cap = FrameCap(rawValue: Int32(raw)) { return Self.capName(cap) }
         return "Default (" + Self.capName(FrameCap.saved) + ")"
     }
 
-    private static func capName(_ c: FrameCap) -> String {
-        switch c {
-        case .locked60: return "60 fps"
-        case .cap40:    return "40 fps"
-        case .cap30:    return "30 fps"
-        case .max:      return "Max"
-        case .raw:      return "Unthrottled"
-        }
-    }
+    private static func capName(_ c: FrameCap) -> String { c.label }
 
     private func cycleScaling(_ id: String, _ s: GameSettings) {
         var options: [String?] = [nil]
@@ -7948,17 +7917,6 @@ struct TouchControlsOverlay: View {
         let cur: Int = options.firstIndex(where: { $0 == s.scaling }) ?? 0
         let next: String? = options[(cur + 1) % options.count]
         library.updateSettings(for: id) { $0.scaling = next }
-        ScreenScaling.reapply()
-    }
-
-    private func cycleSharp(_ id: String, _ s: GameSettings) {
-        let next: Bool?
-        switch s.sharpPixels {
-        case nil:          next = true
-        case .some(true):  next = false
-        case .some(false): next = nil
-        }
-        library.updateSettings(for: id) { $0.sharpPixels = next }
         ScreenScaling.reapply()
     }
 

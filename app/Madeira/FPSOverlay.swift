@@ -17,7 +17,9 @@ final class ProMotionIntent {
         if active {
             guard link == nil else { return }
             let l = CADisplayLink(target: self, selector: #selector(tick))
-            l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            // ml899: minimum 80, so the panel cannot settle at 60 while a 120 or
+            // uncapped game wants more.
+            l.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
             l.add(to: .main, forMode: .common)
             link = l
         } else {
@@ -98,7 +100,7 @@ struct FPSOverlay: View {
         }
         .onAppear {
             perf.start()
-            ProMotionIntent.shared.setActive(cap == .max || cap == .raw)
+            ProMotionIntent.shared.setActive(cap == .cap120 || cap == .uncapped)
         }
         .onDisappear { perf.stop() }
     }
