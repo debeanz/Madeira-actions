@@ -1597,10 +1597,11 @@ private struct OptionsSheet: View {
     // MARK: Settings (ml903)
 
     /// One switch decides whether this game uses Madeira's settings or its own.
-    /// Its own are listed only while it is on, grouped like Madeira's Settings:
-    /// Display, Performance, Graphics, Controls. Turning it on fills in every
-    /// value the game has not got yet with Madeira's current one; off keeps
-    /// them for next time (GameLibrary.setOverride).
+    /// The rows under it are grouped like Madeira's Settings: Display,
+    /// Performance, Graphics, Controls. ml905: always listed -- greyed out with
+    /// Madeira's values while the switch is off, the game's own once it is on.
+    /// Turning it on fills in every value the game has not got yet with
+    /// Madeira's current one; off keeps them for next time (GameLibrary.setOverride).
     private func settingsRows(_ g: LauncherGame) -> [OptionRow] {
         let id: String = g.id
         let on: Bool = library.overridesSettings(id)
@@ -1611,23 +1612,22 @@ private struct OptionsSheet: View {
                              note: on ? "Changes below are for this game only." : "This game uses Madeira's settings.",
                              section: "Settings", switchOn: on,
                              action: { library.setOverride(!on, for: id) }))
-        guard on else { return out }
-        out.append(contentsOf: perGameSettingRows(g))
-        out.append(shaderCacheRow(g))
-        out.append(controlsSummaryRow(g))
+        out.append(contentsOf: perGameSettingRows(g, own: on))
+        out.append(shaderCacheRow(g, own: on))
+        out.append(controlsSummaryRow(g, own: on))
         return out
     }
 
     /// Resolution and screen scaling (Display), the frame rate cap and the x86
-    /// memory-ordering switch (Performance): the game's own values, each row
-    /// cycling them on tap or A. Resolution and the TSO switch reach the game
-    /// only at launch, so they are disabled while it runs; the scaling and the
-    /// cap apply at once when this game is the one playing, and Settings' cap
-    /// comes back when it ends.
-    private func perGameSettingRows(_ g: LauncherGame) -> [OptionRow] {
+    /// memory-ordering switch (Performance): the game's own values (`own`),
+    /// each row cycling them on tap or A; else Madeira's, greyed out (ml905).
+    /// Resolution and the TSO switch reach the game only at launch, so they are
+    /// disabled while it runs; the scaling and the cap apply at once when this
+    /// game is the one playing, and Settings' cap comes back when it ends.
+    private func perGameSettingRows(_ g: LauncherGame, own: Bool) -> [OptionRow] {
         let busy: Bool = busyGameIDs.contains(g.id)
         let id: String = g.id
-        let s: GameSettings = library.gameSettings[id] ?? GameSettings()
+        let s: GameSettings = own ? (library.gameSettings[id] ?? GameSettings()) : GameSettings()
         let defaults = UserDefaults.standard
         var playingThis: Bool = false
         if case .playing(let t) = session, t == g.title { playingThis = true }
@@ -1639,7 +1639,7 @@ private struct OptionsSheet: View {
                              systemImage: "rectangle.expand.vertical",
                              destructive: false, checked: false,
                              trailing: curRes,
-                             disabled: busy,
+                             disabled: busy || !own,
                              header: "Display",
                              action: {
                                  let opts: [String] = GameSettings.resolutionOptions
@@ -1658,6 +1658,7 @@ private struct OptionsSheet: View {
                              systemImage: "arrow.up.left.and.arrow.down.right",
                              destructive: false, checked: false,
                              trailing: curScale.label,
+                             disabled: !own,
                              action: {
                                  let modes: [ScreenScaling] = Array(ScreenScaling.allCases)
                                  let cur: Int = modes.firstIndex(of: curScale) ?? -1
@@ -1671,6 +1672,7 @@ private struct OptionsSheet: View {
                              systemImage: "speedometer",
                              destructive: false, checked: false,
                              trailing: curCap.label,
+                             disabled: !own,
                              header: "Performance",
                              action: {
                                  let next: FrameCap = curCap.next
@@ -1683,7 +1685,7 @@ private struct OptionsSheet: View {
                              systemImage: "cpu",
                              destructive: false, checked: false,
                              trailing: curNoTSO ? "On" : "Off",
-                             disabled: busy,
+                             disabled: busy || !own,
                              note: "Turning this on may improve performance in some games. If this game runs slowly, it is worth a try.",   // ml872
                              action: {
                                  library.updateSettings(for: id) { $0.noTSO = !curNoTSO }
@@ -1691,10 +1693,11 @@ private struct OptionsSheet: View {
         return out
     }
 
-    /// ml830: the game's own shader cache switch (Graphics). Disabled while the
-    /// game runs or is still shutting down: its d3d11.dll reads the switch at
-    /// launch and holds the cache files open.
-    private func shaderCacheRow(_ g: LauncherGame) -> OptionRow {
+    /// ml830: the game's own shader cache switch (Graphics; ml905: Madeira's,
+    /// greyed out, while the game does not override). Disabled while the game
+    /// runs or is still shutting down: its d3d11.dll reads the switch at launch
+    /// and holds the cache files open.
+    private func shaderCacheRow(_ g: LauncherGame, own: Bool) -> OptionRow {
         let busy: Bool = busyGameIDs.contains(g.id)
         let id: String = g.id
         let on: Bool = library.isShaderCacheEnabled(for: id)
@@ -1702,7 +1705,7 @@ private struct OptionsSheet: View {
                          systemImage: "square.stack.3d.down.right",
                          destructive: false, checked: false,
                          trailing: on ? "On" : "Off",
-                         disabled: busy,
+                         disabled: busy || !own,
                          header: "Graphics",
                          action: {
                              // No dismiss: the row stays where it is, and so does the highlight.
@@ -1710,14 +1713,16 @@ private struct OptionsSheet: View {
                          })
     }
 
-    /// ml903: opens the Controls page; says what is picked now.
-    private func controlsSummaryRow(_ g: LauncherGame) -> OptionRow {
+    /// ml903: opens the Controls page; says what is picked now (ml905:
+    /// Madeira's, greyed out and closed, while the game does not override).
+    private func controlsSummaryRow(_ g: LauncherGame, own: Bool) -> OptionRow {
         let touchNow: TouchControlsChoice = touch.choice(forGame: g.id)
         let padText: String = pad.sendsXbox(forGame: g.id) ? "XInput" : "keyboard keys"
         let summary: String = "Touch: \(touchNow.title) · Controller: \(padText)"
         return OptionRow(id: "controls", title: "Touch screen and controller",
                          systemImage: "gamecontroller",
                          destructive: false, checked: false,
+                         disabled: !own,
                          note: summary,
                          header: "Controls", chevron: true,
                          action: { openControls() })
@@ -1916,16 +1921,21 @@ private struct OptionsSheet: View {
 
     // MARK: Delete (ml830)
 
-    /// Last row of the main list. Opens the in-sheet confirmation.
+    /// Last row of the main list. Opens the in-sheet confirmation. ml905: the
+    /// game's size next to it when its folder is what gets deleted.
     private func deleteRow(_ g: LauncherGame) -> OptionRow {
         let busy: Bool = busyGameIDs.contains(g.id)
         var base: String = "Delete game"
+        var size: String? = nil
         if case .removeFromLibrary = library.deletePlan(for: g) {
             base = "Remove from library"
+        } else if library.sizeFolder(for: g) != nil {
+            size = gameBytes.map { ShaderCache.text($0) } ?? "…"
         }
         return OptionRow(id: "delete", title: busy ? base + " (close it first)" : base,
                          systemImage: "trash",
                          destructive: true, checked: false,
+                         trailing: size,
                          disabled: busy,
                          action: { enterDeleteConfirm(g) })
     }

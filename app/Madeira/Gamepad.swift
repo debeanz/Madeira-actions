@@ -433,7 +433,9 @@ final class GamepadBridge: ObservableObject {
     /// its own setting, else the default. The running game's is the live one.
     func sendsXbox(forGame id: String) -> Bool {
         if id == gameID { return native }
-        return profiles[id]?.native ?? defaultSendsXbox
+        // ml905: a game whose switch is off gets the defaults, whatever it kept
+        let own = GameLibrary.usesOwnSettings(id) ? profiles[id] : nil
+        return own?.native ?? defaultSendsXbox
     }
 
     /// Pick XInput or keyboard keys for a game. The running game's changes at
@@ -456,7 +458,8 @@ final class GamepadBridge: ObservableObject {
     /// The binds a game uses: its own, else the defaults.
     func mapping(forGame id: String) -> GamepadMapping {
         if id == gameID { return mapping }
-        return profiles[id]?.mapping ?? (gameID == nil ? mapping : defaultMapping)
+        let own = GameLibrary.usesOwnSettings(id) ? profiles[id] : nil   // ml905
+        return own?.mapping ?? (gameID == nil ? mapping : defaultMapping)
     }
 
     /// Change a game's binds: live for the running game, else its own.

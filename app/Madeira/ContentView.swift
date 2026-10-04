@@ -6185,7 +6185,9 @@ final class TouchControlsModel: ObservableObject {
     /// is what is on screen.
     func choice(forGame id: String) -> TouchControlsChoice {
         if id == gameID { return choice }
-        return Self.choice(of: Self.merged(profiles[id], over: defaults ?? snapshot()))
+        // ml905: a game whose switch is off gets the defaults, whatever it kept
+        let own = GameLibrary.usesOwnSettings(id) ? profiles[id] : nil
+        return Self.choice(of: Self.merged(own, over: defaults ?? snapshot()))
     }
 
     /// Pick a game's touch controls. The running game's change at once (and
