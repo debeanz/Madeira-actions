@@ -2918,7 +2918,7 @@ struct ContentView: View {
 
     private enum StatusLevel { case good, bad, neutral }
 
-    /// What decides whether games run, on one page: JIT, StikDebug, the memory
+    /// What decides whether games run, on one page: JIT, the memory
     /// entitlements and storage. Also what the removed Containers tab showed:
     /// Madeira's size, Wine Mono and Open Madeira in Files.
     private var systemStatusScreen: some View {
@@ -2929,18 +2929,13 @@ struct ContentView: View {
             Section("JIT") {
                 statusRow("JIT", value: jitOn ? "On" : "Off", level: jitOn ? .good : .bad,
                           note: jitOn ? nil : "Open Madeira from StikDebug to turn it on.")
-                statusRow("StikDebug",
-                          value: attached ? "Attached"
-                                 : (StikJITHelper.poolReady ? "Done, JIT kept" : "Not attached"),
-                          level: (attached || StikJITHelper.poolReady) ? .good : .bad, note: nil)
             }
             Section("Memory") {
                 statusRow("Increased memory limit", value: ents.increasedMemory ? "Yes" : "No",
                           level: ents.increasedMemory ? .good : .bad,
                           note: ents.increasedMemory ? nil : "Big games may be closed by iOS without it.")
                 statusRow("Extended virtual addressing", value: ents.extendedVA ? "Yes" : "No",
-                          level: ents.extendedVA ? .good : .neutral,
-                          note: ents.extendedVA ? nil : "Optional. GetMoreRam can add it.")
+                          level: ents.extendedVA ? .good : .neutral, note: nil)
             }
             Section("Storage") {
                 LabeledContent("Free on this device", value: freeSpaceText)
@@ -3338,7 +3333,7 @@ struct ContentView: View {
     private var settingsScreen: some View {
         NavigationStack {
             Form {
-                // ml893: JIT, StikDebug, memory and storage at a glance.
+                // ml893: JIT, memory and storage at a glance.
                 Section {
                     NavigationLink {
                         systemStatusScreen
@@ -3352,33 +3347,12 @@ struct ContentView: View {
                     }
                 }
 
-                Section("Input") {
-                    Picker("Pointer mode", selection: $input.relative) {
-                        Text("Absolute").tag(false)
-                        Text("Relative").tag(true)
-                    }
-                    HStack {
-                        Text("Sensitivity")
-                        Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8.0)
-                        Text(String(format: "%.1f", input.relative ? input.sensRel : input.sensAbs))
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .frame(width: 28)
-                    }
-                    NavigationLink {
-                        GamepadSettingsView()
-                    } label: {
-                        HStack {
-                            Label("Physical controller", systemImage: "gamecontroller.fill")
-                            Spacer()
-                            Text(gamepad.controllerName ?? "None")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    // ml865: the same Off / Xbox / Custom switch as the game
+                // ml897: sections by what the settings control.
+                Section("Controls") {
+                    // ml865: the same Off / Xbox / Keyboard switch as the game
                     // toolbar's controller button.
                     VStack(alignment: .leading, spacing: 10) {
-                        Label("Touch controls", systemImage: "gamecontroller")
+                        Label("Touch controls", systemImage: "hand.tap")
                         Picker("Touch controls", selection: $touchControls.choice) {
                             ForEach(TouchControlsChoice.allCases) { c in
                                 Text(c.title).tag(c)
@@ -3398,7 +3372,9 @@ struct ContentView: View {
                                 Text("\(Int((touchControls.opacity * 100).rounded()))%")
                                     .foregroundStyle(.secondary)
                                     .monospacedDigit()
-                                    .frame(width: 44, alignment: .trailing)
+                                    .lineLimit(1)
+                                    .fixedSize()
+                                    .frame(minWidth: 52, alignment: .trailing)
                             }
                         }
                     }
@@ -3410,6 +3386,54 @@ struct ContentView: View {
                     } label: {
                         Label("Edit Keyboard Layout", systemImage: "pencil")
                     }
+                    NavigationLink {
+                        GamepadSettingsView()
+                    } label: {
+                        HStack {
+                            Label("Physical controller", systemImage: "gamecontroller.fill")
+                            Spacer()
+                            Text(gamepad.controllerName ?? "None")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Section("Pointer") {
+                    Picker("Pointer mode", selection: $input.relative) {
+                        Text("Absolute").tag(false)
+                        Text("Relative").tag(true)
+                    }
+                    HStack {
+                        Text("Sensitivity")
+                        Slider(value: input.relative ? $input.sensRel : $input.sensAbs, in: 0.1...8.0)
+                        Text(String(format: "%.1f", input.relative ? input.sensRel : input.sensAbs))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .frame(width: 28)
+                    }
+                }
+
+                Section("Display") {
+                    Picker("Resolution", selection: $desktopResolution) {
+                        ForEach(Self.desktopResolutions, id: \.self) { r in
+                            Text(r).tag(r)
+                        }
+                    }
+                    Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch. Games start at this size on their first launch; after that they keep their own setting.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    // ml896: how the picture fills the screen
+                    Picker("Scaling", selection: $screenScalingSetting) {
+                        ForEach(ScreenScaling.allCases) { m in
+                            Text(m.label).tag(m.rawValue)
+                        }
+                    }
+                    .onChange(of: screenScalingSetting) { _, _ in ScreenScaling.reapply() }
+                    Toggle("Sharp pixels", isOn: $sharpPixelsSetting)
+                        .onChange(of: sharpPixelsSetting) { _, _ in ScreenScaling.reapply() }
+                    Text("Fit shows the whole picture with black bars, Fill covers the screen and crops the edges, Stretch fills it out of shape, and Whole-number scales by exactly 2x, 3x and so on, so pixel art stays even. Sharp pixels turns off the smoothing. A game's ⋯ menu can change both for that game.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Performance") {
@@ -3424,44 +3448,19 @@ struct ContentView: View {
                     Text("A lower cap runs cooler: the game's frame loop waits on the display, so the CPU translation work per second falls with it. The cap never changes on its own.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                }
-
-                Section("FEX Engine") {
-                    Picker("Default profile", selection: $compatibilityMode) {
-                        Text("Stability").tag("Stability")
-                        Text("Performance").tag("Performance")
-                    }
                     Toggle("Skip x86 memory-ordering emulation", isOn: $fexNoTSO)
                     Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch. Turning this on may improve performance in some games, so if one runs slowly, it is worth trying for just that game from its ⋯ menu.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    LabeledContent("Translation", value: "x86-64 → ARM64")
-                    LabeledContent("JIT", value: statusText)
-                    NavigationLink("Engine diagnostics") {
-                        List {
-                            Section("Capabilities") {
-                                if let ents = entitlements {
-                                    capabilityRow("JIT", enabled: debuggerAttached)
-                                    capabilityRow("Increased memory", enabled: ents.increasedMemory)
-                                    capabilityRow("64-bit address space", enabled: ents.extendedVA)
-                                }
-                            }
-                            Section("Diagnostics") {
-                                Toggle("Detailed runtime diagnostics", isOn: $input.diagnostics)
-                                Toggle("Verbose Wine trace (slow)", isOn: $wineVerbose)
-                                Text("Logs every file open, module load, exception dispatch and process event to madeira-log.txt. Use it to capture a crash, then turn it off. Applies on the next launch.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .navigationTitle("FEX Engine")
+                    Toggle(isOn: $perfOverlayEnabled) {
+                        Label("Show FPS, memory and thermal readout", systemImage: "gauge.with.dots.needle.67percent")
                     }
+                    Text("Shown beside the game surface and in full screen. Memory and thermal changes are always written to the session log, whether or not the readout is on.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
-                Section("DXMT Renderer") {
-                    LabeledContent("API", value: "Direct3D 11")
-                    LabeledContent("Backend", value: "Metal")
-                    LabeledContent("Build", value: "Bundled")
+                Section("Graphics") {
                     Toggle("Shader cache", isOn: $shaderCacheEnabled)
                     Button(role: .destructive) {
                         shaderCacheSizeText = "…"
@@ -3485,51 +3484,22 @@ struct ContentView: View {
                     }
                 }
 
-                Section("Screen") {
-                    Picker("Resolution", selection: $desktopResolution) {
-                        ForEach(Self.desktopResolutions, id: \.self) { r in
-                            Text(r).tag(r)
+                Section("Emulation") {
+                    Picker("Default profile", selection: $compatibilityMode) {
+                        Text("Stability").tag("Stability")
+                        Text("Performance").tag("Performance")
+                    }
+                    NavigationLink("Diagnostics") {
+                        List {
+                            Section {
+                                Toggle("Detailed runtime diagnostics", isOn: $input.diagnostics)
+                                Toggle("Verbose Wine trace (slow)", isOn: $wineVerbose)
+                                Text("Logs every file open, module load, exception dispatch and process event to madeira-log.txt. Use it to capture a crash, then turn it off. Applies on the next launch.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                    }
-                    Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch. Games start at this size on their first launch; after that they keep their own setting.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    // ml896: how the picture fills the screen
-                    Picker("Scaling", selection: $screenScalingSetting) {
-                        ForEach(ScreenScaling.allCases) { m in
-                            Text(m.label).tag(m.rawValue)
-                        }
-                    }
-                    .onChange(of: screenScalingSetting) { _, _ in ScreenScaling.reapply() }
-                    Toggle("Sharp pixels", isOn: $sharpPixelsSetting)
-                        .onChange(of: sharpPixelsSetting) { _, _ in ScreenScaling.reapply() }
-                    Text("Fit shows the whole picture with black bars, Fill covers the screen and crops the edges, Stretch fills it out of shape, and Whole-number scales by exactly 2x, 3x and so on, so pixel art stays even. Sharp pixels turns off the smoothing. A game's ⋯ menu can change both for that game.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Section("Performance Overlay") {
-                    Toggle(isOn: $perfOverlayEnabled) {
-                        Label("Show FPS, memory and thermal readout", systemImage: "gauge.with.dots.needle.67percent")
-                    }
-                    Text("Shown beside the game surface and in full screen. Memory and thermal changes are always written to the session log, whether or not the readout is on.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Section("Help") {
-                    NavigationLink {
-                        SetupGuideView()
-                    } label: {
-                        Label("Setup guide", systemImage: "book.closed")
-                    }
-                }
-
-                Section("Developer") {
-                    NavigationLink {
-                        developerScreen
-                    } label: {
-                        Label("Developer launchers", systemImage: "hammer.fill")
+                        .navigationTitle("Diagnostics")
                     }
                 }
 
@@ -8123,7 +8093,9 @@ struct TouchControlsOverlay: View {
             Text("\(Int((m.opacity * 100).rounded()))%")
                 .font(.system(size: 12, weight: .semibold).monospacedDigit())
                 .foregroundStyle(Color.white.opacity(0.7))
-                .frame(width: 40, alignment: .trailing)
+                .lineLimit(1)
+                .fixedSize()
+                .frame(minWidth: 40, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 12)

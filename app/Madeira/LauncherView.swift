@@ -196,6 +196,7 @@ final class GamesFocus: ObservableObject {
             // ml800: keep the highlight on the same GAME across a reorder.
             let prevID: String? = (self.gridIndex >= 0 && self.gridIndex < self.gameIDs.count)
                 ? self.gameIDs[self.gridIndex] : nil
+            let wasEmpty: Bool = self.gameIDs.isEmpty
             self.gameIDs = games.map { $0.id }
             self.gameCount = self.gameIDs.count
             if self.gameCount == 0 {
@@ -210,6 +211,10 @@ final class GamesFocus: ObservableObject {
                     self.closeNow()
                 }
                 if self.area == .card && self.openedID == nil { self.area = .grid }
+                // ml897: an empty list (the library still loading at launch) put
+                // the highlight on the top bar; once games are there it belongs
+                // on them, not stuck on the first top-bar button.
+                if wasEmpty && self.area == .topBar { self.area = .grid }
             }
         }
     }
@@ -583,6 +588,12 @@ struct LauncherView: View {
 
     // MARK: Top bar
 
+    /// ml897: a top-bar button shows the highlight only while a controller
+    /// can move it (touch never needs it).
+    private func topFocused(_ i: Int) -> Bool {
+        pad.controllerName != nil && focus.area == .topBar && focus.topIndex == i
+    }
+
     private var topBar: some View {
         HStack(spacing: 10) {
             Text("Games")
@@ -591,22 +602,22 @@ struct LauncherView: View {
             Spacer(minLength: 8)
             // ml893: search the library, and change its order.
             TopPill(systemImage: "magnifyingglass", label: "Search",
-                    focused: focus.area == .topBar && focus.topIndex == 0,
+                    focused: topFocused(0),
                     spinning: false) {
                 toggleSearch()
             }
             TopPill(systemImage: "arrow.up.arrow.down", label: "Sort",
-                    focused: focus.area == .topBar && focus.topIndex == 1,
+                    focused: topFocused(1),
                     spinning: false) {
                 cycleSort()
             }
             TopPill(systemImage: "plus.circle", label: "Add game",
-                    focused: focus.area == .topBar && focus.topIndex == 2,
+                    focused: topFocused(2),
                     spinning: false) {
                 showAddGame = true
             }
             TopPill(systemImage: "arrow.clockwise", label: "Refresh",
-                    focused: focus.area == .topBar && focus.topIndex == 3,
+                    focused: topFocused(3),
                     spinning: refreshSpin) {
                 library.rescan()
             }
@@ -784,11 +795,6 @@ struct LauncherView: View {
         let smallW: CGFloat = 196, smallH: CGFloat = 92
         return VStack(alignment: .leading, spacing: 10) {
             Spacer(minLength: 0)
-            Text("YOUR GAMES")
-                .font(.system(size: 13, weight: .semibold))
-                .tracking(0.8)
-                .foregroundStyle(LauncherPalette.textSecondary)
-                .padding(.horizontal, 20)
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .center, spacing: 14) {
                     ForEach(Array(games.enumerated()), id: \.element.id) { i, game in
@@ -898,14 +904,14 @@ struct LauncherView: View {
 
     // MARK: Status line
 
-    private var statusText: String {
+    private var statusText: String? {
         if let toast = sortToast { return toast }   // ml893
         switch session {
         case .idle:
             if let name = pad.controllerName {
                 return "\(name) · D-pad to browse, A to select, B to go back, Y adds a game"
             }
-            return "Tap a game to open it · connect a controller to browse"
+            return nil   // ml897: no touch hint
         case .enablingJIT:
             return "Enabling JIT… (StikDebug)"
         case .launching(let t):
@@ -917,16 +923,19 @@ struct LauncherView: View {
         }
     }
 
+    @ViewBuilder
     private var statusLine: some View {
-        Text(statusText)
-            .font(.caption)
-            .foregroundStyle(LauncherPalette.textSecondary)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(LauncherPalette.bgBottom.opacity(0.85))
+        if let text = statusText {
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(LauncherPalette.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(LauncherPalette.bgBottom.opacity(0.85))
+        }
     }
 }
 
@@ -1142,11 +1151,13 @@ private struct GameTile: View, Equatable {
                 .overlay(ring)
                 .shadow(color: focused ? LauncherPalette.accent.opacity(0.55) : Color.clear, radius: 12)
                 .scaleEffect(focused ? 1.04 : 1.0)
+            // ml897: one line ("…" when long), so every tile is the same height;
+            // the card shows the whole title.
             Text(title)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(focused ? Color.white : Color.white.opacity(0.85))
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
+                .lineLimit(1)
+                .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .zIndex(focused ? 1 : 0)
