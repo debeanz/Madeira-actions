@@ -62,9 +62,10 @@ struct LauncherGame: Identifiable, Equatable {
     }
 }
 
-/// ml849: one game's overrides of the Settings defaults. nil = "Default", i.e.
-/// the value in Settings at launch time. Kept in UserDefaults
-/// "madeira.launcher.gameSettings" as JSON keyed by game id.
+/// ml849: one game's overrides of the Settings defaults. nil = the value in
+/// Settings at launch time (ml902: also what picking Settings' own value in a
+/// game's ⋯ menu stores; there is no separate "Default" entry any more). Kept
+/// in UserDefaults "madeira.launcher.gameSettings" as JSON keyed by game id.
 struct GameSettings: Codable, Equatable {
     /// Logical screen for this game as "WxH" (Settings → Desktop resolution
     /// otherwise). A Unity game also gets it as -screen-width/-height on every

@@ -6154,6 +6154,10 @@ final class TouchControlsModel: ObservableObject {
         return p.mode.flatMap { TouchControlsMode(rawValue: $0) } == .xbox ? .xbox : .custom
     }
 
+    /// ml902: Settings' choice, what a game without its own gets (the defaults
+    /// kept while a game runs, else the live ones).
+    var defaultChoice: TouchControlsChoice { Self.choice(of: defaults ?? snapshot()) }
+
     /// What a game gets: its own choice, else the default. The running game's
     /// is what is on screen.
     func choice(forGame id: String) -> TouchControlsChoice {
@@ -7881,7 +7885,7 @@ struct TouchControlsOverlay: View {
                 }
             }
         }
-        .frame(width: 320)   // ml898: room for "Default (Whole-number)"
+        .frame(width: 320)   // ml898: room for "Screen scaling" + "Whole-number"
         .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
                         .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.95)))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -7892,50 +7896,50 @@ struct TouchControlsOverlay: View {
     // MARK: ml898 the running game's picture and frame rate (toolbar ⋯)
 
     /// Screen scaling and the frame rate cap of the game being
-    /// played. Each row cycles Default (Settings') and the values, applies at
-    /// once and is saved for this game: the same values as its ⋯ menu in the
-    /// Games tab. The menu stays open, so a tap shows the result right away.
+    /// played. Each row shows the value the game runs with and cycles the
+    /// values, applies at once and is saved for this game: the same rows as
+    /// its ⋯ menu in the Games tab (ml902: no separate "Default" entry; the
+    /// value Settings has is stored as none). The menu stays open, so a tap
+    /// shows the result right away.
     @ViewBuilder
     private func gameDisplayRows(_ id: String) -> some View {
         let s: GameSettings = library.gameSettings[id] ?? GameSettings()
-        panelRow("Screen scaling", system: "arrow.up.left.and.arrow.down.right", value: scalingText(s)) {
+        panelRow("Screen scaling", system: "arrow.up.left.and.arrow.down.right", value: scalingText(s),
+                 overrides: currentScaling(s) != ScreenScaling.saved) {
             cycleScaling(id, s)
         }
         Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
-        panelRow("Frame rate cap", system: "speedometer", value: capText(s)) {
+        panelRow("Frame rate cap", system: "speedometer", value: capText(s),
+                 overrides: currentCap(s) != FrameCap.saved) {
             cycleFrameCap(id, s)
         }
     }
 
-    private func scalingText(_ s: GameSettings) -> String {
-        if let raw = s.scaling, let mode = ScreenScaling(rawValue: raw) { return mode.label }
-        return "Default (" + ScreenScaling.saved.label + ")"
+    /// The game's own value, else Settings'.
+    private func currentScaling(_ s: GameSettings) -> ScreenScaling {
+        s.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? ScreenScaling.saved
     }
 
-    private func capText(_ s: GameSettings) -> String {
-        if let raw = s.frameCap, let cap = FrameCap(rawValue: Int32(raw)) { return Self.capName(cap) }
-        return "Default (" + Self.capName(FrameCap.saved) + ")"
+    private func currentCap(_ s: GameSettings) -> FrameCap {
+        s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
     }
 
-    private static func capName(_ c: FrameCap) -> String { c.label }
+    private func scalingText(_ s: GameSettings) -> String { currentScaling(s).label }
+
+    private func capText(_ s: GameSettings) -> String { currentCap(s).label }
 
     private func cycleScaling(_ id: String, _ s: GameSettings) {
-        var options: [String?] = [nil]
-        for mode in ScreenScaling.allCases { options.append(mode.rawValue) }
-        let cur: Int = options.firstIndex(where: { $0 == s.scaling }) ?? 0
-        let next: String? = options[(cur + 1) % options.count]
-        library.updateSettings(for: id) { $0.scaling = next }
+        let modes: [ScreenScaling] = Array(ScreenScaling.allCases)
+        let cur: Int = modes.firstIndex(of: currentScaling(s)) ?? -1
+        let next: ScreenScaling = modes[(cur + 1) % modes.count]
+        library.updateSettings(for: id) { $0.scaling = (next == ScreenScaling.saved) ? nil : next.rawValue }
         ScreenScaling.reapply()
     }
 
     private func cycleFrameCap(_ id: String, _ s: GameSettings) {
-        var options: [Int?] = [nil]
-        for cap in FrameCap.allCases { options.append(Int(cap.rawValue)) }
-        let cur: Int = options.firstIndex(where: { $0 == s.frameCap }) ?? 0
-        let next: Int? = options[(cur + 1) % options.count]
-        library.updateSettings(for: id) { $0.frameCap = next }
-        let cap: FrameCap = next.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
-        FrameCap.apply(cap, persist: false)
+        let next: FrameCap = currentCap(s).next
+        library.updateSettings(for: id) { $0.frameCap = (next == FrameCap.saved) ? nil : Int(next.rawValue) }
+        FrameCap.apply(next, persist: false)
     }
 
     /// ml865: the controller button's panel — Off, the Xbox preset or the
@@ -8183,20 +8187,24 @@ struct TouchControlsOverlay: View {
     /// current value and a chevron, or a checkmark. Unlike menuRow it keeps
     /// the panel open.
     private func panelRow(_ title: String, system: String? = nil, value: String? = nil,
-                          checked: Bool = false, chevron: Bool = false,
+                          checked: Bool = false, chevron: Bool = false, overrides: Bool = false,
                           _ action: @escaping () -> Void) -> some View {
         Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             showChrome()
             withAnimation(.easeInOut(duration: 0.15)) { action() }
         } label: {
-            panelRowLabel(title, system: system, value: value, checked: checked, chevron: chevron)
+            panelRowLabel(title, system: system, value: value, checked: checked, chevron: chevron,
+                          overrides: overrides)
         }
         .buttonStyle(.plain)
     }
 
+    /// ml902: `overrides` -- the running game's own value differs from
+    /// Madeira's Settings: the override dot before the value.
     private func panelRowLabel(_ title: String, system: String? = nil, value: String? = nil,
-                               checked: Bool = false, chevron: Bool = false) -> some View {
+                               checked: Bool = false, chevron: Bool = false,
+                               overrides: Bool = false) -> some View {
         HStack(spacing: 12) {
             if let system {
                 Image(systemName: system)
@@ -8207,6 +8215,12 @@ struct TouchControlsOverlay: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
             Spacer(minLength: 8)
+            if overrides {
+                Circle()
+                    .fill(SteamPalette.accent)
+                    .frame(width: 7, height: 7)
+                    .accessibilityLabel("Overrides Madeira settings")
+            }
             if let value {
                 Text(value)
                     .foregroundStyle(Color.white.opacity(0.62))
@@ -8232,6 +8246,7 @@ struct TouchControlsOverlay: View {
 
     private func padModeTile(_ title: String, icon: String, native: Bool) -> some View {
         let on = pad.native == native
+        let own: Bool = on && pad.native != pad.defaultSendsXbox   // ml902
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             showChrome()
@@ -8255,6 +8270,7 @@ struct TouchControlsOverlay: View {
                             .fill(on ? SteamPalette.accent : Color(red: 0.12, green: 0.15, blue: 0.20)))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(Color.white.opacity(on ? 0.18 : 0.08), lineWidth: 1))
+            .overlay(alignment: .topTrailing) { overrideTileDot(own) }
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(.plain)
@@ -8264,6 +8280,7 @@ struct TouchControlsOverlay: View {
     /// is up now under the toolbar.
     private func choiceTile(_ c: TouchControlsChoice) -> some View {
         let on = m.choice == c
+        let own: Bool = on && m.choice != m.defaultChoice   // ml902
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             withAnimation(.easeInOut(duration: 0.18)) { openMenu = nil }
@@ -8288,9 +8305,22 @@ struct TouchControlsOverlay: View {
                             .fill(on ? SteamPalette.accent : Color(red: 0.12, green: 0.15, blue: 0.20)))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(Color.white.opacity(on ? 0.18 : 0.08), lineWidth: 1))
+            .overlay(alignment: .topTrailing) { overrideTileDot(own) }
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+
+    /// ml902: the override dot on a picked tile (white: the tile is accent).
+    @ViewBuilder
+    private func overrideTileDot(_ show: Bool) -> some View {
+        if show {
+            Circle()
+                .fill(Color.white)
+                .frame(width: 7, height: 7)
+                .padding(7)
+                .accessibilityLabel("Overrides Madeira settings")
+        }
     }
 
     /// One menu row. Picking it closes the menu and restarts the toolbar's

@@ -393,7 +393,9 @@ final class GamepadBridge: ObservableObject {
     var gameHasOwnSettings: Bool { gameID.map { profiles[$0] != nil } ?? false }
 
     /// The default "send as" (what a game without its own uses).
-    private var defaultSendsXbox: Bool { gameID == nil ? native : defaultNative }
+    /// Settings' choice, what a game without its own gets (ml902: also the
+    /// override dot's reference in the ⋯ menus).
+    var defaultSendsXbox: Bool { gameID == nil ? native : defaultNative }
 
     // MARK: ml889 a game's physical controller from its ⋯ menu (Games tab)
 

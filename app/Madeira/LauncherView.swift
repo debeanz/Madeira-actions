@@ -1348,6 +1348,9 @@ private struct OptionRow: Identifiable {
     /// ml899: one of a set of choices: the checkmark's room is kept when it is
     /// not checked, so checking it never re-wraps the row's text.
     var radio: Bool = false
+    /// ml902: this game's own value differs from Madeira's Settings: the row
+    /// shows the override dot.
+    var overrides: Bool = false
     let action: () -> Void
 }
 
@@ -1650,11 +1653,15 @@ private struct OptionsSheet: View {
     // MARK: Per-game settings (ml849)
 
     /// Resolution, the x86 memory-ordering switch and the frame rate cap for
-    /// this game. Each row cycles "Default" (the Settings value, shown in
-    /// brackets) and its options on tap or A, the way the shader cache row
-    /// toggles. Resolution and the TSO switch reach the game only at launch,
-    /// so they are disabled while it runs; the cap applies at once when this
-    /// game is the one playing, and Settings' cap comes back when it ends.
+    /// this game. Each row shows the value the game runs with and cycles the
+    /// values on tap or A, the way the shader cache row toggles. ml902: there
+    /// is no separate "Default" entry -- a game without its own value shows
+    /// Settings' one, and picking the value Settings has stores none, so the
+    /// game keeps following Settings; a value that differs from Settings shows
+    /// the override dot. Resolution and the TSO switch reach the
+    /// game only at launch, so they are disabled while it runs; the cap
+    /// applies at once when this game is the one playing, and Settings' cap
+    /// comes back when it ends.
     private func perGameSettingRows(_ g: LauncherGame) -> [OptionRow] {
         let busy: Bool = busyGameIDs.contains(g.id)
         let id: String = g.id
@@ -1663,79 +1670,67 @@ private struct OptionsSheet: View {
         var out: [OptionRow] = []
 
         let globalRes: String = defaults.string(forKey: "madeira.desktopResolution") ?? GameResolutionDefault.settingDefault
-        let resOptions: [String?] = [nil] + GameSettings.resolutionOptions.map { Optional($0) }
+        let curRes: String = s.resolution ?? globalRes
         out.append(OptionRow(id: "resolution", title: "Resolution",
                              systemImage: "rectangle.expand.vertical",
                              destructive: false, checked: false,
-                             trailing: s.resolution ?? "Default (\(globalRes))",
+                             trailing: curRes,
                              disabled: busy,
+                             overrides: curRes != globalRes,
                              action: {
-                                 let cur: Int = resOptions.firstIndex(where: { $0 == s.resolution }) ?? 0
-                                 let next: String? = resOptions[(cur + 1) % resOptions.count]
-                                 library.updateSettings(for: id) { $0.resolution = next }
+                                 let opts: [String] = GameSettings.resolutionOptions
+                                 let cur: Int = opts.firstIndex(of: curRes) ?? -1
+                                 let next: String = opts[(cur + 1) % opts.count]
+                                 library.updateSettings(for: id) { $0.resolution = (next == globalRes) ? nil : next }
                              }))
 
         let globalNoTSO: Bool = defaults.bool(forKey: "madeira.fexNoTSO")
-        let tsoText: String
-        switch s.noTSO {
-        case nil:          tsoText = "Default (\(globalNoTSO ? "On" : "Off"))"
-        case .some(true):  tsoText = "On"
-        case .some(false): tsoText = "Off"
-        }
+        let curNoTSO: Bool = s.noTSO ?? globalNoTSO
         out.append(OptionRow(id: "notso", title: "Skip x86 memory-ordering emulation",
                              systemImage: "cpu",
                              destructive: false, checked: false,
-                             trailing: tsoText,
+                             trailing: curNoTSO ? "On" : "Off",
                              disabled: busy,
                              note: "Turning this on may improve performance in some games. If this game runs slowly, it is worth a try.",   // ml872
+                             overrides: curNoTSO != globalNoTSO,
                              action: {
-                                 let next: Bool?
-                                 switch s.noTSO {
-                                 case nil:          next = true
-                                 case .some(true):  next = false
-                                 case .some(false): next = nil
-                                 }
-                                 library.updateSettings(for: id) { $0.noTSO = next }
+                                 let next: Bool = !curNoTSO
+                                 library.updateSettings(for: id) { $0.noTSO = (next == globalNoTSO) ? nil : next }
                              }))
 
-        let capOptions: [Int?] = [nil] + FrameCap.allCases.map { Int($0.rawValue) }
-        let capText: String
-        if let raw = s.frameCap, let c = FrameCap(rawValue: Int32(raw)) {
-            capText = c.label
-        } else {
-            capText = "Default (\(FrameCap.saved.label))"
-        }
+        let curCap: FrameCap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
         var playingThis: Bool = false
         if case .playing(let t) = session, t == g.title { playingThis = true }
         out.append(OptionRow(id: "framecap", title: "Frame rate cap",
                              systemImage: "speedometer",
                              destructive: false, checked: false,
-                             trailing: capText,
+                             trailing: curCap.label,
                              disabled: false,
+                             overrides: curCap != FrameCap.saved,
                              action: {
-                                 let cur: Int = capOptions.firstIndex(where: { $0 == s.frameCap }) ?? 0
-                                 let next: Int? = capOptions[(cur + 1) % capOptions.count]
-                                 library.updateSettings(for: id) { $0.frameCap = next }
-                                 if playingThis {
-                                     let cap: FrameCap = next.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
-                                     FrameCap.apply(cap, persist: false)
+                                 let next: FrameCap = curCap.next
+                                 library.updateSettings(for: id) {
+                                     $0.frameCap = (next == FrameCap.saved) ? nil : Int(next.rawValue)
                                  }
+                                 if playingThis { FrameCap.apply(next, persist: false) }
                              }))
 
         // ml896: how the picture fills the screen; applies at once when this
         // game is the one playing.
-        let scaleOptions: [String?] = [nil] + ScreenScaling.allCases.map { Optional($0.rawValue) }
-        let scaleText: String = s.scaling.flatMap { ScreenScaling(rawValue: $0) }?.label
-            ?? "Default (\(ScreenScaling.saved.label))"
+        let curScale: ScreenScaling = s.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? ScreenScaling.saved
         out.append(OptionRow(id: "scaling", title: "Screen scaling",
                              systemImage: "arrow.up.left.and.arrow.down.right",
                              destructive: false, checked: false,
-                             trailing: scaleText,
+                             trailing: curScale.label,
                              disabled: false,
+                             overrides: curScale != ScreenScaling.saved,
                              action: {
-                                 let cur: Int = scaleOptions.firstIndex(where: { $0 == s.scaling }) ?? 0
-                                 let next: String? = scaleOptions[(cur + 1) % scaleOptions.count]
-                                 library.updateSettings(for: id) { $0.scaling = next }
+                                 let modes: [ScreenScaling] = Array(ScreenScaling.allCases)
+                                 let cur: Int = modes.firstIndex(of: curScale) ?? -1
+                                 let next: ScreenScaling = modes[(cur + 1) % modes.count]
+                                 library.updateSettings(for: id) {
+                                     $0.scaling = (next == ScreenScaling.saved) ? nil : next.rawValue
+                                 }
                                  ScreenScaling.reapply()
                              }))
         return out
@@ -1753,30 +1748,38 @@ private struct OptionsSheet: View {
         let id: String = g.id
         let touchNow: TouchControlsChoice = touch.choice(forGame: id)
         let sendsXbox: Bool = pad.sendsXbox(forGame: id)
+        // ml902: the picked row shows the override dot when it is not Settings' choice
+        let touchOwn: Bool = touchNow != touch.defaultChoice
+        let padOwn: Bool = sendsXbox != pad.defaultSendsXbox
         var out: [OptionRow] = []
 
         out.append(OptionRow(id: "touch-off", title: "Off", systemImage: "nosign",
                              destructive: false, checked: touchNow == .off,
                              section: "Controls", header: "Touch screen controls", radio: true,
+                             overrides: touchOwn && touchNow == .off,
                              action: { touch.setChoice(.off, forGame: id) }))
         out.append(OptionRow(id: "touch-xbox", title: "Xbox controller (XInput)", systemImage: "gamecontroller",
                              destructive: false, checked: touchNow == .xbox,
                              note: "A fixed layout.", radio: true,
+                             overrides: touchOwn && touchNow == .xbox,
                              action: { touch.setChoice(.xbox, forGame: id) }))
         out.append(OptionRow(id: "touch-keyboard", title: "Keyboard layout", systemImage: "keyboard",
                              destructive: false, checked: touchNow == .custom,
                              note: "Arrange it with the pencil while playing.", radio: true,
+                             overrides: touchOwn && touchNow == .custom,
                              action: { touch.setChoice(.custom, forGame: id) }))
 
         out.append(OptionRow(id: "pad-xinput", title: "XInput", systemImage: "gamecontroller.fill",
                              destructive: false, checked: sendsXbox,
                              note: "The game sees an Xbox controller.",
                              header: "Physical controller", radio: true,
+                             overrides: padOwn && sendsXbox,
                              action: { pad.setSendsXbox(true, forGame: id) }))
         out.append(OptionRow(id: "pad-keyboard", title: "Send as keyboard", systemImage: "keyboard",
                              destructive: false, checked: !sendsXbox,
                              note: "For games without controller support: each button sends a key you choose.",
                              radio: true,
+                             overrides: padOwn && !sendsXbox,
                              action: { pad.setSendsXbox(false, forGame: id) }))
         guard !sendsXbox else { return out }
         // ml890: the binds are a page of their own, so the menu stays short.
@@ -1997,7 +2000,7 @@ private struct OptionsSheet: View {
                      destructive: row.destructive, checked: row.checked,
                      focused: focused, subtitle: nil, thumbnail: nil,
                      trailing: row.trailing, disabled: disabled, note: row.note,
-                     radio: row.radio)
+                     radio: row.radio, overrides: row.overrides)
         }
         .buttonStyle(SheetRowStyle())
     }
@@ -2462,6 +2465,8 @@ private struct SheetRow: View {
     var note: String? = nil
     /// ml899: keep the checkmark's room when unchecked (OptionRow.radio).
     var radio: Bool = false
+    /// ml902: the override dot (OptionRow.overrides).
+    var overrides: Bool = false
 
     private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
@@ -2519,6 +2524,12 @@ private struct SheetRow: View {
                 }
             }
             Spacer(minLength: 8)
+            if overrides {
+                Circle()
+                    .fill(LauncherPalette.accent)
+                    .frame(width: 7, height: 7)
+                    .accessibilityLabel("Overrides Madeira settings")
+            }
             if let trailing {
                 Text(trailing)
                     .font(.subheadline.monospacedDigit())
