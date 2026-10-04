@@ -1796,7 +1796,7 @@ private struct OptionsSheet: View {
                              action: { touch.setChoice(.off, forGame: id) }))
         out.append(OptionRow(id: "touch-xbox", title: "Xbox controller (XInput)", systemImage: "gamecontroller",
                              destructive: false, checked: touchNow == .xbox,
-                             note: "A fixed layout.", radio: true,
+                             note: "Arrange it with the pencil while playing.", radio: true,
                              action: { touch.setChoice(.xbox, forGame: id) }))
         out.append(OptionRow(id: "touch-keyboard", title: "Keyboard layout", systemImage: "keyboard",
                              destructive: false, checked: touchNow == .custom,

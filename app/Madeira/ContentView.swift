@@ -3413,14 +3413,16 @@ struct ContentView: View {
                         }
                     }
                     .padding(.vertical, 4)
-                    // ml909: only with the keyboard layout picked. It used to pick it
-                    // itself, so editing from Off or Xbox left Keyboard switched on.
-                    if touchControls.choice == .custom {
+                    // ml909: the editor for the picked layout only. It used to pick the
+                    // keyboard layout itself, so editing from Off or Xbox left Keyboard
+                    // switched on. ml911: the Xbox layout is edited too.
+                    if touchControls.choice != .off {
                         Button {
                             touchControls.editing = true
                             desktopFullScreen = true
                         } label: {
-                            Label("Edit Keyboard Layout", systemImage: "pencil")
+                            Label(touchControls.choice == .xbox ? "Edit Xbox Layout" : "Edit Keyboard Layout",
+                                  systemImage: "pencil")
                         }
                     }
                     NavigationLink {
@@ -5842,7 +5844,7 @@ enum TouchControlsChoice: String, CaseIterable, Identifiable {
         case .off:
             return "No on-screen controls. The screen works as a trackpad, and a physical controller still works."
         case .xbox:
-            return "A fixed Xbox controller layout (XInput). Games read it as player 1, alongside any physical controller."
+            return "An Xbox controller layout (XInput) you can arrange with the pencil. Games read it as player 1, alongside any physical controller."
         case .custom:
             return "A keyboard layout you arrange yourself with the pencil, starting from a ready-made PC layout. Controller buttons can be added too; then games also see an Xbox controller."
         }
@@ -5858,7 +5860,8 @@ struct GameControlsProfile: Codable, Equatable {
     var mode: String?                        // TouchControlsMode raw value
     var visible: Bool?
     var custom: [TouchControl]?              // its custom layout
-    var isEmpty: Bool { mode == nil && visible == nil && custom == nil }
+    var xbox: [TouchControl]?                // ml911: its Xbox layout
+    var isEmpty: Bool { mode == nil && visible == nil && custom == nil && xbox == nil }
 }
 
 /// One on-screen control.
@@ -5879,11 +5882,13 @@ final class TouchControlsModel: ObservableObject {
     static let baseDiameter: CGFloat = 64
 
     /// The ACTIVE layout; everything reads this. ml865: in Xbox mode it is the
-    /// fixed preset, and the custom layout waits in `customStash`.
+    /// Xbox layout (ml911: the player's own, edited like the custom one), and
+    /// the custom layout waits in `customStash`; in custom mode the Xbox layout
+    /// waits in `xboxStash`.
     @Published var controls: [TouchControl] = [] { didSet { save() } }
     @Published var visible = false              { didSet { save(); pushPadConnected() } }
-    /// ml831: which layout is up. ml865: the Xbox preset or the custom layout;
-    /// only the custom one is the player's, and only it is edited.
+    /// ml831: which layout is up. ml865: the Xbox layout or the custom one.
+    /// ml911: both are the player's and both are edited.
     @Published var mode: TouchControlsMode = .custom {
         didSet {
             guard !loading, mode != oldValue else { return }
@@ -5893,8 +5898,9 @@ final class TouchControlsModel: ObservableObject {
                 // Stash BEFORE assigning `controls`: its didSet saves, and save()
                 // reads `customStash` as the custom layout in Xbox mode.
                 customStash = controls
-                controls = Self.defaultLayout(.xbox)
+                controls = xboxStash.isEmpty ? Self.defaultLayout(.xbox) : xboxStash
             } else {
+                xboxStash = controls                // ml911: the same rule the other way
                 controls = customStash              // saves
                 ensureDefaultLayout()               // seeds (and saves) if empty
             }
@@ -5952,6 +5958,8 @@ final class TouchControlsModel: ObservableObject {
     /// ml865: the custom layout while the Xbox preset is up (not published;
     /// nothing draws it).
     private var customStash: [TouchControl] = []
+    /// ml911: the Xbox layout while the custom one is up.
+    private var xboxStash: [TouchControl] = []
     /// ml865: the editable Xbox layout of ml831–ml864. The preset is fixed now,
     /// but this is written back untouched so an older build still finds it.
     private var legacyPad: [TouchControl]?
@@ -5974,6 +5982,7 @@ final class TouchControlsModel: ObservableObject {
         var padControls: [TouchControl]?
         var games: [String: GameControlsProfile]?
         var opacity: Double?   // ml894: one value for every layout
+        var xbox: [TouchControl]?   // ml911: the Xbox layout; nil = the default one
     }
 
     /// ml886: per-game profiles, and the default controls while a game's own
@@ -5989,13 +5998,16 @@ final class TouchControlsModel: ObservableObject {
             // ml889: a keyboard layout that is still exactly the old seed was never
             // customised, so it becomes the natural preset.
             let custom = Self.isLegacySeed(s.controls) ? Self.defaultLayout(.custom) : s.controls
+            // ml911: the player's Xbox layout, or the default one.
+            let xbox: [TouchControl] = s.xbox.flatMap { $0.isEmpty ? nil : $0 } ?? Self.defaultLayout(.xbox)
             mode      = m
             legacyPad = s.padControls
             if m == .xbox {
                 customStash = custom
-                controls    = Self.defaultLayout(.xbox)
+                controls    = xbox
             } else {
-                controls = custom
+                controls  = custom
+                xboxStash = xbox
             }
             visible  = s.visible
             profiles = s.games ?? [:]
@@ -6006,6 +6018,7 @@ final class TouchControlsModel: ObservableObject {
             mode     = .xbox
             controls = Self.defaultLayout(.xbox)
             visible  = true
+            xboxStash = controls
         }
         loading = false
         // ml831: next turn, so GamepadBridge.shared is never first touched from
@@ -6016,13 +6029,14 @@ final class TouchControlsModel: ObservableObject {
     /// ml886: what is on screen now, as a complete profile.
     private func snapshot() -> GameControlsProfile {
         GameControlsProfile(mode: mode.rawValue, visible: visible,
-                            custom: mode == .xbox ? customStash : controls)
+                            custom: mode == .xbox ? customStash : controls,
+                            xbox: mode == .xbox ? controls : xboxStash)
     }
 
     /// ml887: a game's own parts over the defaults (a complete profile).
     private static func merged(_ own: GameControlsProfile?, over base: GameControlsProfile) -> GameControlsProfile {
         GameControlsProfile(mode: own?.mode ?? base.mode, visible: own?.visible ?? base.visible,
-                            custom: own?.custom ?? base.custom)
+                            custom: own?.custom ?? base.custom, xbox: own?.xbox ?? base.xbox)
     }
 
     /// ml886: put a complete profile on screen. `loading` keeps every didSet
@@ -6031,11 +6045,13 @@ final class TouchControlsModel: ObservableObject {
         loading = true
         let m = p.mode.flatMap { TouchControlsMode(rawValue: $0) } ?? .custom
         let custom = p.custom ?? []
+        let xbox: [TouchControl] = p.xbox.flatMap { $0.isEmpty ? nil : $0 } ?? Self.defaultLayout(.xbox)
         selected = nil
         editing = false
         customStash = custom
+        xboxStash = xbox
         mode = m
-        controls = m == .xbox ? Self.defaultLayout(.xbox) : custom
+        controls = m == .xbox ? xbox : custom
         if controls.isEmpty { controls = Self.defaultLayout(m) }
         visible = p.visible ?? false
         loading = false
@@ -6113,6 +6129,7 @@ final class TouchControlsModel: ObservableObject {
         if own.mode == nil { own.mode = now.mode }
         if own.visible == nil { own.visible = now.visible }
         if own.custom == nil { own.custom = now.custom }
+        if own.xbox == nil { own.xbox = now.xbox }   // ml911
         profiles[id] = own
         objectWillChange.send()
         persist()
@@ -6293,8 +6310,10 @@ final class TouchControlsModel: ObservableObject {
                 if own.mode != nil || live.mode != base.mode { own.mode = live.mode }
                 if own.visible != nil || live.visible != base.visible { own.visible = live.visible }
                 if own.custom != nil || live.custom != base.custom { own.custom = live.custom }
+                if own.xbox != nil || live.xbox != base.xbox { own.xbox = live.xbox }   // ml911
                 profiles[id] = own.isEmpty ? nil : own
-            } else if live.mode != base.mode || live.visible != base.visible || live.custom != base.custom {
+            } else if live.mode != base.mode || live.visible != base.visible || live.custom != base.custom
+                        || live.xbox != base.xbox {
                 // ml903: changed in game while the game uses Madeira's settings: from
                 // now on they are its own (next turn: this runs inside a didSet).
                 DispatchQueue.main.async { GameLibrary.shared.setOverride(true, for: id, inGame: true) }
@@ -6309,9 +6328,13 @@ final class TouchControlsModel: ObservableObject {
     private func persist() {
         guard !loading else { return }
         let base = (gameID == nil || editingDefaults) ? snapshot() : (defaults ?? snapshot())   // ml906
+        // ml911: an Xbox layout still exactly the default one is not written, so a
+        // later build's default reaches everyone who never changed theirs.
+        let xbox: [TouchControl] = base.xbox ?? []
+        let ownXbox: [TouchControl]? = Self.sameLayout(xbox, Self.defaultLayout(.xbox)) ? nil : xbox
         let s = Saved(controls: base.custom ?? [], visible: base.visible ?? false, mode: base.mode,
                       padControls: legacyPad, games: profiles.isEmpty ? nil : profiles,
-                      opacity: opacity < 1 ? opacity : nil)
+                      opacity: opacity < 1 ? opacity : nil, xbox: ownXbox)
         guard let d = try? JSONEncoder().encode(s) else { return }
         // ml835: coalesce. A drag or resize in the editor changes `controls` on
         // every touch sample, and an atomic file write per sample made the editor
@@ -6354,6 +6377,19 @@ final class TouchControlsModel: ObservableObject {
     func index(of id: UUID?) -> Int? {
         guard let id else { return nil }
         return controls.firstIndex { $0.id == id }
+    }
+
+    /// ml911: the Xbox layout back to the default one (the editor's layout menu).
+    func resetXboxLayout() {
+        let preset = Self.defaultLayout(.xbox)
+        selected = nil
+        if mode == .xbox {
+            controls = preset                       // saves
+        } else {
+            xboxStash = preset
+            save()
+        }
+        LogStore.shared.log("[controls] ml911 Xbox layout reset to the default")
     }
 
     /// Seeds the ACTIVE mode's default layout when it has none.
@@ -7751,6 +7787,8 @@ struct TouchControlsOverlay: View {
     /// import picker, and the file the Export row shares.
     @State private var pendingPreset: TouchControlsModel.KeyboardPreset? = nil
     @State private var importingLayout = false
+    /// ml911: the Xbox layout's "Reset to default" asks first.
+    @State private var confirmingXboxReset = false
     @State private var exportURL: URL? = nil
     @State private var openMenu: ToolbarMenu? = nil
     private var chromeShown: Bool { chromeVisible || m.editing || openMenu != nil }
@@ -7919,6 +7957,17 @@ struct TouchControlsOverlay: View {
         } message: { p in
             Text("The \(p.title) layout replaces your current one. Export it first to keep a copy.")
         }
+        // ml911: the Xbox layout's reset, confirmed like a keyboard preset.
+        .confirmationDialog("Reset the Xbox layout?", isPresented: $confirmingXboxReset,
+                            titleVisibility: .visible) {
+            Button("Reset", role: .destructive) {
+                m.resetXboxLayout()
+                openMenu = nil
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Every button goes back to where it was at first.")
+        }
         .fileImporter(isPresented: $importingLayout, allowedContentTypes: [.json]) { result in
             guard case .success(let url) = result else { return }
             let ok = m.importLayout(from: url)
@@ -7970,8 +8019,9 @@ struct TouchControlsOverlay: View {
             glassButton("keyboard") {
                 MetalBackedView.toggleKeyboard()
             }
-            // ml865: only the custom layout is edited; the Xbox preset is fixed.
-            if m.choice == .custom {
+            // ml911: both layouts are edited (the Xbox one only with controller
+            // buttons, see MappingPanel); nothing to edit while they are off.
+            if m.choice != .off {
                 glassButton(m.editing ? "checkmark" : "pencil",
                             steam: m.editing, primary: m.editing) {
                     m.editing.toggle()
@@ -7980,6 +8030,8 @@ struct TouchControlsOverlay: View {
                 if m.editing {
                     glassButton("plus", steam: true) {
                         var c = TouchControl()
+                        // ml911: the Xbox layout gets a controller button
+                        if m.mode == .xbox { c.action = .pad(PadInput.a.rawValue) }
                         // Stagger, so repeated adds do not stack invisibly.
                         c.nx = 0.5 + Double(m.controls.count % 3) * 0.06
                         c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
@@ -8311,8 +8363,28 @@ struct TouchControlsOverlay: View {
     }
 
     /// The keyboard layout's presets (confirmed before replacing it), and the
-    /// layout as a file to export or import.
+    /// layout as a file to export or import. ml911: for the Xbox layout, a reset
+    /// to the default one.
+    @ViewBuilder
     private var layoutsMenu: some View {
+        if m.mode == .xbox {
+            panelChrome(VStack(alignment: .leading, spacing: 0) {
+                Text("Xbox layout")
+                    .font(.system(size: 12, weight: .semibold))
+                    .tracking(0.6)
+                    .textCase(.uppercase)
+                    .foregroundStyle(Color.white.opacity(0.5))
+                    .padding(.horizontal, 16)
+                    .padding(.top, 14)
+                    .padding(.bottom, 4)
+                panelRow("Reset to default", system: "arrow.counterclockwise") { confirmingXboxReset = true }
+            })
+        } else {
+            keyboardLayoutsMenu
+        }
+    }
+
+    private var keyboardLayoutsMenu: some View {
         panelChrome(VStack(alignment: .leading, spacing: 0) {
             Text("Keyboard layout")
                 .font(.system(size: 12, weight: .semibold))
@@ -8737,16 +8809,20 @@ struct MappingPanel: View {
     var body: some View {
         // ml833: Steam Big Picture style — opaque #1B2838 panel, #171A21 tab
         // strip, accent-filled selection. No glass/material in the editor.
+        // ml911: the Xbox layout stays a controller -- controller buttons only.
+        let padOnly: Bool = m.mode == .xbox
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                tabButton(0, "keyboard", "Keyboard")
-                tabButton(1, "gamecontroller", "Controller")
+            if !padOnly {
+                HStack(spacing: 8) {
+                    tabButton(0, "keyboard", "Keyboard")
+                    tabButton(1, "gamecontroller", "Controller")
+                }
+                .padding(8)
+                .background(SteamPalette.base)
+                Rectangle().fill(SteamPalette.border).frame(height: 1)
             }
-            .padding(8)
-            .background(SteamPalette.base)
-            Rectangle().fill(SteamPalette.border).frame(height: 1)
             ScrollView {
-                (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
+                (tab == 0 && !padOnly ? AnyView(keyboardTab) : AnyView(controllerTab))
                     .padding(12)
             }
         }
