@@ -7584,6 +7584,7 @@ extension Notification.Name {
 
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
+    @ObservedObject private var library = GameLibrary.shared   // ml898: the running game's settings
     @ObservedObject private var pad = GamepadBridge.shared   // ml887: the physical controller
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     /// Auto-hiding toolbar: shown on entry, on a quick tap of the surface in
@@ -7862,6 +7863,11 @@ struct TouchControlsOverlay: View {
     /// is playing; in a Windows desktop session there is no game to close.
     private var gameMenu: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // ml898: the game's picture and frame rate, changed while it runs.
+            if let id = m.gameID {
+                gameDisplayRows(id)
+                Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+            }
             menuRow("Save Log", system: "doc.text") {
                 showLogToast("Saving log…")
                 NotificationCenter.default.post(name: .madeiraSaveLog, object: nil)
@@ -7878,12 +7884,92 @@ struct TouchControlsOverlay: View {
                 }
             }
         }
-        .frame(width: 280)
+        .frame(width: 320)   // ml898: room for "Default (Whole-number)"
         .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
                         .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.95)))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .stroke(Color.white.opacity(0.10), lineWidth: 1))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    // MARK: ml898 the running game's picture and frame rate (toolbar ⋯)
+
+    /// Screen scaling, sharp pixels and the frame rate cap of the game being
+    /// played. Each row cycles Default (Settings') and the values, applies at
+    /// once and is saved for this game: the same values as its ⋯ menu in the
+    /// Games tab. The menu stays open, so a tap shows the result right away.
+    @ViewBuilder
+    private func gameDisplayRows(_ id: String) -> some View {
+        let s: GameSettings = library.gameSettings[id] ?? GameSettings()
+        panelRow("Screen scaling", system: "arrow.up.left.and.arrow.down.right", value: scalingText(s)) {
+            cycleScaling(id, s)
+        }
+        Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+        panelRow("Sharp pixels", system: "square.grid.3x3", value: sharpText(s)) {
+            cycleSharp(id, s)
+        }
+        Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+        panelRow("Frame rate cap", system: "speedometer", value: capText(s)) {
+            cycleFrameCap(id, s)
+        }
+    }
+
+    private func scalingText(_ s: GameSettings) -> String {
+        if let raw = s.scaling, let mode = ScreenScaling(rawValue: raw) { return mode.label }
+        return "Default (" + ScreenScaling.saved.label + ")"
+    }
+
+    private func sharpText(_ s: GameSettings) -> String {
+        switch s.sharpPixels {
+        case nil:          return "Default (" + (ScreenScaling.savedSharp ? "On" : "Off") + ")"
+        case .some(true):  return "On"
+        case .some(false): return "Off"
+        }
+    }
+
+    private func capText(_ s: GameSettings) -> String {
+        if let raw = s.frameCap, let cap = FrameCap(rawValue: Int32(raw)) { return Self.capName(cap) }
+        return "Default (" + Self.capName(FrameCap.saved) + ")"
+    }
+
+    private static func capName(_ c: FrameCap) -> String {
+        switch c {
+        case .locked60: return "60 fps"
+        case .cap40:    return "40 fps"
+        case .cap30:    return "30 fps"
+        case .max:      return "Max"
+        case .raw:      return "Unthrottled"
+        }
+    }
+
+    private func cycleScaling(_ id: String, _ s: GameSettings) {
+        var options: [String?] = [nil]
+        for mode in ScreenScaling.allCases { options.append(mode.rawValue) }
+        let cur: Int = options.firstIndex(where: { $0 == s.scaling }) ?? 0
+        let next: String? = options[(cur + 1) % options.count]
+        library.updateSettings(for: id) { $0.scaling = next }
+        ScreenScaling.reapply()
+    }
+
+    private func cycleSharp(_ id: String, _ s: GameSettings) {
+        let next: Bool?
+        switch s.sharpPixels {
+        case nil:          next = true
+        case .some(true):  next = false
+        case .some(false): next = nil
+        }
+        library.updateSettings(for: id) { $0.sharpPixels = next }
+        ScreenScaling.reapply()
+    }
+
+    private func cycleFrameCap(_ id: String, _ s: GameSettings) {
+        var options: [Int?] = [nil]
+        for cap in FrameCap.allCases { options.append(Int(cap.rawValue)) }
+        let cur: Int = options.firstIndex(where: { $0 == s.frameCap }) ?? 0
+        let next: Int? = options[(cur + 1) % options.count]
+        library.updateSettings(for: id) { $0.frameCap = next }
+        let cap: FrameCap = next.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
+        FrameCap.apply(cap, persist: false)
     }
 
     /// ml865: the controller button's panel — Off, the Xbox preset or the
