@@ -5888,49 +5888,66 @@ final class TouchControlsModel: ObservableObject {
         controls = Self.defaultLayout(mode)
     }
 
-    /// ml889: the four-control keyboard layout builds before ml889 seeded. A saved
-    /// layout that is still exactly this was never customised.
+    /// ml889: a saved keyboard layout that is still exactly a seed some build put
+    /// there was never customised: the four controls before ml889, or ml889's
+    /// preset with the R key (0.1.155-0.1.156; ml891 swapped it for Q).
     private static func isLegacySeed(_ c: [TouchControl]) -> Bool {
         let seed: [(Double, Double, Double, ControlAction)] = [
             (0.16, 0.72, 1.35, .joystickWASD), (0.84, 0.72, 1.05, .mouseLeft),
             (0.73, 0.60, 0.88, .key(0x20)), (0.90, 0.55, 0.78, .key(0x1B)),
         ]
-        guard c.count == seed.count else { return false }
-        for (t, s) in zip(c, seed) where t.nx != s.0 || t.ny != s.1 || t.scale != s.2 || t.action != s.3 {
+        let old = seed.map { TouchControl(nx: $0.0, ny: $0.1, scale: $0.2, action: $0.3) }
+        return sameLayout(c, old) || sameLayout(c, keyboardPreset(top: 0x52))
+    }
+
+    /// The same controls in the same order, ids aside.
+    private static func sameLayout(_ a: [TouchControl], _ b: [TouchControl]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (x, y) in zip(a, b) where x.nx != y.nx || x.ny != y.ny || x.scale != y.scale || x.action != y.action {
             return false
         }
         return true
     }
 
-    private static func defaultLayout(_ mode: TouchControlsMode) -> [TouchControl] {
-        // ml885: positions are fractions of the screen, sizes are points, so on a
-        // shorter screen everything is scaled by its height (down to 0.85).
+    /// ml885: positions are fractions of the screen, sizes are points, so on a
+    /// shorter screen everything is scaled by its height (down to 0.85).
+    private static func presetScale() -> Double {
         let screen = UIScreen.main.bounds.size
-        let k = min(max(Double(min(screen.width, screen.height)) / 430, 0.85), 1.0)
+        return min(max(Double(min(screen.width, screen.height)) / 430, 0.85), 1.0)
+    }
+
+    /// ml889: a natural PC keyboard layout, placed like the Xbox preset: WASD
+    /// under the left thumb, Shift (run) at its inner shoulder and Ctrl (crouch)
+    /// below-right of it; Space (jump) with E, F and `top` above it as the right
+    /// thumb's diamond; right click (aim) and left click (attack) on the
+    /// shoulders; Tab and Esc at the bottom centre. The rest of the screen stays
+    /// the mouse. ml891: `top` is Q, because an R key read exactly like the
+    /// right mouse button's "R".
+    private static func keyboardPreset(top: Int32) -> [TouchControl] {
+        let k = presetScale()
+        func c(_ x: Double, _ y: Double, _ s: Double, _ a: ControlAction) -> TouchControl {
+            TouchControl(nx: x, ny: y, scale: (s * k * 100).rounded() / 100, action: a)
+        }
+        return [
+            c(0.165, 0.680, 1.85, .joystickWASD),
+            c(0.262, 0.495, 0.80, .key(0x10)),      // Shift
+            c(0.325, 0.825, 0.90, .key(0x11)),      // Ctrl
+            c(0.826, 0.845, 1.05, .key(0x20)),      // Space
+            c(0.768, 0.705, 0.94, .key(0x45)),      // E
+            c(0.884, 0.705, 0.94, .key(0x46)),      // F
+            c(0.826, 0.580, 0.94, .key(top)),       // Q
+            c(0.120, 0.430, 1.05, .mouseRight),
+            c(0.880, 0.430, 1.05, .mouseLeft),
+            c(0.462, 0.885, 0.66, .key(0x09)),      // Tab
+            c(0.538, 0.885, 0.66, .key(0x1B)),      // Esc
+        ]
+    }
+
+    private static func defaultLayout(_ mode: TouchControlsMode) -> [TouchControl] {
+        let k = presetScale()
         switch mode {
         case .custom:
-            // ml889: a natural PC keyboard layout, placed like the Xbox preset:
-            // WASD under the left thumb, Shift (run) at its inner shoulder and
-            // Ctrl (crouch) below-right of it; Space (jump) with E, F and R above
-            // it as the right thumb's diamond; right click (aim) and left click
-            // (attack) on the shoulders; Tab and Esc at the bottom centre. The
-            // rest of the screen stays the mouse.
-            func c(_ x: Double, _ y: Double, _ s: Double, _ a: ControlAction) -> TouchControl {
-                TouchControl(nx: x, ny: y, scale: (s * k * 100).rounded() / 100, action: a)
-            }
-            return [
-                c(0.165, 0.680, 1.85, .joystickWASD),
-                c(0.262, 0.495, 0.80, .key(0x10)),      // Shift
-                c(0.325, 0.825, 0.90, .key(0x11)),      // Ctrl
-                c(0.826, 0.845, 1.05, .key(0x20)),      // Space
-                c(0.768, 0.705, 0.94, .key(0x45)),      // E
-                c(0.884, 0.705, 0.94, .key(0x46)),      // F
-                c(0.826, 0.580, 0.94, .key(0x52)),      // R
-                c(0.120, 0.430, 1.05, .mouseRight),
-                c(0.880, 0.430, 1.05, .mouseLeft),
-                c(0.462, 0.885, 0.66, .key(0x09)),      // Tab
-                c(0.538, 0.885, 0.66, .key(0x1B)),      // Esc
-            ]
+            return keyboardPreset(top: 0x51)        // Q
         case .xbox:
             // ml885: laid out like the controller, on a landscape iPhone Pro Max
             // (932 x 430 pt, 59 pt side and 21 pt bottom safe areas):
