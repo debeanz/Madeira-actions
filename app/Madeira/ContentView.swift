@@ -3413,12 +3413,15 @@ struct ContentView: View {
                         }
                     }
                     .padding(.vertical, 4)
-                    Button {
-                        touchControls.choice = .custom
-                        touchControls.editing = true
-                        desktopFullScreen = true
-                    } label: {
-                        Label("Edit Keyboard Layout", systemImage: "pencil")
+                    // ml909: only with the keyboard layout picked. It used to pick it
+                    // itself, so editing from Off or Xbox left Keyboard switched on.
+                    if touchControls.choice == .custom {
+                        Button {
+                            touchControls.editing = true
+                            desktopFullScreen = true
+                        } label: {
+                            Label("Edit Keyboard Layout", systemImage: "pencil")
+                        }
                     }
                     NavigationLink {
                         GamepadSettingsView()
