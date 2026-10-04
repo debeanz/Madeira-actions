@@ -92,6 +92,8 @@ final class MetalBackedView: UIView {
     // Run) directly instead of relying on the browse list.
     static weak var keyboardTarget: MetalBackedView?
     override var canBecomeFirstResponder: Bool { true }
+    /// ml895: Esc, Tab, Ctrl, Alt, the arrows and F1-F12 above the keyboard.
+    override var inputAccessoryView: UIView? { GameKeyBar.shared }
 
     /// Whether the software keyboard is actually on screen, tracked from
     /// UIKit's notifications. `isFirstResponder` alone is not enough: the
@@ -1435,6 +1437,8 @@ extension MetalBackedView: UIKeyInput {
     }
 
     func insertText(_ text: String) {
+        let mods = GameKeyBar.takeModifiers()      // ml895: Ctrl / Alt from the key bar
+        for m in mods { winios_post_key(m, 1) }
         for ch in text {
             guard let (vk, shift) = MetalBackedView.vkForChar(ch) else { continue }
             if shift { winios_post_key(0x10, 1) }   // VK_SHIFT down
@@ -1442,11 +1446,15 @@ extension MetalBackedView: UIKeyInput {
             winios_post_key(vk, 0)
             if shift { winios_post_key(0x10, 0) }    // VK_SHIFT up
         }
+        for m in mods.reversed() { winios_post_key(m, 0) }
     }
 
     func deleteBackward() {
+        let mods = GameKeyBar.takeModifiers()      // ml895
+        for m in mods { winios_post_key(m, 1) }
         winios_post_key(0x08, 1)   // VK_BACK down
         winios_post_key(0x08, 0)
+        for m in mods.reversed() { winios_post_key(m, 0) }
     }
 
     // Traits: keep iOS from rewriting path characters.
@@ -1456,6 +1464,124 @@ extension MetalBackedView: UIKeyInput {
     var smartQuotesType: UITextSmartQuotesType { get { .no } set {} }
     var smartDashesType: UITextSmartDashesType { get { .no } set {} }
     var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
+}
+
+// MARK: - Key bar (ml895)
+
+/// The keys the iOS keyboard does not have, in a row above it while it is up
+/// over a game or the desktop: Esc, Tab, Ctrl and Alt (held for the next key,
+/// from the bar or the keyboard, then let go), the arrows and F1-F12. A key is
+/// down while the finger is on it, so holding an arrow holds it in the game.
+final class GameKeyBar: UIInputView {
+    static let shared = GameKeyBar()
+
+    private static var ctrlOn = false
+    private static var altOn = false
+    private var modButtons: [Int32: UIButton] = [:]
+    /// The modifiers the key under the finger took, let go with it.
+    private var heldMods: [Int32] = []
+
+    private static let keyColor = UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.42, alpha: 1) : .white }
+    private static let modOnColor = UIColor(red: 0.10, green: 0.62, blue: 1.0, alpha: 1)
+
+    /// The modifiers to hold around the next key; one-shot, so they clear.
+    static func takeModifiers() -> [Int32] {
+        var out: [Int32] = []
+        if ctrlOn { out.append(0x11) }
+        if altOn { out.append(0x12) }
+        if !out.isEmpty {
+            ctrlOn = false
+            altOn = false
+            shared.refreshModifiers()
+        }
+        return out
+    }
+
+    private init() {
+        super.init(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 48),
+                   inputViewStyle: .keyboard)
+        allowsSelfSizing = true
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(scroll)
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 6
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(stack)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 5),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -5),
+            stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor, constant: -10),
+        ])
+        var keys: [(String, Int32)] = [("Esc", 0x1B), ("Tab", 0x09), ("Ctrl", 0x11), ("Alt", 0x12),
+                                       ("←", 0x25), ("↑", 0x26), ("↓", 0x28), ("→", 0x27)]
+        keys += (1...12).map { ("F" + String($0), Int32(0x6F + $0)) }
+        for (title, vk) in keys { stack.addArrangedSubview(makeKey(title, vk)) }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override var intrinsicContentSize: CGSize { CGSize(width: UIView.noIntrinsicMetric, height: 48) }
+
+    private func makeKey(_ title: String, _ vk: Int32) -> UIButton {
+        let b = UIButton(type: .custom)
+        b.setTitle(title, for: .normal)
+        b.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium)
+        b.setTitleColor(.label, for: .normal)
+        b.backgroundColor = Self.keyColor
+        b.layer.cornerRadius = 6
+        b.layer.shadowColor = UIColor.black.cgColor
+        b.layer.shadowOpacity = 0.3
+        b.layer.shadowOffset = CGSize(width: 0, height: 1)
+        b.layer.shadowRadius = 0
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.widthAnchor.constraint(equalToConstant: title.count > 2 ? 52 : 44).isActive = true
+        b.tag = Int(vk)
+        if vk == 0x11 || vk == 0x12 {
+            modButtons[vk] = b
+            b.addTarget(self, action: #selector(toggleModifier(_:)), for: .touchUpInside)
+        } else {
+            b.addTarget(self, action: #selector(keyDown(_:)), for: .touchDown)
+            b.addTarget(self, action: #selector(keyUp(_:)), for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        }
+        return b
+    }
+
+    @objc private func keyDown(_ b: UIButton) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        heldMods = Self.takeModifiers()
+        for m in heldMods { winios_post_key(m, 1) }
+        winios_post_key(Int32(b.tag), 1)
+    }
+
+    @objc private func keyUp(_ b: UIButton) {
+        winios_post_key(Int32(b.tag), 0)
+        for m in heldMods.reversed() { winios_post_key(m, 0) }
+        heldMods = []
+    }
+
+    @objc private func toggleModifier(_ b: UIButton) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        if b.tag == 0x11 { Self.ctrlOn.toggle() } else { Self.altOn.toggle() }
+        refreshModifiers()
+    }
+
+    private func refreshModifiers() {
+        for (vk, b) in modButtons {
+            let on = vk == 0x11 ? Self.ctrlOn : Self.altOn
+            b.backgroundColor = on ? Self.modOnColor : Self.keyColor
+            b.setTitleColor(on ? .white : .label, for: .normal)
+        }
+    }
 }
 
 /// Pointer settings, persisted to the app container.
