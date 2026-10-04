@@ -1853,6 +1853,8 @@ struct ContentView: View {
     /// ml829/ml830: DXMT shader cache on/off for every game (Settings → DXMT Renderer).
     /// ON by default; each game also has its own switch in its ⋯ menu.
     @AppStorage(ShaderCache.key) private var shaderCacheEnabled = true
+    /// ml912: MetalFX upscaling for Direct3D 11 games (off by default).
+    @AppStorage(GraphicsProbe.metalFXKey) private var metalFXEnabled = false
     @State private var shaderCacheSizeText = "…"
     /// MADEIRA_DEBUG_VERBOSE=1: full WINEDEBUG trace (WineProcessBridge.m).
     @AppStorage("madeira.wineVerbose") private var wineVerbose = false
@@ -2254,6 +2256,23 @@ struct ContentView: View {
         let perGame = GameLibrary.activeSettings(for: game.id)   // ml903: its own only while its switch is on
         let (screenW0, screenH0) = perGame.resolution.flatMap(GameSettings.size) ?? desktopSize
         let effectiveNoTSO: Bool = perGame.noTSO ?? fexNoTSO
+        // ml912: MetalFX upscaling for a Direct3D 11 game, by the factor that makes
+        // its resolution fill the screen (at most 2x). Nothing at about 1x: the
+        // game already renders at screen size.
+        var metalFXFactor: Double? = nil
+        if perGame.metalFX ?? metalFXEnabled, GameLibrary.shared.drawsWithDirect3D11(game) {
+            let native: CGSize = UIScreen.main.nativeBounds.size
+            let screenLong: Double = Double(max(native.width, native.height))
+            let screenShort: Double = Double(min(native.width, native.height))
+            let fit: Double = min(screenLong / Double(screenW0), screenShort / Double(screenH0))
+            let factor: Double = min(max(fit, 1.0), 2.0)
+            if factor >= 1.1 { metalFXFactor = (factor * 100).rounded(.down) / 100 }
+            if let f = metalFXFactor {
+                logStore.log("Games: " + game.title + " — MetalFX upscaling x" + String(format: "%.2f", f) + " to the screen")
+            } else {
+                logStore.log("Games: " + game.title + " — MetalFX skipped: \(screenW0)x\(screenH0) already fills the screen")
+            }
+        }
         setenv("MADEIRA_SCREEN_W", String(screenW0), 1)
         setenv("MADEIRA_SCREEN_H", String(screenH0), 1)
         let launchInSession: (String) -> Void = { args in
@@ -2273,7 +2292,8 @@ struct ContentView: View {
             }
             // ml837: args = GameResolutionDefault's Unity screen options, or "".
             SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, args: args, shaderCache: cache,
-                                          noTSO: effectiveNoTSO, monoSuspend: monoSuspend) { outcome in
+                                          noTSO: effectiveNoTSO, monoSuspend: monoSuspend,
+                                          metalFX: metalFXFactor) { outcome in
                 switch outcome {
                 case .started(let pid):
                     logStore.log("\(game.title) started (pid \(pid))", level: .success)
@@ -3470,6 +3490,12 @@ struct ContentView: View {
                     }
                     .onChange(of: screenScalingSetting) { _, _ in ScreenScaling.reapply() }
                     Text("Fit shows the whole picture with black bars, Fill covers the screen and crops the edges, Stretch fills it out of shape, and Whole-number scales by exactly 2x, 3x and so on, so pixel art stays even. A game's ⋯ menu can change it for that game.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    // ml912
+                    Toggle("MetalFX upscaling", isOn: $metalFXEnabled)
+                        .disabled(runtimeInUse)   // launch-only
+                    Text("DirectX 11 games only. The game renders at its resolution and Apple's MetalFX upscales the picture to fill the screen, sharper than a plain stretch. Pick a lower resolution for more speed. A game's ⋯ menu can change it for that game. Applies the next time a game starts.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

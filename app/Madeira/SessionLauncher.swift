@@ -160,8 +160,11 @@ final class SessionLauncher {
     /// `monoSuspend`: ml868 — "coop" sends "monosuspend=coop", which the agent
     /// turns into MONO_THREADS_SUSPEND=coop around this game's CreateProcessW;
     /// nil sends nothing. See monoSuspend(forExe:).
+    /// `metalFX`: ml912 -- a factor sends "metalfx=<factor>", MetalFX upscaling
+    /// for this Direct3D 11 game (the agent sets DXMT's switch and factor around
+    /// its CreateProcessW); nil sends nothing.
     func launch(exe: String, dir: String, args: String = "", shaderCache: String? = nil,
-                noTSO: Bool? = nil, monoSuspend: String? = nil,
+                noTSO: Bool? = nil, monoSuspend: String? = nil, metalFX: Double? = nil,
                 readyTimeout: TimeInterval = 120,
                 completion: @escaping (Outcome) -> Void) {
         queue.async {
@@ -199,6 +202,9 @@ final class SessionLauncher {
                 // site, later patches are written and invalidated directly instead
                 // of each costing an access violation.
                 text += "monohook=on\r\n"
+            }
+            if let metalFX = metalFX {
+                text += "metalfx=" + String(format: "%.2f", metalFX) + "\r\n"   // ml912
             }
             let tmp = self.agentDir.appendingPathComponent("launch.tmp")
             do {

@@ -89,10 +89,12 @@ struct GameSettings: Codable, Equatable {
     /// filled in when its switch was turned on. Only a picked one is asked of
     /// a Unity game on EVERY launch (ml849); a filled one is just its screen.
     var resolutionChosen: Bool? = nil
+    /// ml912: MetalFX upscaling (Direct3D 11 games only, see GraphicsProbe).
+    var metalFX: Bool? = nil
 
     var isEmpty: Bool {
         resolution == nil && noTSO == nil && frameCap == nil && scaling == nil && shaderCache == nil
-            && resolutionChosen == nil
+            && resolutionChosen == nil && metalFX == nil
     }
 
     /// The resolutions Settings offers; the per-game row cycles the same list.
@@ -374,6 +376,21 @@ final class GameLibrary: ObservableObject {
         GameLibrary.loadGameSettings()[id] ?? GameSettings()
     }
 
+    // MARK: Direct3D 11 (ml912)
+
+    /// Per exe path: whether the game draws with Direct3D 11. Main thread.
+    private var d3d11Cache: [String: Bool] = [:]
+
+    /// ml912: whether MetalFX upscaling can work for this game (it draws with
+    /// Direct3D 11). Probed once per executable, from its folder's files.
+    func drawsWithDirect3D11(_ g: LauncherGame) -> Bool {
+        guard let exe = g.exe else { return false }
+        if let known = d3d11Cache[exe.path] { return known }
+        let found: Bool = GraphicsProbe.usesDirect3D11(exe: exe)
+        d3d11Cache[exe.path] = found
+        return found
+    }
+
     // MARK: Override Madeira settings (ml903)
 
     private static let overrideKey = "madeira.launcher.overrideOn"
@@ -441,6 +458,7 @@ final class GameLibrary: ObservableObject {
             if replace || s.frameCap == nil { s.frameCap = Int(FrameCap.saved.rawValue) }
             if replace || s.scaling == nil { s.scaling = ScreenScaling.saved.rawValue }
             if replace || s.shaderCache == nil { s.shaderCache = ShaderCache.enabled }
+            if replace || s.metalFX == nil { s.metalFX = d.bool(forKey: GraphicsProbe.metalFXKey) }   // ml912
         }
         TouchControlsModel.shared.fillOwnProfile(forGame: id, replace: replace)
         GamepadBridge.shared.fillOwnProfile(forGame: id, replace: replace)
@@ -1591,4 +1609,97 @@ private enum PlayClock {
 /// ml893: folders being measured (main thread only).
 private enum SizeJobs {
     static var running: Set<String> = []
+}
+
+// MARK: - Graphics API probe (ml912)
+
+/// ml912: does a game draw with Direct3D 11? MetalFX upscaling is DXMT's d3d11
+/// swapchain (64- and 32-bit d3d11.dll); the Direct3D 9 renderer
+/// (d3d9-emulated.dll) has no such path, and OpenGL games never reach DXMT.
+/// Decided from the game's files: an engine that draws with Direct3D 11 on
+/// Windows (Unity, FNA, SharpDX), or an executable or DLL next to the game's
+/// that imports d3d11.dll. A library that only names d3d11.dll in a string
+/// (SDL's renderer, for one) does not count.
+enum GraphicsProbe {
+    /// Settings' MetalFX switch (UserDefaults).
+    static let metalFXKey = "madeira.metalFX"
+
+    static func usesDirect3D11(exe: URL) -> Bool {
+        let fm = FileManager.default
+        let dir = exe.deletingLastPathComponent()
+        let names: [String] = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        var lower: Set<String> = []
+        for n in names { lower.insert(n.lowercased()) }
+        if lower.contains("unityplayer.dll") || lower.contains("fna3d.dll") || lower.contains("sharpdx.direct3d11.dll") {
+            return true
+        }
+        // Unity before UnityPlayer.dll: <Game>_Data/Managed/UnityEngine.dll
+        for n in names where n.hasSuffix("_Data") {
+            let engine = dir.appendingPathComponent(n).appendingPathComponent("Managed/UnityEngine.dll")
+            if fm.fileExists(atPath: engine.path) { return true }
+        }
+        if importedDLLs(exe).contains("d3d11.dll") { return true }
+        for n in names where n.lowercased().hasSuffix(".dll") {
+            if importedDLLs(dir.appendingPathComponent(n)).contains("d3d11.dll") { return true }
+        }
+        return false
+    }
+
+    /// The DLLs a PE file imports (lower-cased); [] when it is not a PE file.
+    /// Mapped, not read: UnityPlayer.dll is tens of MB and only its headers matter.
+    static func importedDLLs(_ url: URL) -> [String] {
+        guard let d = try? Data(contentsOf: url, options: .alwaysMapped), d.count > 0x40 else { return [] }
+        let base: Int = d.startIndex
+        func u16(_ o: Int) -> Int {
+            guard o >= 0, o + 2 <= d.count else { return -1 }
+            return Int(d[base + o]) | (Int(d[base + o + 1]) << 8)
+        }
+        func u32(_ o: Int) -> Int {
+            guard o >= 0, o + 4 <= d.count else { return -1 }
+            var v: Int = 0
+            for i in 0..<4 { v |= Int(d[base + o + i]) << (8 * i) }
+            return v
+        }
+        guard u16(0) == 0x5A4D else { return [] }
+        let pe: Int = u32(0x3C)
+        guard pe > 0, u32(pe) == 0x4550 else { return [] }
+        let sectionCount: Int = u16(pe + 6)
+        let optSize: Int = u16(pe + 20)
+        let opt: Int = pe + 24
+        let dirs: Int = opt + (u16(opt) == 0x20B ? 112 : 96)
+        let importRVA: Int = u32(dirs + 8)
+        guard importRVA > 0, sectionCount > 0, sectionCount < 100 else { return [] }
+        var vas: [Int] = [], sizes: [Int] = [], raws: [Int] = []
+        let table: Int = opt + optSize
+        for i in 0..<sectionCount {
+            let s: Int = table + i * 40
+            vas.append(u32(s + 12))
+            sizes.append(max(u32(s + 8), u32(s + 16)))
+            raws.append(u32(s + 20))
+        }
+        func fileOffset(_ rva: Int) -> Int? {
+            for i in 0..<vas.count where rva >= vas[i] && rva < vas[i] + sizes[i] {
+                return rva - vas[i] + raws[i]
+            }
+            return nil
+        }
+        guard var entry = fileOffset(importRVA) else { return [] }
+        var out: [String] = []
+        for _ in 0..<256 {
+            let nameRVA: Int = u32(entry + 12)
+            if nameRVA <= 0 { break }
+            guard let at = fileOffset(nameRVA) else { break }
+            var bytes: [UInt8] = []
+            var p: Int = at
+            while p >= 0, p < d.count, bytes.count < 64 {
+                let b: UInt8 = d[base + p]
+                if b == 0 { break }
+                bytes.append(b)
+                p += 1
+            }
+            out.append(String(decoding: bytes, as: UTF8.self).lowercased())
+            entry += 20
+        }
+        return out
+    }
 }

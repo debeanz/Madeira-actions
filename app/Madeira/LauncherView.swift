@@ -1667,6 +1667,20 @@ private struct OptionsSheet: View {
                                  ScreenScaling.reapply()
                              }))
 
+        // ml912: only for a game that draws with Direct3D 11, the one API it works for.
+        if library.drawsWithDirect3D11(g) {
+            let curFX: Bool = s.metalFX ?? defaults.bool(forKey: GraphicsProbe.metalFXKey)
+            out.append(OptionRow(id: "metalfx", title: "MetalFX upscaling",
+                                 systemImage: "sparkles",
+                                 destructive: false, checked: false,
+                                 trailing: curFX ? "On" : "Off",
+                                 disabled: busy || !own,
+                                 note: "Upscales the picture to the screen, sharper than a plain stretch. Lower the resolution for more speed.",
+                                 action: {
+                                     library.updateSettings(for: id) { $0.metalFX = !curFX }
+                                 }))
+        }
+
         let curCap: FrameCap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
         out.append(OptionRow(id: "framecap", title: "Frame rate cap",
                              systemImage: "speedometer",

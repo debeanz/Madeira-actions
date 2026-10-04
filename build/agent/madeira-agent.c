@@ -18,6 +18,7 @@
  *     tso=off  or  tso=on                                 (optional, ml849)
  *     monosuspend=coop|hybrid|preemptive                  (optional, ml868)
  *     monohook=on                                         (optional, ml873)
+ *     metalfx=<factor 1-3>                                (optional, ml912)
  *
  * The agent deletes the request, CreateProcess()es the game with its folder
  * as working directory, and answers in C:\madeira\launch.result:
@@ -718,13 +719,15 @@ static void handle_request( void )
 {
     char *text = read_text_file( REQUEST_PATH );
     char id[128], exe[1024], dir[1024], args[2048], cache[2048], tso[16], mono[16], hook[8], result[256];
+    char fx[32];          /* ml912 */
     WCHAR *wexe, *wdir, *wargs, *wcache = NULL;
     DWORD pid, err = 0;
     int cache_mode = 0;   /* ml830: 0 = leave the environment alone, 1 = off, 2 = cache dir */
     int tso_mode = 0;     /* ml849: 0 = leave it, 1 = FEX_TSOENABLED=0 (off), 2 = FEX_TSOENABLED=1 (on) */
     int mono_mode = 0;    /* ml868: 0 = leave it, 1 = MONO_THREADS_SUSPEND=<mono> */
     int hook_mode = 0;    /* ml873: 0 = leave it, 1 = MADEIRA_WINEMONO_BRIDGE=1 */
-    struct saved_env saved[5];
+    int fx_mode = 0;      /* ml912: 0 = leave it, 1 = MetalFX upscaling at factor fx */
+    struct saved_env saved[7];
 
     if (!text) return;
     /* Delete first so a failure cannot be retried forever. */
@@ -813,6 +816,16 @@ static void handle_request( void )
     {
         if (!strcmp( hook, "on" )) hook_mode = 1;
         else agent_log( "monohook=%s ignored: not \"on\"", hook );
+    }
+    /* ml912: MetalFX upscaling for this game. DXMT's d3d11 swapchain (64- and
+     * 32-bit d3d11.dll alike) takes the MetalFX spatial-scaler path when
+     * DXMT_METALFX_SPATIAL_SWAPCHAIN=1 is in the game's environment, and reads
+     * the factor from DXMT_CONFIG (d3d11.metalSpatialUpscaleFactor). */
+    if (get_field( text, "metalfx", fx, sizeof(fx) ))
+    {
+        double f = atof( fx );
+        if (strspn( fx, "0123456789." ) == strlen( fx ) && f >= 1.0 && f <= 3.0) fx_mode = 1;
+        else agent_log( "metalfx=%s ignored: not a factor between 1 and 3", fx );
     }
     HeapFree( GetProcessHeap(), 0, text );
 
@@ -918,6 +931,47 @@ static void handle_request( void )
         }
     }
 
+    /* ml912: MetalFX for this CreateProcessW only, same snapshot rule. The factor
+     * goes FIRST in DXMT_CONFIG, so it can never land inside a per-exe [section]
+     * of whatever madeira-dxmt.txt put there. */
+    if (fx_mode)
+    {
+        BOOL ok_sw = save_env( &saved[5], L"DXMT_METALFX_SPATIAL_SWAPCHAIN" );
+        BOOL ok_conf = save_env( &saved[6], L"DXMT_CONFIG" );
+
+        if (!ok_sw || !ok_conf)
+        {
+            agent_log( "metalfx override skipped: could not save the agent's environment" );
+            if (saved[5].value) HeapFree( GetProcessHeap(), 0, saved[5].value );
+            if (saved[6].value) HeapFree( GetProcessHeap(), 0, saved[6].value );
+            fx_mode = 0;
+        }
+        else
+        {
+            size_t old_len = saved[6].value ? wcslen( saved[6].value ) : 0;
+            WCHAR wfx[32], *conf = HeapAlloc( GetProcessHeap(), 0, (old_len + 96) * sizeof(WCHAR) );
+            BOOL ok1, ok2 = FALSE;
+
+            MultiByteToWideChar( CP_UTF8, 0, fx, -1, wfx, ARRAYSIZE(wfx) );
+            ok1 = SetEnvironmentVariableW( L"DXMT_METALFX_SPATIAL_SWAPCHAIN", L"1" );
+            if (conf)
+            {
+                wcscpy( conf, L"d3d11.metalSpatialUpscaleFactor = " );
+                wcscat( conf, wfx );
+                if (old_len)
+                {
+                    wcscat( conf, L";" );
+                    wcscat( conf, saved[6].value );
+                }
+                ok2 = SetEnvironmentVariableW( L"DXMT_CONFIG", conf );
+                HeapFree( GetProcessHeap(), 0, conf );
+            }
+            agent_log( "metalfx=%s: DXMT_METALFX_SPATIAL_SWAPCHAIN=1%s, factor in DXMT_CONFIG%s (agent had DXMT_CONFIG=%ls)",
+                       fx, ok1 ? "" : " FAILED", ok2 ? "" : " FAILED",
+                       saved[6].value ? saved[6].value : L"<unset>" );
+        }
+    }
+
     write_install_key( wexe );   /* ml883 */
     pid = start_process( wexe, wargs, wdir );
     if (!pid) err = GetLastError();
@@ -930,6 +984,11 @@ static void handle_request( void )
     if (tso_mode) restore_env( &saved[2] );   /* ml849 */
     if (mono_mode) restore_env( &saved[3] );  /* ml868 */
     if (hook_mode) restore_env( &saved[4] );  /* ml873 */
+    if (fx_mode)                               /* ml912 */
+    {
+        restore_env( &saved[5] );
+        restore_env( &saved[6] );
+    }
     if (pid) snprintf( result, sizeof(result), "id=%s\r\nok pid=%lu\r\n", id, (unsigned long)pid );
     else     snprintf( result, sizeof(result), "id=%s\r\nerr code=%lu\r\n", id, (unsigned long)err );
     agent_log( "%s", result );
