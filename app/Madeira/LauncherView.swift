@@ -1695,7 +1695,9 @@ private struct OptionsSheet: View {
             let curIndex: Int = GraphicsProbe.stopIndex(GraphicsProbe.snap(s.metalFXScale ?? GraphicsProbe.savedScale), in: stops)
             let curFX: Double = stops[curIndex]
             let setStop: (Int) -> Void = { i in
-                let stop: Double = stops[min(max(i, 0), stops.count - 1)]
+                let k: Int = min(max(i, 0), stops.count - 1)
+                if k == curIndex { return }   // ml916: the smooth slider reports every move
+                let stop: Double = stops[k]
                 library.updateSettings(for: id) { $0.metalFXScale = stop }
             }
             var fxSlider: SheetSlider? = nil
@@ -2633,7 +2635,9 @@ private struct SheetRow: View {
     /// ml913: lines up under the title (past the icon's column).
     private func sliderBar(_ sl: SheetSlider) -> some View {
         let binding: Binding<Double> = Binding<Double>(get: { sl.value }, set: { sl.set($0) })
-        return Slider(value: binding, in: sl.range, step: sl.step)
+        // ml916: no step: a stepped Slider ticks the haptics at every stop;
+        // sl.set snaps the value (the pad's left/right still use sl.step).
+        return Slider(value: binding, in: sl.range)
             .tint(LauncherPalette.accent)
             .disabled(self.disabled)
             .padding(.leading, 40)

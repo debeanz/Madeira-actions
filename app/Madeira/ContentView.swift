@@ -1892,11 +1892,13 @@ struct ContentView: View {
         let stops: [Double] = GraphicsProbe.stops(upTo: most)
         let index: Int = GraphicsProbe.stopIndex(GraphicsProbe.snap(metalFXScale), in: stops)
         let shown: Double = stops[index]
+        // ml916: a smooth slider that snaps here: a stepped Slider ticks the
+        // haptics at every stop, which the user asked to lose.
         let binding: Binding<Double> = Binding<Double>(
             get: { Double(index) },
             set: { v in
                 let i: Int = min(max(Int(v.rounded()), 0), stops.count - 1)
-                metalFXScale = stops[i]
+                if i != index { metalFXScale = stops[i] }
             })
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -1907,7 +1909,7 @@ struct ContentView: View {
                     .monospacedDigit()
             }
             if stops.count > 1 {
-                Slider(value: binding, in: 0...Double(stops.count - 1), step: 1)
+                Slider(value: binding, in: 0...Double(stops.count - 1))
             }
             Text(GraphicsProbe.effectText(width: size.w, height: size.h, factor: shown, most: most))
                 .font(.caption)
@@ -8923,39 +8925,95 @@ struct MappingPanel: View {
     /// on the screen along the axis it separates on. Clamping the OTHER axis is
     /// then always safe — below/above are separated vertically, so no horizontal
     /// clamp can reintroduce an overlap, and vice versa.
+    ///
+    /// ml916: nor over the toolbar. A face button low on the right put the
+    /// panel above it, on the toolbar's checkmark, so the layout could not be
+    /// saved. Each side is now also tried slid clear of the toolbar (left of
+    /// it for below/above, under it for the sides -- moves along the axis that
+    /// does not separate the panel from the control), and a spot that still
+    /// touches the toolbar is skipped.
     private var layout: Placement {
         let cx = CGFloat(control.nx) * screen.width
         let cy = CGFloat(control.ny) * screen.height
         let r  = ControlsGeometry.diameter(control) / 2
         let gap: CGFloat = 14, edge: CGFloat = 8
+        let bar: CGRect = ControlsChrome.toolbar.isNull ? .null : ControlsChrome.toolbar.insetBy(dx: -6, dy: -6)
 
         for size in [CGSize(width: 340, height: 236),
                      CGSize(width: 300, height: 196),
                      CGSize(width: 264, height: 164)] {
             let clampX = min(max(cx, size.width  / 2 + edge), screen.width  - size.width  / 2 - edge)
             let clampY = min(max(cy, size.height / 2 + edge), screen.height - size.height / 2 - edge)
+            let barX: CGFloat = Self.leftOf(bar, x: clampX, width: size.width, edge: edge)
+            let barY: CGFloat = Self.under(bar, y: clampY, height: size.height, screenHeight: screen.height, edge: edge)
+            var tries: [Placement] = []
             if cy + r + gap + size.height <= screen.height - edge {
-                return Placement(center: CGPoint(x: clampX, y: cy + r + gap + size.height / 2), size: size)
+                let y: CGFloat = cy + r + gap + size.height / 2
+                tries.append(Placement(center: CGPoint(x: clampX, y: y), size: size))
+                tries.append(Placement(center: CGPoint(x: barX, y: y), size: size))
             }
             if cy - r - gap - size.height >= edge {
-                return Placement(center: CGPoint(x: clampX, y: cy - r - gap - size.height / 2), size: size)
+                let y: CGFloat = cy - r - gap - size.height / 2
+                tries.append(Placement(center: CGPoint(x: clampX, y: y), size: size))
+                tries.append(Placement(center: CGPoint(x: barX, y: y), size: size))
             }
             if cx + r + gap + size.width <= screen.width - edge {
-                return Placement(center: CGPoint(x: cx + r + gap + size.width / 2, y: clampY), size: size)
+                let x: CGFloat = cx + r + gap + size.width / 2
+                tries.append(Placement(center: CGPoint(x: x, y: clampY), size: size))
+                tries.append(Placement(center: CGPoint(x: x, y: barY), size: size))
             }
             if cx - r - gap - size.width >= edge {
-                return Placement(center: CGPoint(x: cx - r - gap - size.width / 2, y: clampY), size: size)
+                let x: CGFloat = cx - r - gap - size.width / 2
+                tries.append(Placement(center: CGPoint(x: x, y: clampY), size: size))
+                tries.append(Placement(center: CGPoint(x: x, y: barY), size: size))
+            }
+            if let p = tries.first(where: { Self.clear($0, of: bar) }) { return p }
+        }
+        // Nothing fits alongside — smallest panel, in the corner furthest from
+        // the control that covers neither it nor the toolbar.
+        let size = CGSize(width: 264, height: 164)
+        let controlRect: CGRect = CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r)
+        var corners: [Placement] = []
+        for x in [size.width / 2 + edge, screen.width - size.width / 2 - edge] {
+            for y in [size.height / 2 + edge, screen.height - size.height / 2 - edge] {
+                corners.append(Placement(center: CGPoint(x: x, y: y), size: size))
             }
         }
-        // Nothing fits alongside — smallest panel, corner furthest from the
-        // control, so it still cannot cover it.
-        let size = CGSize(width: 264, height: 164)
-        return Placement(
-            center: CGPoint(x: cx < screen.width  / 2 ? screen.width  - size.width  / 2 - edge
-                                                      : size.width  / 2 + edge,
-                            y: cy < screen.height / 2 ? screen.height - size.height / 2 - edge
-                                                      : size.height / 2 + edge),
-            size: size)
+        corners.sort { a, b in
+            let da: CGFloat = hypot(a.center.x - cx, a.center.y - cy)
+            let db: CGFloat = hypot(b.center.x - cx, b.center.y - cy)
+            return da > db
+        }
+        if let p = corners.first(where: { Self.clear($0, of: bar) && !Self.rect($0).intersects(controlRect) }) {
+            return p
+        }
+        return corners[0]
+    }
+
+    private static func rect(_ p: Placement) -> CGRect {
+        CGRect(x: p.center.x - p.size.width / 2, y: p.center.y - p.size.height / 2,
+               width: p.size.width, height: p.size.height)
+    }
+
+    /// ml916: the panel at p leaves the toolbar uncovered.
+    private static func clear(_ p: Placement, of bar: CGRect) -> Bool {
+        bar.isNull || !rect(p).intersects(bar)
+    }
+
+    /// ml916: a panel centre x that keeps it left of the toolbar (as is when
+    /// there is no room there).
+    private static func leftOf(_ bar: CGRect, x: CGFloat, width: CGFloat, edge: CGFloat) -> CGFloat {
+        if bar.isNull { return x }
+        let leftX: CGFloat = bar.minX - 2 - width / 2
+        return leftX >= width / 2 + edge ? min(x, leftX) : x
+    }
+
+    /// ml916: a panel centre y that keeps its top under the toolbar (as is
+    /// when it would not fit there).
+    private static func under(_ bar: CGRect, y: CGFloat, height: CGFloat, screenHeight: CGFloat, edge: CGFloat) -> CGFloat {
+        if bar.isNull { return y }
+        let lowY: CGFloat = bar.maxY + 2 + height / 2
+        return lowY + height / 2 <= screenHeight - edge ? max(y, lowY) : y
     }
 
     private func tabButton(_ i: Int, _ icon: String, _ title: String) -> some View {
