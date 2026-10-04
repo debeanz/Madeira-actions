@@ -2602,9 +2602,15 @@ enum GameLogSaver {
     }
 
     private static func write(title: String, exe: URL?, header: String, at date: Date) -> String? {
-        let fm = FileManager.default
         guard let out = buildLog(title: title, exe: exe, header: header) else { return nil }
+        return store(out, title: title, at: date)
+    }
 
+    /// ml900: a built log into the game's folder (Save Log, and the copy Report
+    /// Compatibility keeps of the log it sends). The saved name, or nil.
+    /// Blocking (writes a file).
+    static func store(_ out: Data, title: String, at date: Date) -> String? {
+        let fm = FileManager.default
         sortLooseLogs()
         // ml866: a folder per game, as the compatibility site's logs are.
         let dir = logsDir.appendingPathComponent(folder(for: title), isDirectory: true)
@@ -2843,9 +2849,17 @@ enum ReportService {
         }
     }
 
+    /// What send() did with the log.
+    struct Sent {
+        var logAttached: Bool
+        /// ml900: the copy kept in Files › Madeira › logs › <game> (its name), or nil.
+        var savedLog: String?
+    }
+
     /// Uploads the log first, so the report can say whether it has one; a log
-    /// that fails to upload does not stop the report. Returns whether it made it.
-    static func send(_ d: Draft) async throws -> Bool {
+    /// that fails to upload does not stop the report. ml900: the same log is also
+    /// saved in the game's logs folder, whether or not the upload works.
+    static func send(_ d: Draft) async throws -> Sent {
         guard isConfigured else { throw Failure.notConfigured }
         let id = UUID().uuidString.lowercased()
         let title = String(d.game.title.prefix(120))
@@ -2853,6 +2867,7 @@ enum ReportService {
         let device = GameLogSaver.deviceModel
 
         var hasLog = false
+        var savedLog: String? = nil
         if d.includeLog {
             var header = "Madeira report \(id) — \(d.game.title)\n"
                 + "Sent \(Date().formatted(date: .abbreviated, time: .standard)) · Madeira \(version)"
@@ -2861,15 +2876,17 @@ enum ReportService {
                 + (d.issues.isEmpty ? "" : " · Issues: " + d.issues.joined(separator: ", "))
                 + "\n"
             if let note = d.note { header += "What happened: \(note)\n" }
-            if let log = GameLogSaver.buildLog(title: d.game.title, exe: d.game.exe, header: header),
-               let gz = gzip(log),
-               let path = logPath(title: title, id: id).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
-                do {
-                    try await post("/storage/v1/object/logs/" + path, body: gz,
-                                   contentType: "application/gzip", headers: ["x-upsert": "false"])
-                    hasLog = true
-                } catch {
-                    hasLog = false   // the report still goes; the site shows no log
+            if let log = GameLogSaver.buildLog(title: d.game.title, exe: d.game.exe, header: header) {
+                savedLog = GameLogSaver.store(log, title: d.game.title, at: Date())   // ml900
+                if let gz = gzip(log),
+                   let path = logPath(title: title, id: id).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+                    do {
+                        try await post("/storage/v1/object/logs/" + path, body: gz,
+                                       contentType: "application/gzip", headers: ["x-upsert": "false"])
+                        hasLog = true
+                    } catch {
+                        hasLog = false   // the report still goes; the site shows no log
+                    }
                 }
             }
         }
@@ -2898,7 +2915,7 @@ enum ReportService {
         let body = try JSONSerialization.data(withJSONObject: row)
         try await post("/rest/v1/reports", body: body, contentType: "application/json",
                        headers: ["Prefer": "return=minimal"])
-        return hasLog
+        return Sent(logAttached: hasLog, savedLog: savedLog)
     }
 
     private static func post(_ path: String, body: Data, contentType: String,
@@ -3009,6 +3026,8 @@ struct ReportSheet: View {
     @State private var fps: String? = nil
     @State private var text = ""
     @State private var includeLog = true
+    /// ml900: the name of the log copy saved in the game's logs folder, or nil.
+    @State private var savedLogName: String? = nil
     @State private var phase: Phase = .editing
     @State private var settings: [String: Any] = [:]
     @State private var autoLine = ""
@@ -3214,6 +3233,12 @@ struct ReportSheet: View {
                 .font(.subheadline)
                 .foregroundStyle(LauncherPalette.textSecondary)
                 .multilineTextAlignment(.center)
+            if savedLogName != nil {   // ml900
+                Text("A copy of the log is in Files › Madeira › logs › \(GameLogSaver.folder(for: game.title)).")
+                    .font(.footnote)
+                    .foregroundStyle(LauncherPalette.textSecondary)
+                    .multilineTextAlignment(.center)
+            }
             if let url = ReportService.pageURL(for: game.title) {
                 Button { openURL(url) } label: {
                     Label("See \(game.title) on the site", systemImage: "safari")
@@ -3323,10 +3348,14 @@ struct ReportSheet: View {
         let wantedLog = includeLog
         Task {
             do {
-                let logged = try await ReportService.send(draft)
+                let sent = try await ReportService.send(draft)
                 await MainActor.run {
-                    phase = .sent(logAttached: logged || !wantedLog)
-                    LogStore.shared.log("Report Compatibility: sent for \(title) (\(rating), log \(logged ? "attached" : "not attached"))")
+                    savedLogName = sent.savedLog
+                    phase = .sent(logAttached: sent.logAttached || !wantedLog)
+                    LogStore.shared.log("Report Compatibility: sent for \(title) (\(rating), log \(sent.logAttached ? "attached" : "not attached"))")
+                    if let name = sent.savedLog {
+                        LogStore.shared.log("Saved log for \(title): logs/\(GameLogSaver.folder(for: title))/\(name).txt")
+                    }
                 }
             } catch {
                 await MainActor.run { phase = .failed(error.localizedDescription) }
