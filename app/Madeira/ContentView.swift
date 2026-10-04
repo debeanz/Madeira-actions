@@ -5290,11 +5290,13 @@ enum ControlAction: Codable, Equatable, Hashable {
         }
     }
 
+    /// The text on a control's face. ml892: the mouse buttons read LMB / RMB,
+    /// so an L or R key never looks like one.
     var label: String {
         switch self {
         case .none:            return "—"
-        case .mouseLeft:       return "L"
-        case .mouseRight:      return "R"
+        case .mouseLeft:       return "LMB"
+        case .mouseRight:      return "RMB"
         case .keyboardToggle:  return "⌨"
         case .joystickWASD:    return "WASD"
         case .joystickArrows:  return "↕"
@@ -5889,15 +5891,15 @@ final class TouchControlsModel: ObservableObject {
     }
 
     /// ml889: a saved keyboard layout that is still exactly a seed some build put
-    /// there was never customised: the four controls before ml889, or ml889's
-    /// preset with the R key (0.1.155-0.1.156; ml891 swapped it for Q).
+    /// there was never customised: the four controls before ml889, or the
+    /// preset with Q (0.1.157, ml891; ml892 has R again).
     private static func isLegacySeed(_ c: [TouchControl]) -> Bool {
         let seed: [(Double, Double, Double, ControlAction)] = [
             (0.16, 0.72, 1.35, .joystickWASD), (0.84, 0.72, 1.05, .mouseLeft),
             (0.73, 0.60, 0.88, .key(0x20)), (0.90, 0.55, 0.78, .key(0x1B)),
         ]
         let old = seed.map { TouchControl(nx: $0.0, ny: $0.1, scale: $0.2, action: $0.3) }
-        return sameLayout(c, old) || sameLayout(c, keyboardPreset(top: 0x52))
+        return sameLayout(c, old) || sameLayout(c, keyboardPreset(top: 0x51))
     }
 
     /// The same controls in the same order, ids aside.
@@ -5921,8 +5923,8 @@ final class TouchControlsModel: ObservableObject {
     /// below-right of it; Space (jump) with E, F and `top` above it as the right
     /// thumb's diamond; right click (aim) and left click (attack) on the
     /// shoulders; Tab and Esc at the bottom centre. The rest of the screen stays
-    /// the mouse. ml891: `top` is Q, because an R key read exactly like the
-    /// right mouse button's "R".
+    /// the mouse. `top` is R (reload); ml891 made it Q while the right mouse
+    /// button's face also read "R" (RMB since ml892).
     private static func keyboardPreset(top: Int32) -> [TouchControl] {
         let k = presetScale()
         func c(_ x: Double, _ y: Double, _ s: Double, _ a: ControlAction) -> TouchControl {
@@ -5935,7 +5937,7 @@ final class TouchControlsModel: ObservableObject {
             c(0.826, 0.845, 1.05, .key(0x20)),      // Space
             c(0.768, 0.705, 0.94, .key(0x45)),      // E
             c(0.884, 0.705, 0.94, .key(0x46)),      // F
-            c(0.826, 0.580, 0.94, .key(top)),       // Q
+            c(0.826, 0.580, 0.94, .key(top)),       // R
             c(0.120, 0.430, 1.05, .mouseRight),
             c(0.880, 0.430, 1.05, .mouseLeft),
             c(0.462, 0.885, 0.66, .key(0x09)),      // Tab
@@ -5947,7 +5949,7 @@ final class TouchControlsModel: ObservableObject {
         let k = presetScale()
         switch mode {
         case .custom:
-            return keyboardPreset(top: 0x51)        // Q
+            return keyboardPreset(top: 0x52)        // R
         case .xbox:
             // ml885: laid out like the controller, on a landscape iPhone Pro Max
             // (932 x 430 pt, 59 pt side and 21 pt bottom safe areas):
