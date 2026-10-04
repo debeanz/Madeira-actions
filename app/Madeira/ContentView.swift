@@ -1616,7 +1616,10 @@ final class GameKeyBar: UIInputView {
         ])
         var keys: [(String, Int32)] = [("Esc", 0x1B), ("Tab", 0x09), ("Ctrl", 0x11), ("Alt", 0x12),
                                        ("←", 0x25), ("↑", 0x26), ("↓", 0x28), ("→", 0x27)]
-        keys += (1...12).map { ("F" + String($0), Int32(0x6F + $0)) }
+        for n in 1...12 {
+            let vk: Int32 = 0x6F + Int32(n)   // VK_F1 = 0x70
+            keys.append(("F\(n)", vk))
+        }
         for (title, vk) in keys { stack.addArrangedSubview(makeKey(title, vk)) }
     }
 
