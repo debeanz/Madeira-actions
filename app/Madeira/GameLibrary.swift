@@ -103,10 +103,24 @@ final class GameLibrary: ObservableObject {
     @Published private(set) var shaderCacheOff: Set<String> = []
     /// ml849: per-game overrides (resolution, TSO switch, frame cap) by game id.
     @Published private(set) var gameSettings: [String: GameSettings] = [:]
+    /// ml893: game ids pinned to the top of the Games tab.
+    @Published private(set) var favorites: Set<String> = []
+    /// ml893: seconds played per game id (from the game's start to its end).
+    @Published private(set) var playSeconds: [String: Double] = [:]
+    /// ml893: each game's folder size, measured when the Games tab sorts by size.
+    @Published private(set) var folderBytes: [String: Int64] = [:]
 
     init() {
         let defaults = UserDefaults.standard
         gameSettings = GameLibrary.loadGameSettings()
+        favorites = Set(defaults.stringArray(forKey: GameLibrary.favoritesKey) ?? [])
+        if let raw = defaults.dictionary(forKey: GameLibrary.playSecondsKey) {
+            var out: [String: Double] = [:]
+            for (k, v) in raw {
+                if let n = v as? NSNumber { out[k] = n.doubleValue }
+            }
+            playSeconds = out
+        }
         // ml830: Hide is gone (Delete replaces it), so everything hidden by an
         // earlier build comes back once and can be deleted properly.
         if !defaults.bool(forKey: GameLibrary.hiddenMigratedKey) {
@@ -649,6 +663,13 @@ final class GameLibrary: ObservableObject {
         if appIDs.removeValue(forKey: id) != nil { steamAppIDs = appIDs }
         var h = hidden
         if h.remove(id) != nil { hidden = h }
+        // ml893
+        if favorites.contains(id) { toggleFavorite(id) }
+        if playSeconds[id] != nil {
+            playSeconds[id] = nil
+            UserDefaults.standard.set(playSeconds, forKey: GameLibrary.playSecondsKey)
+        }
+        folderBytes[id] = nil
         var off = shaderCacheOff
         if off.remove(id) != nil {
             UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
@@ -1314,4 +1335,113 @@ enum GameResolutionDefault {
         }
         return saved ? "" : arguments(width: width, height: height)
     }
+}
+
+// MARK: - Favourites, play time, sizes (ml893)
+
+extension GameLibrary {
+    static let favoritesKey = "madeira.launcher.favorites"
+    static let playSecondsKey = "madeira.launcher.playSeconds"
+
+    func isFavorite(_ id: String) -> Bool { favorites.contains(id) }
+
+    /// Pin a game to the top of the Games tab, or unpin it. Main thread.
+    func toggleFavorite(_ id: String) {
+        var f = favorites
+        if f.remove(id) == nil { f.insert(id) }
+        favorites = f
+        UserDefaults.standard.set(f.sorted(), forKey: GameLibrary.favoritesKey)
+    }
+
+    /// "3 h 20 min" / "12 min"; nil under a minute.
+    static func playTimeText(_ seconds: Double) -> String? {
+        let minutes = Int(seconds / 60)
+        guard minutes > 0 else { return nil }
+        let h = minutes / 60, m = minutes % 60
+        if h == 0 { return "\(m) min" }
+        return m == 0 ? "\(h) h" : "\(h) h \(m) min"
+    }
+
+    /// The game is on screen from now on (ContentView: the session is
+    /// playing). Its time is added every minute and when it ends, so an app
+    /// that is killed loses at most a minute. Main thread.
+    func beginPlaying(_ id: String) {
+        guard PlayClock.id != id else { return }
+        endPlaying()
+        observeAppStateOnce()
+        PlayClock.id = id
+        PlayClock.since = Date()
+        PlayClock.timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.addPlayedTime()
+        }
+    }
+
+    /// The clock stops while Madeira is in the background (the game is frozen
+    /// then), so a phone left locked mid-game adds nothing.
+    private func observeAppStateOnce() {
+        guard !PlayClock.observing else { return }
+        PlayClock.observing = true
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.addPlayedTime()
+            PlayClock.since = nil
+        }
+        nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { _ in
+            if PlayClock.id != nil { PlayClock.since = Date() }
+        }
+    }
+
+    /// The game ended (or the app is going away). Main thread.
+    func endPlaying() {
+        addPlayedTime()
+        PlayClock.timer?.invalidate()
+        PlayClock.timer = nil
+        PlayClock.id = nil
+        PlayClock.since = nil
+    }
+
+    private func addPlayedTime() {
+        guard let id = PlayClock.id, let since = PlayClock.since else { return }
+        let now = Date()
+        PlayClock.since = now
+        let add = now.timeIntervalSince(since)
+        guard add > 0, add < 24 * 3600 else { return }
+        playSeconds[id, default: 0] += add
+        UserDefaults.standard.set(playSeconds, forKey: GameLibrary.playSecondsKey)
+    }
+
+    /// Measure the folder of every game not measured yet, off the main thread
+    /// (a big game is tens of thousands of files). Games whose folder is not
+    /// their own have no size.
+    func measureSizes() {
+        let todo: [(String, URL)] = games.compactMap { g in
+            guard folderBytes[g.id] == nil, !SizeJobs.running.contains(g.id),
+                  let f = sizeFolder(for: g) else { return nil }
+            return (g.id, f)
+        }
+        guard !todo.isEmpty else { return }
+        for (id, _) in todo { SizeJobs.running.insert(id) }
+        DispatchQueue.global(qos: .utility).async {
+            for (id, folder) in todo {
+                let bytes = ShaderCache.sizeBytes(of: folder)
+                DispatchQueue.main.async {
+                    SizeJobs.running.remove(id)
+                    self.folderBytes[id] = bytes
+                }
+            }
+        }
+    }
+}
+
+/// ml893: the running game's play clock (main thread only).
+private enum PlayClock {
+    static var id: String?
+    static var since: Date?
+    static var timer: Timer?
+    static var observing = false
+}
+
+/// ml893: folders being measured (main thread only).
+private enum SizeJobs {
+    static var running: Set<String> = []
 }

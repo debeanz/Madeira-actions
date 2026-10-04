@@ -34,6 +34,7 @@ enum FocusArea { case topBar, grid, card }
 
 enum Activation: Equatable {
     case addGame, refresh, desktop
+    case search, sort   // ml893
     case play(String)
     case more(String)
     case options(String)
@@ -118,11 +119,13 @@ final class GamesFocus: ObservableObject {
         case .topBar:
             switch action {
             case .left:  topIndex = max(0, topIndex - 1)
-            case .right: topIndex = min(1, topIndex + 1)   // ml834: Add game, Refresh
+            case .right: topIndex = min(3, topIndex + 1)   // ml893: Search, Sort, Add game, Refresh
             case .down:  if gameCount > 0 { area = .grid }
             case .select:
                 switch topIndex {
-                case 0: fire(.addGame)
+                case 0: fire(.search)
+                case 1: fire(.sort)
+                case 2: fire(.addGame)
                 default: fire(.refresh)
                 }
             case .back:  if gameCount > 0 { area = .grid }
@@ -307,6 +310,14 @@ struct LauncherView: View {
     @State private var renameText: String = ""
     @State private var showAddGame: Bool = false
     @State private var refreshSpin: Bool = false
+    /// ml893: the search field (open or not) and what it filters by.
+    @State private var searching: Bool = false
+    @State private var searchText: String = ""
+    @FocusState private var searchFocused: Bool
+    /// ml893: the grid's order (LibrarySort raw value); favourites always lead.
+    @AppStorage("madeira.launcher.sort") private var sortRaw: String = "name"
+    /// ml893: "Sorted by name" in the status line for a moment.
+    @State private var sortToast: String? = nil
 
     init(session: LauncherSession,
          onPlay: @escaping (LauncherGame) -> Void,
@@ -393,8 +404,11 @@ struct LauncherView: View {
     private func mainColumn(columns: Int, wide: Bool) -> some View {
         VStack(spacing: 0) {
             topBar
+            if searching { searchRow }   // ml893
             if library.games.isEmpty {
                 emptyState
+            } else if orderedGames.isEmpty {
+                noMatches
             } else {
                 grid(columns: columns, horizontal: wide)
             }
@@ -419,6 +433,7 @@ struct LauncherView: View {
         .onAppear {
             focus.sync(games: orderedGames)
             focus.active = !overlayPresented
+            if sort == .size { library.measureSizes() }   // ml893: sizes are measured per run
             refreshSpin = library.scanning
             library.rescanIfStale()
         }
@@ -426,6 +441,11 @@ struct LauncherView: View {
             focus.active = false
         }
         .onChange(of: library.games) { _, _ in
+            focus.sync(games: orderedGames)
+            if sort == .size { library.measureSizes() }   // ml893: new games get a size too
+        }
+        // ml893: search, sort and favourites reorder the grid too.
+        .onChange(of: orderedGames.map { $0.id }) { _, _ in
             focus.sync(games: orderedGames)
         }
         .onChange(of: focus.openedID) { _, id in
@@ -537,6 +557,10 @@ struct LauncherView: View {
             showAddGame = true
         case .refresh:
             library.rescan()
+        case .search:
+            toggleSearch()
+        case .sort:
+            cycleSort()
         case .desktop:
             onOpenDesktop()
         case .play(let id):
@@ -565,13 +589,24 @@ struct LauncherView: View {
                 .font(.title2.weight(.bold))
                 .foregroundStyle(.white)
             Spacer(minLength: 8)
-            TopPill(systemImage: "plus.circle", label: "Add game",
+            // ml893: search the library, and change its order.
+            TopPill(systemImage: "magnifyingglass", label: "Search",
                     focused: focus.area == .topBar && focus.topIndex == 0,
+                    spinning: false) {
+                toggleSearch()
+            }
+            TopPill(systemImage: "arrow.up.arrow.down", label: "Sort",
+                    focused: focus.area == .topBar && focus.topIndex == 1,
+                    spinning: false) {
+                cycleSort()
+            }
+            TopPill(systemImage: "plus.circle", label: "Add game",
+                    focused: focus.area == .topBar && focus.topIndex == 2,
                     spinning: false) {
                 showAddGame = true
             }
             TopPill(systemImage: "arrow.clockwise", label: "Refresh",
-                    focused: focus.area == .topBar && focus.topIndex == 1,
+                    focused: focus.area == .topBar && focus.topIndex == 3,
                     spinning: refreshSpin) {
                 library.rescan()
             }
@@ -588,8 +623,35 @@ struct LauncherView: View {
     /// highlighted cover drawn larger); portrait = the vertical grid.
     /// Left/right browse either; A opens the card.
     /// ml798: the game being played comes first so it is easy to find.
+    /// ml893: then the favourites, each group in the chosen order, filtered by
+    /// the search text. library.games is already by name.
     private var orderedGames: [LauncherGame] {
         var g: [LauncherGame] = library.games
+        let query: String = searchText.trimmingCharacters(in: .whitespaces)
+        if !query.isEmpty {
+            g = g.filter { $0.title.localizedCaseInsensitiveContains(query) }
+        }
+        switch sort {
+        case .name:
+            break
+        case .recent:
+            g.sort { a, b in
+                let ta: Date = a.lastPlayed ?? Date.distantPast
+                let tb: Date = b.lastPlayed ?? Date.distantPast
+                if ta != tb { return ta > tb }
+                return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+            }
+        case .size:
+            let bytes: [String: Int64] = library.folderBytes
+            g.sort { a, b in
+                let sa: Int64 = bytes[a.id] ?? -1
+                let sb: Int64 = bytes[b.id] ?? -1
+                if sa != sb { return sa > sb }
+                return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+            }
+        }
+        let favs: Set<String> = library.favorites
+        g = g.filter { favs.contains($0.id) } + g.filter { !favs.contains($0.id) }
         if case .playing(let t) = session, let i = g.firstIndex(where: { $0.title == t }), i > 0 {
             let playing = g.remove(at: i)
             g.insert(playing, at: 0)
@@ -600,6 +662,75 @@ struct LauncherView: View {
     private func isPlaying(_ game: LauncherGame) -> Bool {
         if case .playing(let t) = session { return t == game.title }
         return false
+    }
+
+    // MARK: Search and sort (ml893)
+
+    private var sort: LibrarySort { LibrarySort(rawValue: sortRaw) ?? .name }
+
+    private func toggleSearch() {
+        if searching {
+            searching = false
+            searchText = ""
+            searchFocused = false
+        } else {
+            searching = true
+            DispatchQueue.main.async { searchFocused = true }   // once the field exists
+        }
+    }
+
+    private func cycleSort() {
+        let next: LibrarySort = sort.next
+        sortRaw = next.rawValue
+        if next == .size { library.measureSizes() }
+        let text: String = "Sorted by " + next.label
+        sortToast = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            if sortToast == text { sortToast = nil }
+        }
+    }
+
+    private var searchRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(LauncherPalette.textSecondary)
+            TextField("Search games", text: $searchText)
+                .focused($searchFocused)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .onSubmit { searchFocused = false }
+                .foregroundStyle(.white)
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(LauncherPalette.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 38)
+        .background(LauncherPalette.panel, in: Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(0.08), lineWidth: 1))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 6)
+    }
+
+    private var noMatches: some View {
+        VStack(spacing: 10) {
+            Spacer(minLength: 0)
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 34))
+                .foregroundStyle(.white.opacity(0.35))
+            Text("No games match \"\(searchText)\"")
+                .font(.headline)
+                .foregroundStyle(.white)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func grid(columns: Int, horizontal: Bool) -> some View {
@@ -629,6 +760,7 @@ struct LauncherView: View {
                         icon: library.icons[game.id],
                         loading: covers.state[game.id] == .loading,
                         only32Bit: game.only32Bit,
+                        favorite: library.favorites.contains(game.id),
                         focused: highlighted)
             .equatable()
             .overlay(alignment: .topTrailing) {
@@ -753,6 +885,7 @@ struct LauncherView: View {
                         icon: library.icons[id],
                         loading: covers.state[id] == .loading,
                         playState: playState,
+                        playSeconds: library.playSeconds[id] ?? 0,
                         focusedIndex: focusedIndex,
                         panelWidth: panelW,
                         coverWidth: coverW,
@@ -766,6 +899,7 @@ struct LauncherView: View {
     // MARK: Status line
 
     private var statusText: String {
+        if let toast = sortToast { return toast }   // ml893
         switch session {
         case .idle:
             if let name = pad.controllerName {
@@ -793,6 +927,29 @@ struct LauncherView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             .background(LauncherPalette.bgBottom.opacity(0.85))
+    }
+}
+
+// MARK: - Library order (ml893)
+
+/// The Games tab's order; favourites always come first.
+private enum LibrarySort: String, CaseIterable {
+    case name, recent, size
+
+    var label: String {
+        switch self {
+        case .name:   return "name"
+        case .recent: return "recently played"
+        case .size:   return "size"
+        }
+    }
+
+    var next: LibrarySort {
+        switch self {
+        case .name:   return .recent
+        case .recent: return .size
+        case .size:   return .name
+        }
     }
 }
 
@@ -948,11 +1105,13 @@ private struct GameTile: View, Equatable {
     let icon: UIImage?
     let loading: Bool
     let only32Bit: Bool
+    let favorite: Bool   // ml893
     let focused: Bool
 
     static func == (a: GameTile, b: GameTile) -> Bool {
         a.id == b.id && a.title == b.title && a.cover === b.cover && a.icon === b.icon
-            && a.loading == b.loading && a.only32Bit == b.only32Bit && a.focused == b.focused
+            && a.loading == b.loading && a.only32Bit == b.only32Bit && a.favorite == b.favorite
+            && a.focused == b.focused
     }
 
     var body: some View {
@@ -967,6 +1126,16 @@ private struct GameTile: View, Equatable {
                             .padding(.vertical, 2)
                             .background(LauncherPalette.danger.opacity(0.9), in: Capsule())
                             .foregroundStyle(.white)
+                            .padding(6)
+                    }
+                }
+                .overlay(alignment: .topLeading) {
+                    if favorite {   // ml893
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.yellow)
+                            .padding(5)
+                            .background(Color.black.opacity(0.55), in: Circle())
                             .padding(6)
                     }
                 }
@@ -1007,6 +1176,8 @@ private struct GameCard: View {
     let icon: UIImage?
     let loading: Bool
     let playState: CardPlayState
+    /// ml893: time played, all sessions.
+    let playSeconds: Double
     /// 0 = Play, 1 = More; nil while the card is not the focused area.
     let focusedIndex: Int?
     let panelWidth: CGFloat
@@ -1054,6 +1225,9 @@ private struct GameCard: View {
         if let played = game.lastPlayed {
             let rel = RelativeDateTimeFormatter().localizedString(for: played, relativeTo: Date())
             line = line + Text("  ·  Last played \(rel)")
+        }
+        if let total = GameLibrary.playTimeText(playSeconds) {   // ml893
+            line = line + Text("  ·  Played \(total)")
         }
         if game.only32Bit {
             line = line + Text("  ·  ") + Text("32-bit — not supported").foregroundStyle(LauncherPalette.danger)
@@ -1315,6 +1489,12 @@ private struct OptionsSheet: View {
                                  dismiss()
                                  onPlay(g)
                              }))
+        // ml893: pinned to the top of the Games tab.
+        let favorite: Bool = library.isFavorite(g.id)
+        out.append(OptionRow(id: "favorite", title: favorite ? "Remove from Favourites" : "Add to Favourites",
+                             systemImage: favorite ? "star.slash" : "star",
+                             destructive: false, checked: false,
+                             action: { library.toggleFavorite(g.id) }))
         if g.candidates.count > 1 {
             out.append(OptionRow(id: "exe", title: "Change executable", systemImage: "doc.badge.gearshape",
                                  destructive: false, checked: false,
@@ -1943,7 +2123,14 @@ private struct OptionsSheet: View {
                 return ("Remove from library", path, reason)
             }
         }
-        return (g.title, g.exeWindowsPath, deleteError ?? sizeNote(g))
+        return (g.title, g.exeWindowsPath, deleteError ?? infoNote(g))
+    }
+
+    /// ml893: the size and the time played, under the game's path.
+    private func infoNote(_ g: LauncherGame) -> String? {
+        let played: String? = GameLibrary.playTimeText(library.playSeconds[g.id] ?? 0).map { "Played " + $0 }
+        let parts: [String] = [sizeNote(g), played].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     /// ml862: "Size: 1.2 GB" under the game's path, or nil when the game's folder

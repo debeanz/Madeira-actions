@@ -1619,6 +1619,7 @@ struct ContentView: View {
     @State private var showActivityLogs = false
     @State private var showRuntimeStatus = false
     @State private var prefixSizeText = "Calculating…"
+    @State private var freeSpaceText = "Calculating…"   // ml893: System status
     @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
@@ -1677,7 +1678,7 @@ struct ContentView: View {
     }
 
     private enum MadeiraTab: Hashable {
-        case games, containers, desktop, settings
+        case games, desktop, settings   // ml893: the Containers tab is gone
     }
 
     var body: some View {
@@ -1695,9 +1696,6 @@ struct ContentView: View {
                     launcherScreen
                         .tabItem { Label("Games", systemImage: "gamecontroller.fill") }
                         .tag(MadeiraTab.games)
-                    containersScreen
-                        .tabItem { Label("Containers", systemImage: "shippingbox.fill") }
-                        .tag(MadeiraTab.containers)
                     Group {
                         if selectedTab == .desktop {
                             activityScreen
@@ -1885,6 +1883,12 @@ struct ContentView: View {
             }
             touchControls.setGame(id)
             GamepadBridge.shared.setGame(id)
+            // ml893: hours played run from the game's start to its end.
+            if case .playing = s, let id {
+                GameLibrary.shared.beginPlaying(id)
+            } else if id == nil {
+                GameLibrary.shared.endPlaying()
+            }
         }
     }
 
@@ -2682,93 +2686,84 @@ struct ContentView: View {
         return "Ready"
     }
 
-    private var containersScreen: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 18) {
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack(alignment: .top) {
-                            Image(systemName: "shippingbox.fill")
-                                .font(.title2)
-                                .foregroundStyle(.indigo)
-                                .frame(width: 52, height: 52)
-                                .background(.indigo.opacity(0.1), in: RoundedRectangle(cornerRadius: 16))
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Default")
-                                    .font(.title3.bold())
-                                Text("Windows 64-bit · DXMT")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Text("READY")
-                                .font(.caption2.bold())
-                                .foregroundStyle(.green)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 6)
-                                .background(.green.opacity(0.11), in: Capsule())
-                        }
-                        Divider()
-                        containerDetail("Translation", value: "FEX · ARM64EC", icon: "arrow.triangle.2.circlepath")
-                        containerDetail("Graphics", value: "DXMT · Metal", icon: "sparkles.rectangle.stack")
-                        containerDetail("Storage", value: prefixSizeText, icon: "internaldrive")
-                        containerDetail("Prefix", value: "Documents/wine", icon: "folder")
-                        Button {
-                            openDocumentsInFiles()
-                        } label: {
-                            Label("Open Madeira in Files", systemImage: "folder.badge.gearshape")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    .padding(18)
-                    .background(Color(uiColor: .secondarySystemGroupedBackground),
-                                in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    // MARK: System status (ml893)
 
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Runtime components").font(.headline)
-                        dependencyRow("Visual C++ runtime", detail: "Provided by the prefix", available: true)
-                        Divider()
-                        dependencyRow("Wine Mono",
-                                      detail: Self.bundledMonoVersion.map { "Bundled runtime \($0) (.NET Framework games)" }
-                                              ?? "Not in this build — .NET games cannot start",
-                                      available: Self.bundledMonoVersion != nil)
-                    }
-                    .padding(18)
-                    .background(Color(uiColor: .secondarySystemGroupedBackground),
-                                in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    private enum StatusLevel { case good, bad, neutral }
+
+    /// What decides whether games run, on one page: JIT, StikDebug, the memory
+    /// entitlements and storage. Also what the removed Containers tab showed:
+    /// Madeira's size, Wine Mono and Open Madeira in Files.
+    private var systemStatusScreen: some View {
+        let attached: Bool = isDebuggerAttached()
+        let jitOn: Bool = StikJITHelper.poolReady || attached
+        let ents: EntitlementStatus = entitlements ?? EntitlementStatus.check()
+        return List {
+            Section("JIT") {
+                statusRow("JIT", value: jitOn ? "On" : "Off", level: jitOn ? .good : .bad,
+                          note: jitOn ? nil : "Open Madeira from StikDebug to turn it on.")
+                statusRow("StikDebug",
+                          value: attached ? "Attached"
+                                 : (StikJITHelper.poolReady ? "Done, JIT kept" : "Not attached"),
+                          level: (attached || StikJITHelper.poolReady) ? .good : .bad, note: nil)
+            }
+            Section("Memory") {
+                statusRow("Increased memory limit", value: ents.increasedMemory ? "Yes" : "No",
+                          level: ents.increasedMemory ? .good : .bad,
+                          note: ents.increasedMemory ? nil : "Big games may be closed by iOS without it.")
+                statusRow("Extended virtual addressing", value: ents.extendedVA ? "Yes" : "No",
+                          level: ents.extendedVA ? .good : .neutral,
+                          note: ents.extendedVA ? nil : "Optional. GetMoreRam can add it.")
+            }
+            Section("Storage") {
+                LabeledContent("Free on this device", value: freeSpaceText)
+                LabeledContent("Used by Madeira", value: prefixSizeText)
+                Button {
+                    openDocumentsInFiles()
+                } label: {
+                    Label("Open Madeira in Files", systemImage: "folder")
                 }
-                .padding()
             }
-            .background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("Containers")
-            .task { calculatePrefixSize() }
+            Section("Runtime") {
+                LabeledContent("Madeira", value: Self.appVersionText)
+                LabeledContent("Translation", value: "FEX · ARM64EC")
+                LabeledContent("Graphics", value: "DXMT · Metal")
+                LabeledContent("Wine Mono", value: Self.bundledMonoVersion ?? "Not in this build")
+            }
+        }
+        .navigationTitle("System status")
+        .task {
+            calculatePrefixSize()
+            calculateFreeSpace()
         }
     }
 
-    private func dependencyRow(_ title: String, detail: String, available: Bool) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: available ? "checkmark.circle.fill" : "arrow.down.circle")
-                .foregroundStyle(available ? .green : .secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.subheadline.bold())
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+    private func statusRow(_ title: String, value: String, level: StatusLevel, note: String?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 10) {
+                Image(systemName: level == .good ? "checkmark.circle.fill"
+                                  : (level == .bad ? "exclamationmark.circle.fill" : "minus.circle"))
+                    .foregroundStyle(level == .good ? Color.green : (level == .bad ? Color.orange : Color.secondary))
+                Text(title)
+                Spacer(minLength: 8)
+                Text(value)
+                    .foregroundStyle(.secondary)
             }
-            Spacer()
+            if let note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
-    private func containerDetail(_ title: String, value: String, icon: String) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .foregroundStyle(.secondary)
-                .frame(width: 24)
-            Text(title)
-            Spacer()
-            Text(value)
-                .foregroundStyle(.secondary)
+    private func calculateFreeSpace() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let values = try? docs.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        if let bytes = values?.volumeAvailableCapacityForImportantUsage {
+            freeSpaceText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        } else {
+            freeSpaceText = "Unknown"
         }
-        .font(.subheadline)
     }
 
     private var activityScreen: some View {
@@ -3115,6 +3110,20 @@ struct ContentView: View {
     private var settingsScreen: some View {
         NavigationStack {
             Form {
+                // ml893: JIT, StikDebug, memory and storage at a glance.
+                Section {
+                    NavigationLink {
+                        systemStatusScreen
+                    } label: {
+                        HStack {
+                            Label("System status", systemImage: "checkmark.shield")
+                            Spacer()
+                            Text(StikJITHelper.poolReady || isDebuggerAttached() ? "JIT on" : "JIT off")
+                                .foregroundStyle(StikJITHelper.poolReady || isDebuggerAttached() ? Color.green : Color.orange)
+                        }
+                    }
+                }
+
                 Section("Input") {
                     Picker("Pointer mode", selection: $input.relative) {
                         Text("Absolute").tag(false)
