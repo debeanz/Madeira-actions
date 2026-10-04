@@ -1853,8 +1853,8 @@ struct ContentView: View {
     /// ml829/ml830: DXMT shader cache on/off for every game (Settings → DXMT Renderer).
     /// ON by default; each game also has its own switch in its ⋯ menu.
     @AppStorage(ShaderCache.key) private var shaderCacheEnabled = true
-    /// ml912: MetalFX upscaling for Direct3D 11 games (off by default).
-    @AppStorage(GraphicsProbe.metalFXKey) private var metalFXEnabled = false
+    /// ml913: MetalFX upscaling multiplier for Direct3D 11 games, 1 = off (default).
+    @AppStorage(GraphicsProbe.metalFXKey) private var metalFXScale: Double = 1.0
     @State private var shaderCacheSizeText = "…"
     /// MADEIRA_DEBUG_VERBOSE=1: full WINEDEBUG trace (WineProcessBridge.m).
     @AppStorage("madeira.wineVerbose") private var wineVerbose = false
@@ -2259,16 +2259,23 @@ struct ContentView: View {
         // ml912: MetalFX upscaling for a Direct3D 11 game, by the factor that makes
         // its resolution fill the screen (at most 2x). Nothing at about 1x: the
         // game already renders at screen size.
+        // ml913: the chosen multiplier, never past what fills the screen.
         var metalFXFactor: Double? = nil
-        if perGame.metalFX ?? metalFXEnabled, GameLibrary.shared.drawsWithDirect3D11(game) {
+        let chosenFX: Double = GraphicsProbe.snap(perGame.metalFXScale ?? GraphicsProbe.savedScale)
+        if chosenFX >= 1.05, GameLibrary.shared.drawsWithDirect3D11(game) {
             let native: CGSize = UIScreen.main.nativeBounds.size
             let screenLong: Double = Double(max(native.width, native.height))
             let screenShort: Double = Double(min(native.width, native.height))
             let fit: Double = min(screenLong / Double(screenW0), screenShort / Double(screenH0))
-            let factor: Double = min(max(fit, 1.0), 2.0)
-            if factor >= 1.1 { metalFXFactor = (factor * 100).rounded(.down) / 100 }
+            let fitDown: Double = (fit * 100).rounded(.down) / 100
+            let factor: Double = min(chosenFX, max(fitDown, 1.0))
+            if factor >= 1.05 { metalFXFactor = factor }
             if let f = metalFXFactor {
-                logStore.log("Games: " + game.title + " — MetalFX upscaling x" + String(format: "%.2f", f) + " to the screen")
+                var line: String = "Games: " + game.title + " — MetalFX upscaling x" + String(format: "%.2f", f)
+                if f < chosenFX {
+                    line += ", the most that fits the screen (" + String(format: "%.1f", chosenFX) + "x picked)"
+                }
+                logStore.log(line)
             } else {
                 logStore.log("Games: " + game.title + " — MetalFX skipped: \(screenW0)x\(screenH0) already fills the screen")
             }
@@ -3493,9 +3500,19 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     // ml912
-                    Toggle("MetalFX upscaling", isOn: $metalFXEnabled)
-                        .disabled(runtimeInUse)   // launch-only
-                    Text("DirectX 11 games only. The game renders at its resolution and Apple's MetalFX upscales the picture to fill the screen, sharper than a plain stretch. Pick a lower resolution for more speed. A game's ⋯ menu can change it for that game. Applies the next time a game starts.")
+                    // ml913: a multiplier, 1x (off) by default
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("MetalFX upscaling")
+                            Spacer()
+                            Text(GraphicsProbe.scaleText(metalFXScale))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(value: $metalFXScale, in: 1.0...2.0, step: 0.1)
+                    }
+                    .disabled(runtimeInUse)   // launch-only
+                    Text("DirectX 11 games only. 1\u{00D7} is off. Higher makes the picture sharper and costs a little more GPU time; past what fills your screen it adds nothing. A lower game resolution is where the speed comes from. A game's ⋯ menu can change it for that game. Applies the next time a game starts.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

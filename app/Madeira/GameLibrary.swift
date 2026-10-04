@@ -89,12 +89,13 @@ struct GameSettings: Codable, Equatable {
     /// filled in when its switch was turned on. Only a picked one is asked of
     /// a Unity game on EVERY launch (ml849); a filled one is just its screen.
     var resolutionChosen: Bool? = nil
-    /// ml912: MetalFX upscaling (Direct3D 11 games only, see GraphicsProbe).
-    var metalFX: Bool? = nil
+    /// ml913: MetalFX upscaling multiplier, 1 = off (Direct3D 11 games only,
+    /// see GraphicsProbe). ml912's on/off `metalFX` is simply not decoded.
+    var metalFXScale: Double? = nil
 
     var isEmpty: Bool {
         resolution == nil && noTSO == nil && frameCap == nil && scaling == nil && shaderCache == nil
-            && resolutionChosen == nil && metalFX == nil
+            && resolutionChosen == nil && metalFXScale == nil
     }
 
     /// The resolutions Settings offers; the per-game row cycles the same list.
@@ -332,6 +333,7 @@ final class GameLibrary: ObservableObject {
     /// the default -- Settings' to 1920x1080, a game's own to Default.
     /// ml901: the same for a frame cap no longer offered (120 fps, uncapped):
     /// Settings' goes back to 60 fps, a game's own to Default.
+    /// ml913: Settings' MetalFX switch becomes the multiplier.
     private static func dropRemovedValues() {
         let defaults = UserDefaults.standard
         let offered = Set(GameSettings.resolutionOptions)
@@ -340,6 +342,14 @@ final class GameLibrary: ObservableObject {
         }
         if let c = defaults.object(forKey: FrameCap.key) as? Int, FrameCap(rawValue: Int32(c)) == nil {
             defaults.removeObject(forKey: FrameCap.key)
+        }
+        // ml913: ml912's MetalFX switch: on was "fill the screen", which the
+        // slider's 2x gives (it never goes past what fills the screen).
+        if defaults.object(forKey: "madeira.metalFX") != nil {
+            if defaults.bool(forKey: "madeira.metalFX"), defaults.object(forKey: GraphicsProbe.metalFXKey) == nil {
+                defaults.set(2.0, forKey: GraphicsProbe.metalFXKey)
+            }
+            defaults.removeObject(forKey: "madeira.metalFX")
         }
         var all = loadGameSettings()
         var changed = false
@@ -458,7 +468,7 @@ final class GameLibrary: ObservableObject {
             if replace || s.frameCap == nil { s.frameCap = Int(FrameCap.saved.rawValue) }
             if replace || s.scaling == nil { s.scaling = ScreenScaling.saved.rawValue }
             if replace || s.shaderCache == nil { s.shaderCache = ShaderCache.enabled }
-            if replace || s.metalFX == nil { s.metalFX = d.bool(forKey: GraphicsProbe.metalFXKey) }   // ml912
+            if replace || s.metalFXScale == nil { s.metalFXScale = GraphicsProbe.savedScale }   // ml913
         }
         TouchControlsModel.shared.fillOwnProfile(forGame: id, replace: replace)
         GamepadBridge.shared.fillOwnProfile(forGame: id, replace: replace)
@@ -1621,8 +1631,29 @@ private enum SizeJobs {
 /// that imports d3d11.dll. A library that only names d3d11.dll in a string
 /// (SDL's renderer, for one) does not count.
 enum GraphicsProbe {
-    /// Settings' MetalFX switch (UserDefaults).
-    static let metalFXKey = "madeira.metalFX"
+    /// Settings' MetalFX multiplier (UserDefaults, 1 = off). ml913: a slider
+    /// replaced ml912's on/off switch ("madeira.metalFX").
+    static let metalFXKey = "madeira.metalFXScale"
+
+    /// Settings' multiplier, 1...2 (1 when never set).
+    static var savedScale: Double {
+        snap(UserDefaults.standard.double(forKey: metalFXKey))
+    }
+
+    /// A slider value on its 0.1 steps, 1...2.
+    static func snap(_ x: Double) -> Double {
+        let clamped: Double = min(max(x, 1.0), 2.0)
+        return (clamped * 10).rounded() / 10
+    }
+
+    /// "Off" at 1x, else "1.5x".
+    static func scaleText(_ x: Double) -> String {
+        let v: Double = snap(x)
+        if v < 1.05 { return "Off" }
+        var t: String = String(format: "%.1f", v)
+        if t.hasSuffix(".0") { t.removeLast(2) }
+        return t + "\u{00D7}"
+    }
 
     static func usesDirect3D11(exe: URL) -> Bool {
         let fm = FileManager.default

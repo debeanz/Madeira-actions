@@ -1352,7 +1352,17 @@ private struct OptionRow: Identifiable {
     var switchOn: Bool? = nil
     /// ml903: opens a page of its own.
     var chevron: Bool = false
+    /// ml913: a slider under the title; the pad's left/right step it.
+    var slider: SheetSlider? = nil
     let action: () -> Void
+}
+
+/// ml913: OptionRow.slider (the MetalFX multiplier).
+private struct SheetSlider {
+    let value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let set: (Double) -> Void
 }
 
 /// Controller highlight for a sheet's row list; a class so the overlay
@@ -1362,6 +1372,8 @@ private final class SheetRowsModel: ObservableObject {
     var rowCount: Int = 0
     var onSelect: (Int) -> Void = { _ in }
     var onBack: () -> Void = {}
+    /// ml913: left (-1) / right (+1) on a slider row.
+    var onAdjust: (Int, Int) -> Void = { _, _ in }
 
     func handle(_ action: GamepadNavAction) {
         switch action {
@@ -1371,6 +1383,10 @@ private final class SheetRowsModel: ObservableObject {
             move(1)
         case .select:
             if highlight >= 0 && highlight < rowCount { onSelect(highlight) }
+        case .left:
+            if highlight >= 0 && highlight < rowCount { onAdjust(highlight, -1) }
+        case .right:
+            if highlight >= 0 && highlight < rowCount { onAdjust(highlight, 1) }
         case .back, .menu:
             onBack()
         default:
@@ -1669,15 +1685,20 @@ private struct OptionsSheet: View {
 
         // ml912: only for a game that draws with Direct3D 11, the one API it works for.
         if library.drawsWithDirect3D11(g) {
-            let curFX: Bool = s.metalFX ?? defaults.bool(forKey: GraphicsProbe.metalFXKey)
+            // ml913: a multiplier slider, 1x = off; A steps it up, past 2x back to off
+            let curFX: Double = GraphicsProbe.snap(s.metalFXScale ?? GraphicsProbe.savedScale)
+            let setFX: (Double) -> Void = { v in
+                library.updateSettings(for: id) { $0.metalFXScale = GraphicsProbe.snap(v) }
+            }
             out.append(OptionRow(id: "metalfx", title: "MetalFX upscaling",
                                  systemImage: "sparkles",
                                  destructive: false, checked: false,
-                                 trailing: curFX ? "On" : "Off",
+                                 trailing: GraphicsProbe.scaleText(curFX),
                                  disabled: busy || !own,
-                                 note: "Upscales the picture to the screen, sharper than a plain stretch. Lower the resolution for more speed.",
+                                 note: "1\u{00D7} is off. Higher is sharper and costs a little more GPU time; past what fills the screen it adds nothing.",
+                                 slider: SheetSlider(value: curFX, range: 1.0...2.0, step: 0.1, set: setFX),
                                  action: {
-                                     library.updateSettings(for: id) { $0.metalFX = !curFX }
+                                     setFX(curFX >= 1.95 ? 1.0 : curFX + 0.1)
                                  }))
         }
 
@@ -2061,19 +2082,29 @@ private struct OptionsSheet: View {
         mainRows(current).firstIndex(where: { $0.id == "exe" }) ?? 0
     }
 
+    @ViewBuilder
     private func rowButton(_ row: OptionRow, focused: Bool) -> some View {
         let disabled: Bool = row.disabled
         let action: () -> Void = row.action
-        return Button {
-            if !disabled { action() }
-        } label: {
+        if let sl = row.slider {
+            // ml913: no Button around it, so the slider gets the touches
             SheetRow(title: row.title, systemImage: row.systemImage,
                      destructive: row.destructive, checked: row.checked,
                      focused: focused, subtitle: nil, thumbnail: nil,
                      trailing: row.trailing, disabled: disabled, note: row.note,
-                     radio: row.radio, switchOn: row.switchOn, chevron: row.chevron)
+                     slider: sl)
+        } else {
+            Button {
+                if !disabled { action() }
+            } label: {
+                SheetRow(title: row.title, systemImage: row.systemImage,
+                         destructive: row.destructive, checked: row.checked,
+                         focused: focused, subtitle: nil, thumbnail: nil,
+                         trailing: row.trailing, disabled: disabled, note: row.note,
+                         radio: row.radio, switchOn: row.switchOn, chevron: row.chevron)
+            }
+            .buttonStyle(SheetRowStyle())
         }
-        .buttonStyle(SheetRowStyle())
     }
 
     var body: some View {
@@ -2209,6 +2240,13 @@ private struct OptionsSheet: View {
             } else {
                 dismiss()
             }
+        }
+        model.onAdjust = { i, dir in
+            let list: [OptionRow] = rows
+            guard i >= 0, i < list.count, !list[i].disabled, let sl = list[i].slider else { return }
+            let stepped: Double = sl.value + Double(dir) * sl.step
+            let v: Double = min(max(stepped, sl.range.lowerBound), sl.range.upperBound)
+            if abs(v - sl.value) > 0.001 { sl.set(v) }
         }
     }
 
@@ -2545,11 +2583,13 @@ private struct SheetRow: View {
     /// ml903: an on/off switch (OptionRow.switchOn) and a page chevron.
     var switchOn: Bool? = nil
     var chevron: Bool = false
+    /// ml913: a slider under the row (OptionRow.slider).
+    var slider: SheetSlider? = nil
 
     private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
     var body: some View {
-        content
+        stack
             .transaction { $0.animation = nil }   // ml899: text never slides; only the focus ring animates
             .opacity(disabled ? 0.45 : 1.0)
             .padding(.horizontal, 14)
@@ -2562,6 +2602,27 @@ private struct SheetRow: View {
             .shadow(color: focused ? LauncherPalette.accent.opacity(0.3) : Color.clear, radius: 8)
             .contentShape(shape)
             .animation(.easeOut(duration: 0.12), value: focused)
+    }
+
+    @ViewBuilder
+    private var stack: some View {
+        if let slider {
+            VStack(alignment: .leading, spacing: 6) {
+                content
+                sliderBar(slider)
+            }
+        } else {
+            content
+        }
+    }
+
+    /// ml913: lines up under the title (past the icon's column).
+    private func sliderBar(_ sl: SheetSlider) -> some View {
+        let binding: Binding<Double> = Binding<Double>(get: { sl.value }, set: { sl.set($0) })
+        return Slider(value: binding, in: sl.range, step: sl.step)
+            .tint(LauncherPalette.accent)
+            .disabled(self.disabled)
+            .padding(.leading, 40)
     }
 
     private var content: some View {
