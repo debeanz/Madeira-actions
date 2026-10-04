@@ -3525,7 +3525,9 @@ struct ContentView: View {
                     }
                 }
 
-                Section("Emulation") {
+                // ml908: no Emulation section; Diagnostics (logging for a problem
+                // report) sits in About, above the version a report asks for.
+                Section("About") {
                     NavigationLink("Diagnostics") {
                         List {
                             Section {
@@ -3539,9 +3541,6 @@ struct ContentView: View {
                         }
                         .navigationTitle("Diagnostics")
                     }
-                }
-
-                Section("About") {
                     LabeledContent("Madeira", value: Self.appVersionText)
                     LabeledContent("Device", value: deviceInfo)
                 }
