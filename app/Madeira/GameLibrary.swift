@@ -1640,6 +1640,21 @@ enum GraphicsProbe {
         snap(UserDefaults.standard.double(forKey: metalFXKey))
     }
 
+    /// ml914: the multiplier a launch hands DXMT for a game drawn at
+    /// width x height, nil when MetalFX is not used: the pick, never past what
+    /// fills the screen. Report Compatibility asks the same, so a report says
+    /// what the game ran with.
+    static func launchFactor(pick: Double, width: Int, height: Int, screen: CGSize) -> Double? {
+        let chosen: Double = snap(pick)
+        guard chosen >= 1.05, width > 0, height > 0 else { return nil }
+        let screenLong: Double = Double(max(screen.width, screen.height))
+        let screenShort: Double = Double(min(screen.width, screen.height))
+        let fit: Double = min(screenLong / Double(width), screenShort / Double(height))
+        let fitDown: Double = (fit * 100).rounded(.down) / 100
+        let factor: Double = min(chosen, max(fitDown, 1.0))
+        return factor >= 1.05 ? factor : nil
+    }
+
     /// A slider value on its 0.1 steps, 1...2.
     static func snap(_ x: Double) -> Double {
         let clamped: Double = min(max(x, 1.0), 2.0)

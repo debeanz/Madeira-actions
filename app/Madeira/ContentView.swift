@@ -2264,12 +2264,7 @@ struct ContentView: View {
         let chosenFX: Double = GraphicsProbe.snap(perGame.metalFXScale ?? GraphicsProbe.savedScale)
         if chosenFX >= 1.05, GameLibrary.shared.drawsWithDirect3D11(game) {
             let native: CGSize = UIScreen.main.nativeBounds.size
-            let screenLong: Double = Double(max(native.width, native.height))
-            let screenShort: Double = Double(min(native.width, native.height))
-            let fit: Double = min(screenLong / Double(screenW0), screenShort / Double(screenH0))
-            let fitDown: Double = (fit * 100).rounded(.down) / 100
-            let factor: Double = min(chosenFX, max(fitDown, 1.0))
-            if factor >= 1.05 { metalFXFactor = factor }
+            metalFXFactor = GraphicsProbe.launchFactor(pick: chosenFX, width: screenW0, height: screenH0, screen: native)
             if let f = metalFXFactor {
                 var line: String = "Games: " + game.title + " — MetalFX upscaling x" + String(format: "%.2f", f)
                 if f < chosenFX {

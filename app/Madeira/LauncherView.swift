@@ -3488,7 +3488,17 @@ struct ReportSheet: View {
         let resolution = s.resolution ?? (UserDefaults.standard.string(forKey: "madeira.desktopResolution") ?? GameResolutionDefault.settingDefault)
         let noTSO = s.noTSO ?? UserDefaults.standard.bool(forKey: "madeira.fexNoTSO")
         let cap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
-        settings = ["resolution": resolution, "x86MemoryOrdering": !noTSO, "frameCap": cap.label]
+        var info: [String: Any] = ["resolution": resolution, "x86MemoryOrdering": !noTSO, "frameCap": cap.label]
+        // ml914: MetalFX only when the game runs with it (DirectX 11, above 1x,
+        // a resolution that doesn't already fill the screen), as the launch decides.
+        if GameLibrary.shared.drawsWithDirect3D11(game), let size = GameSettings.size(resolution) {
+            let pick: Double = s.metalFXScale ?? GraphicsProbe.savedScale
+            let screen: CGSize = UIScreen.main.nativeBounds.size
+            if let fx = GraphicsProbe.launchFactor(pick: pick, width: size.w, height: size.h, screen: screen) {
+                info["metalFX"] = NSDecimalNumber(string: String(format: "%.2f", fx))
+            }
+        }
+        settings = info
         let version = ContentView.appVersionText.split(separator: " ").first.map(String.init) ?? ContentView.appVersionText
         autoLine = "Madeira \(version) · \(GameLogSaver.deviceModel) · iOS \(UIDevice.current.systemVersion) · "
             + resolution.replacingOccurrences(of: "x", with: "×")
