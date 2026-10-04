@@ -1502,9 +1502,9 @@ private struct OptionsSheet: View {
         }
     }
 
-    /// ml903: the menu in sections -- the game itself, its settings, logs and
-    /// reports, storage -- after Play (Force close while it runs) and the
-    /// favourite star.
+    /// ml903: Play (Force close while it runs), the favourite star and the
+    /// game's own rows (executable, name, cover) with no title, then the
+    /// sections Settings, Logs and reports, Storage.
     private func mainRows(_ g: LauncherGame) -> [OptionRow] {
         var out: [OptionRow] = []
         let canPlay = !g.only32Bit && !isEnded
@@ -1559,8 +1559,7 @@ private struct OptionsSheet: View {
                                           dismiss()
                                       }))
         }
-        gameRows[0].section = "Game"
-        out.append(contentsOf: gameRows)
+        out.append(contentsOf: gameRows)   // ml904: no "Game" title, right under the favourite star
 
         out.append(contentsOf: settingsRows(g))
 
