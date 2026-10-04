@@ -5,6 +5,7 @@ import QuartzCore
 import Combine
 import Metal
 import os.log
+import UniformTypeIdentifiers
 
 // 2026-07-03 window-hosted Metal layer.
 //
@@ -3162,6 +3163,17 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                        // ml894: how see-through the buttons are in play
+                        if touchControls.choice != .off {
+                            HStack {
+                                Text("Opacity")
+                                Slider(value: $touchControls.opacity, in: 0.2...1.0)
+                                Text("\(Int((touchControls.opacity * 100).rounded()))%")
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                                    .frame(width: 44, alignment: .trailing)
+                            }
+                        }
                     }
                     .padding(.vertical, 4)
                     Button {
@@ -5644,6 +5656,11 @@ final class TouchControlsModel: ObservableObject {
     /// first controller button or take its last away; the pad follows when
     /// editing ends, not per edit.
     @Published var editing = false              { didSet { if oldValue && !editing { pushPadConnected() } } }
+    /// ml894: a physical controller is connected (and Use controller is on):
+    /// the touch controls step aside until it is unplugged. GamepadBridge sets it.
+    @Published private(set) var controllerHides = false
+    /// ml894: how see-through the touch controls are in play (0.2-1).
+    @Published var opacity: Double = 1 { didSet { persist() } }
     @Published var selected: UUID?              // transient
     /// ml827: the loading / "Closing game…" panel is up (ContentView.showLaunchOverlay).
     /// The controls, toolbar and performance HUD wait for the game's first frame.
@@ -5703,6 +5720,7 @@ final class TouchControlsModel: ObservableObject {
         var mode: String?
         var padControls: [TouchControl]?
         var games: [String: GameControlsProfile]?
+        var opacity: Double?   // ml894: one value for every layout
     }
 
     /// ml886: per-game profiles, and the default controls while a game's own
@@ -5728,6 +5746,7 @@ final class TouchControlsModel: ObservableObject {
             }
             visible  = s.visible
             profiles = s.games ?? [:]
+            opacity  = min(max(s.opacity ?? 1, 0.2), 1)
         } else {
             // ml889: nothing saved yet (a first install): the Xbox controller
             // preset is on. The keyboard layout is seeded when first picked.
@@ -5793,6 +5812,135 @@ final class TouchControlsModel: ObservableObject {
     /// ml886: whether the running game has controls of its own.
     var gameHasOwnControls: Bool { gameID.map { profiles[$0] != nil } ?? false }
 
+    // MARK: ml894 controller, presets, layout files
+
+    func setPhysicalController(_ present: Bool) {
+        guard present != controllerHides else { return }
+        controllerHides = present
+        LogStore.shared.log("[controls] ml894 touch controls " +
+                            (present ? "hidden: a controller is connected" : "back: no controller"))
+        pushPadConnected()
+    }
+
+    /// Ready-made keyboard layouts (the editor's layout menu).
+    enum KeyboardPreset: String, CaseIterable, Identifiable {
+        case pc, platformer, shooter, pointAndClick
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .pc:            return "PC (default)"
+            case .platformer:    return "Platformer"
+            case .shooter:       return "Shooter"
+            case .pointAndClick: return "Point and click"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .pc:            return "keyboard"
+            case .platformer:    return "figure.run"
+            case .shooter:       return "scope"
+            case .pointAndClick: return "cursorarrow.click"
+            }
+        }
+    }
+
+    /// Put a preset in place of the keyboard layout (the running game's own,
+    /// like any edit).
+    func applyPreset(_ p: KeyboardPreset) {
+        guard mode == .custom else { return }
+        selected = nil
+        controls = Self.presetLayout(p)
+        LogStore.shared.log("[controls] ml894 keyboard layout preset: \(p.rawValue)")
+    }
+
+    static func presetLayout(_ p: KeyboardPreset) -> [TouchControl] {
+        let k = presetScale()
+        func c(_ x: Double, _ y: Double, _ s: Double, _ a: ControlAction) -> TouchControl {
+            TouchControl(nx: x, ny: y, scale: (s * k * 100).rounded() / 100, action: a)
+        }
+        switch p {
+        case .pc:
+            return keyboardPreset(top: 0x52)
+        case .platformer:
+            // Arrows to move; Space, X, C and Z as the right thumb's diamond
+            // (jump, attack, dash, grab in most platformers); Shift, Esc, Enter.
+            return [
+                c(0.165, 0.680, 1.85, .joystickArrows),
+                c(0.262, 0.495, 0.80, .key(0x10)),      // Shift
+                c(0.826, 0.845, 1.05, .key(0x20)),      // Space
+                c(0.768, 0.705, 0.94, .key(0x58)),      // X
+                c(0.884, 0.705, 0.94, .key(0x43)),      // C
+                c(0.826, 0.580, 0.94, .key(0x5A)),      // Z
+                c(0.462, 0.885, 0.66, .key(0x1B)),      // Esc
+                c(0.538, 0.885, 0.66, .key(0x0D)),      // Enter
+            ]
+        case .shooter:
+            // The PC layout plus G and Q above the clicks and a weapon key (1).
+            return keyboardPreset(top: 0x52) + [
+                c(0.120, 0.240, 0.94, .key(0x47)),      // G
+                c(0.880, 0.255, 0.94, .key(0x51)),      // Q
+                c(0.578, 0.600, 0.80, .key(0x31)),      // 1
+            ]
+        case .pointAndClick:
+            // Mostly the mouse (the screen is the trackpad): big clicks on the
+            // right; Space to skip, Esc, Tab and the on-screen keyboard.
+            return [
+                c(0.855, 0.770, 1.30, .mouseLeft),
+                c(0.880, 0.505, 1.00, .mouseRight),
+                c(0.700, 0.850, 0.90, .key(0x20)),      // Space
+                c(0.120, 0.300, 0.80, .key(0x1B)),      // Esc
+                c(0.120, 0.480, 0.80, .key(0x09)),      // Tab
+                c(0.120, 0.800, 0.80, .keyboardToggle),
+            ]
+        }
+    }
+
+    /// A keyboard layout as a file to share.
+    struct LayoutFile: Codable {
+        var madeiraLayout: Int
+        var controls: [TouchControl]
+    }
+
+    /// Write the keyboard layout to a file in tmp for the share sheet.
+    func exportLayoutURL() -> URL? {
+        let file = LayoutFile(madeiraLayout: 1, controls: mode == .xbox ? customStash : controls)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let d = try? enc.encode(file) else { return nil }
+        let base = (gameTitle ?? "Madeira").components(separatedBy: CharacterSet(charactersIn: "/:\\?*<>|\"")).joined()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(base + " keyboard layout.json")
+        guard (try? d.write(to: url, options: .atomic)) != nil else { return nil }
+        return url
+    }
+
+    /// Take a layout file (ours, or a bare control list). False if it is not one.
+    func importLayout(from url: URL) -> Bool {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard mode == .custom, let d = try? Data(contentsOf: url) else { return false }
+        let list: [TouchControl]
+        if let f = try? JSONDecoder().decode(LayoutFile.self, from: d) {
+            list = f.controls
+        } else if let c = try? JSONDecoder().decode([TouchControl].self, from: d) {
+            list = c
+        } else {
+            return false
+        }
+        let valid = list.filter { (0...1).contains($0.nx) && (0...1).contains($0.ny) && $0.scale >= 0.3 && $0.scale <= 4 }
+        guard !valid.isEmpty else { return false }
+        selected = nil
+        controls = valid.map { t -> TouchControl in
+            var c = t
+            c.id = UUID()
+            return c
+        }
+        LogStore.shared.log("[controls] ml894 keyboard layout imported: \(valid.count) controls")
+        return true
+    }
+
     // MARK: ml889 a game's touch controls from its ⋯ menu (Games tab)
 
     private static func choice(of p: GameControlsProfile) -> TouchControlsChoice {
@@ -5848,7 +5996,8 @@ final class TouchControlsModel: ObservableObject {
         guard !loading else { return }
         let base = gameID == nil ? snapshot() : (defaults ?? snapshot())
         let s = Saved(controls: base.custom ?? [], visible: base.visible ?? false, mode: base.mode,
-                      padControls: legacyPad, games: profiles.isEmpty ? nil : profiles)
+                      padControls: legacyPad, games: profiles.isEmpty ? nil : profiles,
+                      opacity: opacity < 1 ? opacity : nil)
         guard let d = try? JSONEncoder().encode(s) else { return }
         // ml835: coalesce. A drag or resize in the editor changes `controls` on
         // every touch sample, and an atomic file write per sample made the editor
@@ -5880,7 +6029,7 @@ final class TouchControlsModel: ObservableObject {
     /// leaving full screen) only zero the input (ControlsInputView.releaseAll).
     private func pushPadConnected() {
         guard !loading else { return }
-        let on = visible && (mode == .xbox || controls.contains { $0.action.isPad })
+        let on = visible && !controllerHides && (mode == .xbox || controls.contains { $0.action.isPad })
         if Thread.isMainThread {
             GamepadBridge.shared.setTouchPadConnected(on)
         } else {
@@ -6000,7 +6149,7 @@ final class TouchControlsModel: ObservableObject {
     /// in this state. Editing hands the controls to SwiftUI; outside full screen
     /// nothing is live. ml827: nor over the loading panel — this going false
     /// releases every held key (ControlsInputView.syncFromModel).
-    var playing: Bool { fullScreen && visible && !editing && !launchPanelUp && !dialogUp }
+    var playing: Bool { fullScreen && visible && !editing && !launchPanelUp && !dialogUp && !controllerHides }
 }
 
 /// ml826: the ONE geometry for on-screen controls. Hit-testing (ControlsWindow),
@@ -6755,6 +6904,8 @@ final class ControlsInputView: UIView {
             if !isHidden { isHidden = true }
             return
         }
+        let see = CGFloat(m.opacity)                   // ml894
+        if alpha != see { alpha = see }
         let size = bounds.size
         for (key, g) in Array(grabs) {                 // removed or remapped while held
             let still = m.controls.first { $0.id == g.id }
@@ -7237,7 +7388,12 @@ struct TouchControlsOverlay: View {
     /// The toolbar stays up while either is open.
     /// ml890: the controls panel's Key binds menu and one input's key list
     /// open in the same place.
-    private enum ToolbarMenu: Equatable { case game, controls, binds, bindPick(GamepadElement) }
+    private enum ToolbarMenu: Equatable { case game, controls, binds, bindPick(GamepadElement), layouts }
+    /// ml894: the layout menu's preset waiting for its confirmation, the
+    /// import picker, and the file the Export row shares.
+    @State private var pendingPreset: TouchControlsModel.KeyboardPreset? = nil
+    @State private var importingLayout = false
+    @State private var exportURL: URL? = nil
     @State private var openMenu: ToolbarMenu? = nil
     private var chromeShown: Bool { chromeVisible || m.editing || openMenu != nil }
     /// ml858: what the toolbar's Save Log did ("Saved: Celeste (…)"), shown under
@@ -7320,6 +7476,7 @@ struct TouchControlsOverlay: View {
                             case .controls:          controlsMenu
                             case .binds:             bindsMenu
                             case .bindPick(let el):  bindPickMenu(el)
+                            case .layouts:           layoutsMenu
                             }
                         }
                         .background { ChromeRectReporter(slot: "menu") }
@@ -7390,6 +7547,26 @@ struct TouchControlsOverlay: View {
             openMenu = nil              // ml861: never reopen into a stale menu
             if on { showChrome() }
         }
+        // ml894: the layout menu's confirmation and import picker.
+        .confirmationDialog("Replace your keyboard layout?",
+                            isPresented: Binding(get: { pendingPreset != nil },
+                                                 set: { if !$0 { pendingPreset = nil } }),
+                            titleVisibility: .visible,
+                            presenting: pendingPreset) { p in
+            Button("Use \(p.title)", role: .destructive) {
+                m.applyPreset(p)
+                openMenu = nil
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { p in
+            Text("The \(p.title) layout replaces your current one. Export it first to keep a copy.")
+        }
+        .fileImporter(isPresented: $importingLayout, allowedContentTypes: [.json]) { result in
+            guard case .success(let url) = result else { return }
+            let ok = m.importLayout(from: url)
+            showLogToast(ok ? "Layout imported" : "That file is not a Madeira layout", for: 2)
+            if ok { openMenu = nil }
+        }
         // ml827: the 4 s auto-hide ran out during the load; show the toolbar
         // when the game appears.
         .onChange(of: m.launchPanelUp) { _, up in if !up { showChrome() } }
@@ -7417,7 +7594,7 @@ struct TouchControlsOverlay: View {
                 openMenu = openMenu == .game ? nil : .game
             }
             // ml865: Off / Xbox / Custom. Dim while the controls are off.
-            glassButton("gamecontroller", dim: !m.visible) {
+            glassButton("gamecontroller", dim: !m.visible || m.controllerHides) {
                 openMenu = openMenu == .controls ? nil : .controls
             }
             // Performance overlay on/off. Same UserDefaults key as the
@@ -7445,6 +7622,12 @@ struct TouchControlsOverlay: View {
                         c.ny = 0.5 + Double(m.controls.count % 2) * 0.06
                         m.controls.append(c)
                         m.selected = c.id
+                    }
+                    .transition(.opacity.combined(with: .scale))
+                    // ml894: presets, and the layout as a file
+                    glassButton("square.stack.3d.up", steam: true) {
+                        exportURL = m.exportLayoutURL()
+                        openMenu = openMenu == .layouts ? nil : .layouts
                     }
                     .transition(.opacity.combined(with: .scale))
                 }
@@ -7536,12 +7719,23 @@ struct TouchControlsOverlay: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 4)
             }
+            // ml894
+            if m.controllerHides {
+                Text("Hidden while a controller is connected")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(SteamPalette.accent)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+            }
             HStack(spacing: 8) {
                 ForEach(TouchControlsChoice.allCases) { c in choiceTile(c) }
             }
             .padding(.horizontal, 12)
             .padding(.top, 10)
             .padding(.bottom, 12)
+            if m.choice != .off {
+                opacityRow
+            }
             Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
             physicalControllerSection
         }
@@ -7676,6 +7870,52 @@ struct TouchControlsOverlay: View {
         .buttonStyle(.plain)
     }
 
+    // MARK: ml894 see-through slider, layout menu
+
+    /// How see-through the touch controls are; the ones under the panel change
+    /// as the slider moves.
+    private var opacityRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "circle.lefthalf.filled")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.7))
+            Slider(value: $m.opacity, in: 0.2...1.0)
+                .tint(SteamPalette.accent)
+            Text("\(Int((m.opacity * 100).rounded()))%")
+                .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                .foregroundStyle(Color.white.opacity(0.7))
+                .frame(width: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 12)
+    }
+
+    /// The keyboard layout's presets (confirmed before replacing it), and the
+    /// layout as a file to export or import.
+    private var layoutsMenu: some View {
+        panelChrome(VStack(alignment: .leading, spacing: 0) {
+            Text("Keyboard layout")
+                .font(.system(size: 12, weight: .semibold))
+                .tracking(0.6)
+                .textCase(.uppercase)
+                .foregroundStyle(Color.white.opacity(0.5))
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 4)
+            ForEach(TouchControlsModel.KeyboardPreset.allCases) { p in
+                panelRow(p.title, system: p.icon) { pendingPreset = p }
+            }
+            Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+            if let url = exportURL {
+                ShareLink(item: url) {
+                    panelRowLabel("Export layout", system: "square.and.arrow.up")
+                }
+                .buttonStyle(.plain)
+            }
+            panelRow("Import layout", system: "square.and.arrow.down") { importingLayout = true }
+        })
+    }
+
     /// A row of the key-bind panels: an optional symbol, the title, then the
     /// current value and a chevron, or a checkmark. Unlike menuRow it keeps
     /// the panel open.
@@ -7687,39 +7927,44 @@ struct TouchControlsOverlay: View {
             showChrome()
             withAnimation(.easeInOut(duration: 0.15)) { action() }
         } label: {
-            HStack(spacing: 12) {
-                if let system {
-                    Image(systemName: system)
-                        .foregroundStyle(SteamPalette.accent)
-                        .frame(width: 22)
-                }
-                Text(title)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                Spacer(minLength: 8)
-                if let value {
-                    Text(value)
-                        .foregroundStyle(Color.white.opacity(0.62))
-                        .lineLimit(1)
-                }
-                if checked {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(SteamPalette.accent)
-                }
-                if chevron {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Color.white.opacity(0.35))
-                }
-            }
-            .font(.system(size: 15, weight: .medium))
-            .foregroundStyle(Color.white)
-            .padding(.horizontal, 16)
-            .frame(height: 44)
-            .contentShape(Rectangle())
+            panelRowLabel(title, system: system, value: value, checked: checked, chevron: chevron)
         }
         .buttonStyle(.plain)
+    }
+
+    private func panelRowLabel(_ title: String, system: String? = nil, value: String? = nil,
+                               checked: Bool = false, chevron: Bool = false) -> some View {
+        HStack(spacing: 12) {
+            if let system {
+                Image(systemName: system)
+                    .foregroundStyle(SteamPalette.accent)
+                    .frame(width: 22)
+            }
+            Text(title)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer(minLength: 8)
+            if let value {
+                Text(value)
+                    .foregroundStyle(Color.white.opacity(0.62))
+                    .lineLimit(1)
+            }
+            if checked {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(SteamPalette.accent)
+            }
+            if chevron {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.35))
+            }
+        }
+        .font(.system(size: 15, weight: .medium))
+        .foregroundStyle(Color.white)
+        .padding(.horizontal, 16)
+        .frame(height: 44)
+        .contentShape(Rectangle())
     }
 
     private func padModeTile(_ title: String, icon: String, native: Bool) -> some View {

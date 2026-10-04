@@ -210,13 +210,25 @@ struct GamepadMapping: Codable, Equatable {
 final class GamepadBridge: ObservableObject {
     static let shared = GamepadBridge()
 
-    @Published private(set) var controllerName: String? = nil
+    @Published private(set) var controllerName: String? = nil {
+        didSet { if controllerName != oldValue { notifyTouchControls() } }
+    }
     @Published var enabled: Bool = true {
         didSet {
             save()
             if !enabled { releaseAll(using: mapping) }
             syncPhysicalPresence()
+            notifyTouchControls()
         }
+    }
+
+    /// ml894: the touch controls step aside while a physical controller is
+    /// connected and in use. Next turn, so neither model's setup is re-entered
+    /// (both are static singletons that reach each other).
+    private func notifyTouchControls() {
+        guard !loading else { return }
+        let present = enabled && controllerName != nil
+        DispatchQueue.main.async { TouchControlsModel.shared.setPhysicalController(present) }
     }
     /// true = XInput (game sees an Xbox pad); false = keyboard & mouse mapping.
     @Published var native: Bool = true {
