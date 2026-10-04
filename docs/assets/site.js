@@ -188,46 +188,64 @@
   function initDevice() {
     var stage = $(".device-stage"), dev = $(".device");
     if (!stage || !dev) return;
-    var tiles = Array.prototype.slice.call(dev.querySelectorAll(".tile"));
-    var track = $(".lib-track", dev), title = $(".lib-card .t", dev), sub = $(".lib-card .s", dev), play = $(".lib-play", dev);
-    if (!tiles.length) return;
+    var gt = $(".gt", dev), track = $(".gt-track", dev);
+    var tiles = Array.prototype.slice.call(dev.querySelectorAll(".gt-tile"));
+    if (!gt || !track || !tiles.length) return;
 
-    // Art for the tiles.
+    // Art for the tiles, with the app's favourite star and PLAYING badge.
     tiles.forEach(function (t) {
       var c = cover(t.dataset.title, t.dataset.steam, true);
-      while (c.firstChild) t.appendChild(c.firstChild);
+      if (t.dataset.fav) c.appendChild(h("span", { class: "gt-star" }, "\u2605"));
+      c.appendChild(h("span", { class: "gt-badge" }, "PLAYING"));
+      t.insertBefore(c, t.firstChild);
     });
 
+    // LauncherView's landscape row in points: 196 pt covers, 300 pt for the
+    // highlighted one, 14 pt apart, 20 pt in from the 59 pt safe area,
+    // scrolled to centre the highlight (never past either end).
+    var PAD = 79, SMALL = 196, BIG = 300, GAP = 14, SCREEN = 932;
     var i = 0, visible = true;
-    function focus(n, instant) {
+    function focus(n) {
       tiles.forEach(function (t, k) { t.classList.toggle("focus", k === n); });
-      var step = tiles.length > 1 ? tiles[1].offsetLeft - tiles[0].offsetLeft : 0;
-      track.style.transform = "translateX(" + (-Math.max(0, n - 1) * step) + "px)";
-      if (instant) { title.textContent = tiles[n].dataset.title; sub.textContent = tiles[n].dataset.sub; return; }
-      title.classList.add("swap"); sub.classList.add("swap");
-      setTimeout(function () {
-        title.textContent = tiles[n].dataset.title; sub.textContent = tiles[n].dataset.sub;
-        title.classList.remove("swap"); sub.classList.remove("swap");
-      }, 230);
+      var content = PAD * 2 + (tiles.length - 1) * (SMALL + GAP) + BIG;
+      var centre = PAD + n * (SMALL + GAP) + BIG / 2;
+      var x = Math.min(0, Math.max(SCREEN - content, SCREEN / 2 - centre));
+      track.style.setProperty("--x", x.toFixed(1));
     }
-    focus(0, true);
+    var cardCover = $(".gt-card-cover", dev), cardTitle = $(".gt-card-title", dev);
+    var cardExe = $(".gt-card-details code", dev), cardLine = $(".gt-card-details span", dev), play = $(".gt-play", dev);
+    function openCard(t) {
+      var d = t.dataset.play.split("|");
+      cardTitle.textContent = t.dataset.title;
+      cardExe.textContent = d[0];
+      cardLine.textContent = "  \u00B7  Last played " + d[1] + "  \u00B7  Played " + d[2];
+      cardCover.replaceChildren(cover(t.dataset.title, t.dataset.steam, true));
+      gt.classList.add("open");
+    }
+    focus(0);
     if (reduceMotion) return;
-
     if (io) {
       new IntersectionObserver(function (es) { visible = es[0].isIntersecting; }).observe(stage);
     }
-    setInterval(function () {
-      if (!visible || document.hidden) return;
+
+    // Like a controller: right along the row. On a game that runs (data-play),
+    // A opens its card, A again presses Play, and its tile says PLAYING.
+    function step() {
+      if (!visible || document.hidden) { setTimeout(step, 700); return; }
       i = (i + 1) % tiles.length;
       focus(i);
-      if (i % 3 === 2) {
-        setTimeout(function () {
-          play.classList.add("press");
-          setTimeout(function () { play.classList.remove("press"); }, 240);
-        }, 1100);
-      }
-    }, 2600);
-    window.addEventListener("resize", function () { focus(i, true); });
+      var t = tiles[i];
+      if (!t.dataset.play) { setTimeout(step, 1700); return; }
+      setTimeout(function () { openCard(t); }, 1000);
+      setTimeout(function () { play.classList.add("press"); }, 2500);
+      setTimeout(function () {
+        play.classList.remove("press");
+        gt.classList.remove("open");
+        tiles.forEach(function (o) { o.classList.toggle("playing", o === t); });
+      }, 2750);
+      setTimeout(step, 4800);
+    }
+    setTimeout(step, 1700);
 
     if (matchMedia("(pointer: fine)").matches) {
       stage.addEventListener("pointermove", function (e) {

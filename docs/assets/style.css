@@ -182,62 +182,89 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
   content: ""; position: absolute; left: 2.2%; top: 50%; width: 3.6%; height: 30%;
   transform: translateY(-50%); border-radius: 999px; background: #000; z-index: 3;
 }
-.lib {
-  position: absolute; inset: 0; padding: 6cqh 5% 0 9%;
-  display: flex; flex-direction: column; gap: 4cqh;
-  font-size: clamp(8px, 0.9vw, 13px);
-  font-size: 4.3cqh;
+/* The Games tab as LauncherView draws it on a 932 x 430 pt iPhone in
+   landscape, in points (--pt = one point of the miniature's screen): the top
+   bar's title and four pills, the row of 2.14:1 covers (196 pt, 300 pt for the
+   highlighted one with the accent ring), the opened game's card and the
+   floating tab bar. */
+.gt { position: absolute; inset: 0; --pt: calc(100cqh / 430); color: #fff; font-size: calc(13 * var(--pt)); }
+.gt-top {
+  position: absolute; left: calc(75 * var(--pt)); right: calc(75 * var(--pt)); top: calc(10 * var(--pt));
+  height: calc(36 * var(--pt)); display: flex; align-items: center; gap: calc(10 * var(--pt));
 }
-.lib-head { display: flex; align-items: baseline; gap: 1em; }
-.lib-head b { font-size: 1.6em; letter-spacing: -0.02em; }
-.lib-head span { color: var(--text-3); font-size: 0.9em; }
-.lib-head .lib-pad { margin-left: auto; color: var(--text-3); font-size: 0.8em; display: inline-flex; gap: 0.5em; }
-.lib-head .lib-pad i { font-style: normal; border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 0.5em; }
-
-.lib-row { position: relative; height: 36cqh; flex: 0 0 auto; }
-.lib-track {
-  position: absolute; inset: 0 auto 0 0; display: flex; gap: 2.6%; width: 160%;
-  transition: transform 0.7s var(--out);
+.gt-top b { font-size: calc(22 * var(--pt)); font-weight: 700; letter-spacing: -0.01em; margin-right: auto; }
+.gt-pill {
+  width: calc(42 * var(--pt)); height: calc(36 * var(--pt)); border-radius: 999px; display: grid; place-items: center;
+  background: var(--panel); box-shadow: inset 0 0 0 1px var(--line);
 }
-.tile {
-  position: relative; flex: 0 0 auto; height: 100%; aspect-ratio: var(--cover);
-  border-radius: 0.7em; overflow: hidden; background: var(--panel);
-  transition: transform 0.45s var(--spring), box-shadow 0.35s, opacity 0.35s;
-  opacity: 0.62;
+.gt svg { fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.gt svg.solid, .gt-play svg, .gt-more svg { fill: currentColor; stroke: none; }
+.gt-pill svg { width: calc(17 * var(--pt)); height: calc(17 * var(--pt)); }
+.gt-row { position: absolute; left: 0; right: 0; top: calc(50 * var(--pt)); bottom: calc(76 * var(--pt)); display: flex; align-items: center; overflow: hidden; }
+.gt-track {
+  display: flex; align-items: center; gap: calc(14 * var(--pt)); padding: 0 calc(79 * var(--pt));
+  transform: translateX(calc(var(--x, 0) * var(--pt))); transition: transform 0.55s var(--out);
 }
-.tile { margin: 0; }
-.tile img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: opacity 0.4s; }
-.tile img.loading { opacity: 0; }
-.tile .ph {
-  position: absolute; inset: 0; display: flex; align-items: flex-end; padding: 0.5em 0.65em;
-  font-weight: 700; font-size: 0.85em; line-height: 1.1; color: rgba(255, 255, 255, 0.92);
+.gt-tile { margin: 0; flex: 0 0 auto; width: calc(196 * var(--pt)); display: flex; flex-direction: column; gap: calc(6 * var(--pt)); transition: width 0.45s var(--spring); }
+.gt-tile.focus { width: calc(300 * var(--pt)); }
+.gt .cover { border-radius: calc(12 * var(--pt)); box-shadow: inset 0 0 0 1px var(--line); transition: transform 0.45s var(--spring), box-shadow 0.3s; }
+.gt .cover img { position: absolute; inset: 0; }
+.gt .cover .ph { font-size: calc(12 * var(--pt)); padding: calc(8 * var(--pt)) calc(10 * var(--pt)); }
+.gt-tile.focus .cover { transform: scale(1.04); box-shadow: 0 0 0 calc(3 * var(--pt)) var(--accent), 0 0 calc(12 * var(--pt)) rgba(26, 159, 255, 0.55); }
+.gt-tile figcaption { font-size: calc(13 * var(--pt)); font-weight: 600; color: rgba(255, 255, 255, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gt-tile.focus figcaption { color: #fff; }
+.gt-star {
+  position: absolute; top: calc(6 * var(--pt)); left: calc(6 * var(--pt)); width: calc(21 * var(--pt)); height: calc(21 * var(--pt));
+  border-radius: 50%; background: rgba(0, 0, 0, 0.55); color: #ffd60a; display: grid; place-items: center; font-size: calc(12 * var(--pt)); line-height: 1;
 }
-.tile.focus {
-  opacity: 1; transform: scale(1.09);
-  box-shadow: 0 0 0 0.16em #fff, 0 0 0 0.34em var(--accent), 0 1.2em 2.4em rgba(0, 0, 0, 0.55);
-  z-index: 2;
+.gt-badge {
+  position: absolute; top: calc(6 * var(--pt)); right: calc(6 * var(--pt)); padding: calc(3 * var(--pt)) calc(7 * var(--pt));
+  border-radius: 999px; background: var(--play); font-size: calc(10 * var(--pt)); font-weight: 800; letter-spacing: 0.02em;
+  opacity: 0; transform: scale(0.8); transition: opacity 0.25s, transform 0.3s var(--spring);
 }
-.lib-card { display: flex; align-items: center; gap: 1.2em; }
-.lib-card .meta { min-width: 0; }
-.lib-card .t { font-weight: 700; font-size: 1.45em; letter-spacing: -0.02em; white-space: nowrap; transition: opacity 0.25s; }
-.lib-card .s { color: var(--text-3); font-size: 0.9em; transition: opacity 0.25s; }
-.lib-card .swap { opacity: 0; }
-.lib-play {
-  margin-left: auto; margin-right: 5%;
-  display: inline-flex; align-items: center; gap: 0.5em;
-  padding: 0.65em 1.4em; border-radius: 999px; background: var(--play); font-weight: 650;
-  box-shadow: 0 0.5em 1.4em rgba(76, 185, 68, 0.3);
-  transition: transform 0.3s var(--spring), background-color 0.2s;
+.gt-tile.playing .gt-badge { opacity: 1; transform: none; }
+.gt-dim { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.55); opacity: 0; transition: opacity 0.3s; }
+/* LauncherView.card in the ~360 pt the tab bar leaves: (360 - 190) x 2.14
+   cover + 32 = 396 pt wide, centred in that space. */
+.gt-card {
+  position: absolute; left: 50%; top: calc(180 * var(--pt)); width: calc(396 * var(--pt)); box-sizing: border-box; padding: calc(16 * var(--pt));
+  display: flex; flex-direction: column; gap: calc(12 * var(--pt)); border-radius: calc(20 * var(--pt)); background: var(--panel-raised);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1), 0 calc(10 * var(--pt)) calc(24 * var(--pt)) rgba(0, 0, 0, 0.5);
+  opacity: 0; transform: translate(-50%, -50%) scale(0.92); transition: opacity 0.25s, transform 0.35s var(--spring);
 }
-.lib-play svg { width: 1em; height: 1em; }
-.lib-play.press { transform: scale(0.92); background: var(--play-hi); }
-.lib-dock {
-  position: absolute; left: 50%; bottom: 4.5cqh; transform: translateX(-50%);
-  display: flex; gap: 4cqh; padding: 1.6cqh 3.4cqh; border-radius: 999px;
-  background: rgba(23, 28, 38, 0.92); border: 1px solid var(--line);
-  color: var(--text-3); font-size: 3.6cqh; font-weight: 500; white-space: nowrap;
+.gt.open .gt-dim { opacity: 1; }
+.gt.open .gt-card { opacity: 1; transform: translate(-50%, -50%); }
+.gt-card .cover { border-radius: calc(14 * var(--pt)); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1), 0 calc(8 * var(--pt)) calc(16 * var(--pt)) rgba(0, 0, 0, 0.45); }
+.gt-card-title { font-size: calc(22 * var(--pt)); font-weight: 700; line-height: 1.15; }
+.gt-card-details { font-size: calc(12 * var(--pt)); color: var(--text-2); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.gt-card-details code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.gt-card-buttons { display: flex; gap: calc(12 * var(--pt)); }
+.gt-play {
+  flex: 1; height: calc(52 * var(--pt)); border-radius: calc(14 * var(--pt)); background: var(--play);
+  display: flex; align-items: center; justify-content: center; gap: calc(8 * var(--pt)); font-size: calc(17 * var(--pt)); font-weight: 700;
+  box-shadow: 0 0 0 calc(3 * var(--pt)) var(--accent), 0 0 calc(10 * var(--pt)) rgba(26, 159, 255, 0.45);
+  transition: transform 0.2s var(--spring), background-color 0.2s;
 }
-.lib-dock .on { color: var(--accent); }
+.gt-play svg { width: calc(17 * var(--pt)); height: calc(17 * var(--pt)); }
+.gt-play.press { transform: scale(0.95); background: var(--play-hi); }
+.gt-more {
+  width: calc(52 * var(--pt)); height: calc(52 * var(--pt)); border-radius: calc(14 * var(--pt)); display: grid; place-items: center;
+  background: var(--panel); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+.gt-more svg { width: calc(20 * var(--pt)); height: calc(20 * var(--pt)); }
+.gt-tabs {
+  position: absolute; left: 50%; bottom: calc(12 * var(--pt)); transform: translateX(-50%); z-index: 2;
+  display: flex; gap: calc(2 * var(--pt)); padding: calc(4 * var(--pt)); border-radius: 999px;
+  background: rgba(38, 42, 50, 0.8); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1), 0 calc(6 * var(--pt)) calc(18 * var(--pt)) rgba(0, 0, 0, 0.45);
+}
+.gt-tabs span {
+  display: flex; flex-direction: column; align-items: center; gap: calc(2 * var(--pt)); min-width: calc(74 * var(--pt));
+  padding: calc(5 * var(--pt)) calc(12 * var(--pt)) calc(4 * var(--pt)); border-radius: 999px;
+  font-size: calc(10 * var(--pt)); font-weight: 600; color: rgba(255, 255, 255, 0.9);
+}
+.gt-tabs span.on { background: rgba(255, 255, 255, 0.12); color: var(--accent); }
+.gt-tabs svg { width: calc(21 * var(--pt)); height: calc(21 * var(--pt)); }
 
 /* ── Sections ───────────────────────────────────────────────────────────── */
 

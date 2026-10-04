@@ -10,9 +10,9 @@
   <meta property="og:description" content="Wine, FEX and DXMT in one iOS app. See which games run, reported by players.">
   <meta property="og:type" content="website">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="assets/style.css">
+  <link rel="stylesheet" href="assets/style.css?v=20261004c">
   <script src="config.js" defer></script>
-  <script src="assets/site.js" defer></script>
+  <script src="assets/site.js?v=20261004c" defer></script>
 </head>
 <body>
 
@@ -61,31 +61,42 @@
       <div class="device-stage" aria-hidden="true">
         <div class="device">
           <div class="device-screen">
-            <div class="lib">
-              <div class="lib-head">
-                <b>Games</b><span>7 games</span>
-                <span class="lib-pad"><i>A</i> Play <i>Y</i> Add game</span>
+            <div class="gt">
+              <div class="gt-top">
+                <b>Games</b>
+                <i class="gt-pill"><svg viewBox="0 0 24 24"><path d="M10.5 4a6.5 6.5 0 1 1 0 13a6.5 6.5 0 0 1 0-13z M15.5 15.5L20 20"/></svg></i>
+                <i class="gt-pill"><svg viewBox="0 0 24 24"><path d="M8 19V5 M4.5 8.5L8 5l3.5 3.5 M16 5v14 M12.5 15.5L16 19l3.5-3.5"/></svg></i>
+                <i class="gt-pill"><svg viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 1 0 17a8.5 8.5 0 0 1 0-17z M12 8v8 M8 12h8"/></svg></i>
+                <i class="gt-pill"><svg viewBox="0 0 24 24"><path d="M19 12a7 7 0 1 1-2.05-4.95 M19 4.5V9h-4.5"/></svg></i>
               </div>
-              <div class="lib-row">
-                <div class="lib-track">
-                  <figure class="tile" data-title="Thumper" data-steam="356400" data-sub="Last played 2 hours ago"></figure>
-                  <figure class="tile" data-title="Untitled Goose Game" data-steam="837470" data-sub="Last played yesterday"></figure>
-                  <figure class="tile" data-title="ULTRAKILL" data-steam="1229490" data-sub="Last played 3 days ago"></figure>
-                  <figure class="tile" data-title="Undertale" data-steam="391540" data-sub="32-bit · Last played today"></figure>
-                  <figure class="tile" data-title="Rhythm Doctor" data-steam="774181" data-sub="Last played last week"></figure>
-                  <figure class="tile" data-title="Enter the Gungeon" data-steam="311690" data-sub="Last played 2 weeks ago"></figure>
-                  <figure class="tile" data-title="OneShot: World Machine Edition" data-steam="2915460" data-sub="Last played last month"></figure>
+              <div class="gt-row">
+                <div class="gt-track">
+                  <figure class="gt-tile" data-title="Hollow Knight" data-steam="367520" data-fav="1"><figcaption>Hollow Knight</figcaption></figure>
+                  <figure class="gt-tile" data-title="Hades" data-steam="1145360" data-fav="1"><figcaption>Hades</figcaption></figure>
+                  <figure class="gt-tile" data-title="Red Dead Redemption 2" data-steam="1174180"><figcaption>Red Dead Redemption 2</figcaption></figure>
+                  <figure class="gt-tile" data-title="Cyberpunk 2077" data-steam="1091500"><figcaption>Cyberpunk 2077</figcaption></figure>
+                  <figure class="gt-tile" data-title="Untitled Goose Game" data-steam="837470" data-play="Untitled.exe|4 days ago|9 h"><figcaption>Untitled Goose Game</figcaption></figure>
+                  <figure class="gt-tile" data-title="Celeste" data-steam="504230" data-play="Celeste.exe|last week|21 h"><figcaption>Celeste</figcaption></figure>
+                  <figure class="gt-tile" data-title="Cuphead" data-steam="268910"><figcaption>Cuphead</figcaption></figure>
+                  <figure class="gt-tile" data-title="Enter the Gungeon" data-steam="311690"><figcaption>Enter the Gungeon</figcaption></figure>
                 </div>
               </div>
-              <div class="lib-card">
-                <div class="meta"><div class="t">Thumper</div><div class="s">Last played 2 hours ago</div></div>
-                <span class="lib-play">
-                  <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/></svg>
-                  Play
-                </span>
+              <div class="gt-dim"></div>
+              <div class="gt-card">
+                <div class="gt-card-cover"></div>
+                <div class="gt-card-title"></div>
+                <div class="gt-card-details"><code></code><span></span></div>
+                <div class="gt-card-buttons">
+                  <span class="gt-play"><svg viewBox="0 0 24 24"><path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/></svg>Play</span>
+                  <span class="gt-more"><svg viewBox="0 0 24 24"><circle cx="5.5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="18.5" cy="12" r="2"/></svg></span>
+                </div>
+              </div>
+              <div class="gt-tabs">
+                <span class="on"><svg viewBox="0 0 24 24" class="solid"><path fill-rule="evenodd" d="M7.2 6.5h9.6c2 0 3.7 1.4 4.1 3.4l1.1 5.4c.4 2.1-2 3.5-3.6 2.2l-2.3-1.9H7.9l-2.3 1.9c-1.6 1.3-4-.1-3.6-2.2l1.1-5.4c.4-2 2.1-3.4 4.1-3.4z M7 9.8v1.4H5.6v1.2H7v1.4h1.2v-1.4h1.4v-1.2H8.2V9.8z M16.2 9.9a.95.95 0 1 0 0 1.9a.95.95 0 0 0 0-1.9z M18.1 11.8a.95.95 0 1 0 0 1.9a.95.95 0 0 0 0-1.9z"/></svg>Games</span>
+                <span><svg viewBox="0 0 24 24"><path d="M3.5 4.5h17v11.5h-17z M8.5 20h7 M12 16v4"/></svg>Desktop</span>
+                <span><svg viewBox="0 0 24 24" class="solid"><circle cx="12" cy="12" r="8.1" fill="none" stroke="currentColor" stroke-width="3.4" stroke-dasharray="3.2 3.16"/><path fill-rule="evenodd" d="M12 5.4a6.6 6.6 0 1 1 0 13.2a6.6 6.6 0 0 1 0-13.2z M12 9.4a2.6 2.6 0 1 0 0 5.2a2.6 2.6 0 0 0 0-5.2z"/></svg>Settings</span>
               </div>
             </div>
-            <div class="lib-dock"><span class="on">Games</span><span>Containers</span><span>Desktop</span><span>Settings</span></div>
           </div>
         </div>
       </div>
