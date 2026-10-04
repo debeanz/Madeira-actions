@@ -377,6 +377,7 @@
     screen: "M3 5h18v12H3z M8 21h8 M12 17v4",
     gauge: "M12 14l4-4 M4 18a9 9 0 1 1 16 0",
     bolt: "M13 2L4 14h7l-1 8 9-12h-7z",
+    sparkle: "M10 5l1.8 6.2L18 13l-6.2 1.8L10 21l-1.8-6.2L2 13l6.2-1.8z M18 3v4 M16 5h4",
     doc: "M6 2h8l4 4v16H6z M14 2v4h4 M9 13h6 M9 17h6"
   };
   function icon(name) {
@@ -401,6 +402,9 @@
     if (r.arch) m.push(meta("chip", r.arch === "x86" ? "32-bit" : "64-bit"));
     if (typeof st.resolution === "string" && /^\d{2,5}x\d{2,5}$/.test(st.resolution)) m.push(meta("screen", st.resolution.replace("x", "×")));
     if (typeof st.frameCap === "string" && frameCapText(st.frameCap)) m.push(meta("gauge", frameCapText(st.frameCap)));
+    // MetalFX upscaling (DirectX 11 games): the app sends it only when the game
+    // ran with it, as the multiplier it used.
+    if (typeof st.metalFX === "number" && st.metalFX > 1 && st.metalFX <= 3) m.push(meta("sparkle", "MetalFX upscaling " + Math.round(st.metalFX * 100) / 100 + "×"));
     // The app's "Skip x86 memory-ordering emulation" switch (the game's own, else
     // Settings'). Reports carry x86MemoryOrdering = !skip: false means it was On.
     if (st.x86MemoryOrdering === false) m.push(meta("bolt", "Skip x86 memory-ordering emulation: On"));
