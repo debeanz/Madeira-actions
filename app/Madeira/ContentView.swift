@@ -81,6 +81,48 @@ final class MetalHostView: UIView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
+/// ml896: how the game picture fills the screen. Fit is what every build before
+/// did: all of the picture, black bars around it.
+enum ScreenScaling: String, CaseIterable, Identifiable {
+    case fit, fill, stretch, integer
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .fit:     return "Fit"
+        case .fill:    return "Fill"
+        case .stretch: return "Stretch"
+        case .integer: return "Whole-number"
+        }
+    }
+
+    static let key = "madeira.screenScaling"
+    static let sharpKey = "madeira.sharpPixels"
+
+    /// The Settings defaults.
+    static var saved: ScreenScaling {
+        ScreenScaling(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .fit
+    }
+    static var savedSharp: Bool { UserDefaults.standard.bool(forKey: sharpKey) }
+
+    /// The Games-tab game running now (ContentView's session hook), nil outside one.
+    static var currentGameID: String?
+
+    /// A game's own scaling and sharp pixels, else the Settings defaults.
+    static func effective(for gameID: String?) -> (ScreenScaling, Bool) {
+        let own: GameSettings? = gameID.flatMap { GameLibrary.shared.gameSettings[$0] }
+        let mode: ScreenScaling = own?.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? saved
+        return (mode, own?.sharpPixels ?? savedSharp)
+    }
+
+    /// Put the running game's (else Settings') scaling on screen.
+    static func reapply() {
+        let (mode, sharp) = effective(for: currentGameID)
+        MetalBackedView.applyScaling(mode, sharp: sharp)
+    }
+}
+
 // SwiftUI-hosted placeholder: geometry + touch input only.
 final class MetalBackedView: UIView {
     private static var layerRegistered = false
@@ -192,12 +234,62 @@ final class MetalBackedView: UIView {
         return (env("MADEIRA_SCREEN_W", 1024), env("MADEIRA_SCREEN_H", 768))
     }
 
+    /// ml896: the live scaling -- the running game's own, else Settings'.
+    private(set) static var scaling: ScreenScaling = .fit
+    private(set) static var sharpPixels = false
+
+    static func applyScaling(_ mode: ScreenScaling, sharp: Bool) {
+        let changed = mode != scaling || sharp != sharpPixels
+        scaling = mode
+        sharpPixels = sharp
+        MetalHostView.shared.metalLayer.magnificationFilter = sharp ? .nearest : .linear
+        guard changed else { return }
+        LogStore.shared.log("[screen] ml896 scaling \(mode.rawValue)" + (sharp ? ", sharp pixels" : ""))
+        liveTarget()?.setNeedsLayout()
+    }
+
+    /// Where the game picture goes in this view; touch mapping uses the same
+    /// rect. ml896: Fit (every earlier build) shows all of it with bars, Fill
+    /// covers the view and crops, Stretch fills it out of shape, Whole-number
+    /// is the largest whole multiple of the picture in device pixels (Fit when
+    /// even 1x does not fit), on whole pixels so pixel-art stays even.
     private func gameRect() -> CGRect {
         let (gw, gh) = Self.logicalScreen()
-        let scale = min(bounds.width / gw, bounds.height / gh)
-        let w = gw * scale, h = gh * scale
-        return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2,
-                      width: max(w, 1), height: max(h, 1))
+        let bw = bounds.width, bh = bounds.height
+        let w: CGFloat, h: CGFloat
+        var x: CGFloat, y: CGFloat
+        switch Self.scaling {
+        case .fit:
+            let scale = min(bw / gw, bh / gh)
+            w = gw * scale
+            h = gh * scale
+        case .fill:
+            let scale = max(bw / gw, bh / gh)
+            w = gw * scale
+            h = gh * scale
+        case .stretch:
+            w = bw
+            h = bh
+        case .integer:
+            let px = traitCollection.displayScale > 0 ? traitCollection.displayScale : UIScreen.main.scale
+            let k = (min(bw * px / gw, bh * px / gh)).rounded(.down)
+            if k >= 1 {
+                w = gw * k / px
+                h = gh * k / px
+            } else {
+                let scale = min(bw / gw, bh / gh)
+                w = gw * scale
+                h = gh * scale
+            }
+        }
+        x = (bw - w) / 2
+        y = (bh - h) / 2
+        if Self.scaling == .integer {
+            let px = traitCollection.displayScale > 0 ? traitCollection.displayScale : UIScreen.main.scale
+            x = (x * px).rounded(.down) / px
+            y = (y * px).rounded(.down) / px
+        }
+        return CGRect(x: x, y: y, width: max(w, 1), height: max(h, 1))
     }
 
     override func didMoveToWindow() {
@@ -1747,6 +1839,9 @@ struct ContentView: View {
     @State private var showRuntimeStatus = false
     @State private var prefixSizeText = "Calculating…"
     @State private var freeSpaceText = "Calculating…"   // ml893: System status
+    /// ml896: Settings › Screen defaults (a game's ⋯ menu can override them).
+    @AppStorage(ScreenScaling.key) private var screenScalingSetting: String = ScreenScaling.fit.rawValue
+    @AppStorage(ScreenScaling.sharpKey) private var sharpPixelsSetting: Bool = false
     @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
@@ -2016,6 +2111,9 @@ struct ContentView: View {
             } else if id == nil {
                 GameLibrary.shared.endPlaying()
             }
+            // ml896: and so is the screen scaling (Settings' outside a game).
+            ScreenScaling.currentGameID = id
+            ScreenScaling.reapply()
         }
     }
 
@@ -3391,6 +3489,18 @@ struct ContentView: View {
                         }
                     }
                     Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch. Games start at this size on their first launch; after that they keep their own setting.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    // ml896: how the picture fills the screen
+                    Picker("Scaling", selection: $screenScalingSetting) {
+                        ForEach(ScreenScaling.allCases) { m in
+                            Text(m.label).tag(m.rawValue)
+                        }
+                    }
+                    .onChange(of: screenScalingSetting) { _, _ in ScreenScaling.reapply() }
+                    Toggle("Sharp pixels", isOn: $sharpPixelsSetting)
+                        .onChange(of: sharpPixelsSetting) { _, _ in ScreenScaling.reapply() }
+                    Text("Fit shows the whole picture with black bars, Fill covers the screen and crops the edges, Stretch fills it out of shape, and Whole-number scales by exactly 2x, 3x and so on, so pixel art stays even. Sharp pixels turns off the smoothing. A game's ⋯ menu can change both for that game.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

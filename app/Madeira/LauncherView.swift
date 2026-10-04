@@ -1707,6 +1707,45 @@ private struct OptionsSheet: View {
                                      FrameCap.apply(cap, persist: false)
                                  }
                              }))
+
+        // ml896: how the picture fills the screen, and sharp pixels. Both apply
+        // at once when this game is the one playing.
+        let scaleOptions: [String?] = [nil] + ScreenScaling.allCases.map { Optional($0.rawValue) }
+        let scaleText: String = s.scaling.flatMap { ScreenScaling(rawValue: $0) }?.label
+            ?? "Default (\(ScreenScaling.saved.label))"
+        out.append(OptionRow(id: "scaling", title: "Screen scaling",
+                             systemImage: "arrow.up.left.and.arrow.down.right",
+                             destructive: false, checked: false,
+                             trailing: scaleText,
+                             disabled: false,
+                             action: {
+                                 let cur: Int = scaleOptions.firstIndex(where: { $0 == s.scaling }) ?? 0
+                                 let next: String? = scaleOptions[(cur + 1) % scaleOptions.count]
+                                 library.updateSettings(for: id) { $0.scaling = next }
+                                 ScreenScaling.reapply()
+                             }))
+        let sharpText: String
+        switch s.sharpPixels {
+        case nil:          sharpText = "Default (\(ScreenScaling.savedSharp ? "On" : "Off"))"
+        case .some(true):  sharpText = "On"
+        case .some(false): sharpText = "Off"
+        }
+        out.append(OptionRow(id: "sharppixels", title: "Sharp pixels",
+                             systemImage: "square.grid.3x3",
+                             destructive: false, checked: false,
+                             trailing: sharpText,
+                             disabled: false,
+                             note: "For pixel-art games: no smoothing when the picture is scaled up.",
+                             action: {
+                                 let next: Bool?
+                                 switch s.sharpPixels {
+                                 case nil:          next = true
+                                 case .some(true):  next = false
+                                 case .some(false): next = nil
+                                 }
+                                 library.updateSettings(for: id) { $0.sharpPixels = next }
+                                 ScreenScaling.reapply()
+                             }))
         return out
     }
 

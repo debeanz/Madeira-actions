@@ -75,8 +75,13 @@ struct GameSettings: Codable, Equatable {
     var noTSO: Bool? = nil
     /// FrameCap raw value for this game; Settings' cap comes back when it ends.
     var frameCap: Int? = nil
+    /// ml896: ScreenScaling raw value, and sharp pixels, for this game.
+    var scaling: String? = nil
+    var sharpPixels: Bool? = nil
 
-    var isEmpty: Bool { resolution == nil && noTSO == nil && frameCap == nil }
+    var isEmpty: Bool {
+        resolution == nil && noTSO == nil && frameCap == nil && scaling == nil && sharpPixels == nil
+    }
 
     /// The resolutions Settings offers; the per-game row cycles the same list.
     static let resolutionOptions = [
