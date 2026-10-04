@@ -5,7 +5,15 @@ import UIKit
 /// with a "Getting ready" screen instead of leaving it looking frozen.
 final class JITWarmup: ObservableObject {
     static let shared = JITWarmup()
-    @Published var active = false
+    /// ml910: up from the very first frame when this launch will take the pool,
+    /// so the Games tab never shows (and looks usable) before the step.
+    @Published var active = StikJITHelper.startupStepPending
+
+    /// Any thread.
+    static func set(_ on: Bool) {
+        if Thread.isMainThread { shared.active = on }
+        else { DispatchQueue.main.async { shared.active = on } }
+    }
 }
 
 /// Helper to enable JIT via StikDebug/StikJIT URL scheme.
@@ -121,15 +129,23 @@ enum StikJITHelper {
 
     /// Allocate the pool now if a debugger is attached and none exists yet, then
     /// detach. Safe to call any time; it does nothing in every other case.
+    /// ml910: allocateEarly() will take the pool on this launch (the cover's
+    /// starting state).
+    static var startupStepPending: Bool { !poolReady && !debuggerDetached && isDebuggerAttached() }
+
     static func allocateEarly() {
         earlyLock.lock()
         let go = !earlyInFlight && !poolReady && !debuggerDetached && isDebuggerAttached()
         if go { earlyInFlight = true }
+        let inFlight = earlyInFlight
         earlyLock.unlock()
-        guard go else { return }
+        guard go else {
+            // ml910: no step is running: never leave the first-frame cover up
+            if !inFlight { JITWarmup.set(false) }
+            return
+        }
         // ml906: the "Getting ready" screen goes up first (callers are on main).
-        if Thread.isMainThread { JITWarmup.shared.active = true }
-        else { DispatchQueue.main.async { JITWarmup.shared.active = true } }
+        JITWarmup.set(true)
         // The BRK freezes the whole process for ~3.5 s; let the frame being
         // drawn now (with that screen) reach the screen first.
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
@@ -137,7 +153,7 @@ enum StikJITHelper {
                 earlyLock.lock()
                 earlyInFlight = false
                 earlyLock.unlock()
-                DispatchQueue.main.async { JITWarmup.shared.active = false }
+                JITWarmup.set(false)
             }
             if poolReady { return }
             LogStore.shared.log("[jit-pool] ml872 StikDebug is attached — taking the JIT pool now, " +

@@ -7677,7 +7677,12 @@ enum TouchControlsHost {
 struct JITWarmupView: View {
     var body: some View {
         ZStack {
-            Color.black.opacity(0.9).ignoresSafeArea()
+            // ml910: opaque, in the Games tab's own colours (#0E1117 to #06080C,
+            // LauncherPalette), so no game shows through while JIT is set up.
+            LinearGradient(colors: [Color(red: 14.0 / 255.0, green: 17.0 / 255.0, blue: 23.0 / 255.0),
+                                    Color(red: 6.0 / 255.0, green: 8.0 / 255.0, blue: 12.0 / 255.0)],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
             VStack(spacing: 14) {
                 SpinnerView()
                     .frame(width: 44, height: 44)
