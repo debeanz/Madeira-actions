@@ -107,9 +107,9 @@ enum ScreenScaling: String, CaseIterable, Identifiable {
     /// The Games-tab game running now (ContentView's session hook), nil outside one.
     static var currentGameID: String?
 
-    /// A game's own scaling, else the Settings default.
+    /// A game's own scaling (ml903: while its switch is on), else the Settings default.
     static func effective(for gameID: String?) -> ScreenScaling {
-        let own: GameSettings? = gameID.flatMap { GameLibrary.shared.gameSettings[$0] }
+        let own: GameSettings? = gameID.map { GameLibrary.activeSettings(for: $0) }
         return own?.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? saved
     }
 
@@ -1988,6 +1988,7 @@ struct ContentView: View {
             entitlements = EntitlementStatus.check()
             logEntitlementStatus()
             GamepadBridge.shared.start()
+            GameLibrary.shared.migrateOverrideSwitch()   // ml903, once
             FrameCap.apply(FrameCap.saved, persist: false)
             applySurfaceVisibility(tab: selectedTab)
             // ml791: controller drives the Games grid while that tab shows.
@@ -2219,7 +2220,7 @@ struct ContentView: View {
         // Settings defaults. The resolution is the logical screen for the
         // whole session part this game runs in; the TSO switch travels to the
         // agent as the tso= line because FEX loads its config per process.
-        let perGame = GameLibrary.shared.settings(for: game.id)
+        let perGame = GameLibrary.activeSettings(for: game.id)   // ml903: its own only while its switch is on
         let (screenW0, screenH0) = perGame.resolution.flatMap(GameSettings.size) ?? desktopSize
         let effectiveNoTSO: Bool = perGame.noTSO ?? fexNoTSO
         setenv("MADEIRA_SCREEN_W", String(screenW0), 1)
@@ -2236,7 +2237,7 @@ struct ContentView: View {
                          + (monoSuspend.map { ", 32-bit .NET: MONO_THREADS_SUSPEND=\($0)" } ?? "") + ")")
             if !args.isEmpty {
                 logStore.log("Games: \(game.title) — "
-                             + (perGame.resolution != nil ? "this game's resolution" : "first launch")
+                             + (perGame.resolutionChosen == true ? "this game's resolution" : "first launch")
                              + " \(screenW0)x\(screenH0) (Unity: \(args))")
             }
             // ml837: args = GameResolutionDefault's Unity screen options, or "".
@@ -2307,8 +2308,9 @@ struct ContentView: View {
                     var probe = game
                     probe.lastPlayed = lastPlayed
                     let args: String
-                    if perGame.resolution != nil, let exe = probe.exe, GameResolutionDefault.isUnity(exe: exe) {
+                    if perGame.resolutionChosen == true, let exe = probe.exe, GameResolutionDefault.isUnity(exe: exe) {
                         // ml849: a per-game resolution is asked for on EVERY launch, saved size or not.
+                        // ml903: only one picked for the game, not one its switch filled in.
                         args = GameResolutionDefault.arguments(width: screenW0, height: screenH0)
                     } else {
                         args = GameResolutionDefault.launchArgs(for: probe, width: screenW0, height: screenH0)
@@ -6003,7 +6005,8 @@ final class TouchControlsModel: ObservableObject {
         if gameID == nil { defaults = snapshot() }
         let base = defaults ?? snapshot()
         gameID = id
-        let own = id.flatMap { profiles[$0] }
+        // ml903: a game's own controls only while its switch is on.
+        let own = id.flatMap { GameLibrary.usesOwnSettings($0) ? profiles[$0] : nil }
         // ml887: a game without its own controls changes nothing on screen.
         let target = Self.merged(own, over: base)
         if target != snapshot() { apply(target) }
@@ -6015,8 +6018,32 @@ final class TouchControlsModel: ObservableObject {
         if id == nil { defaults = nil }
     }
 
-    /// ml886: whether the running game has controls of its own.
-    var gameHasOwnControls: Bool { gameID.map { profiles[$0] != nil } ?? false }
+    /// ml903: games with touch controls of their own (the switch's migration).
+    var gamesWithOwnProfiles: Set<String> { Set(profiles.keys) }
+
+    /// ml903: the running game's switch changed: its own controls (on) or the
+    /// defaults (off) go on screen.
+    func refreshGame() {
+        guard let id = gameID else { return }
+        let base = defaults ?? snapshot()
+        let own = GameLibrary.usesOwnSettings(id) ? profiles[id] : nil
+        let target = Self.merged(own, over: base)
+        if target != snapshot() { apply(target) }
+    }
+
+    /// ml903: a game's switch was turned on. Its profile gets every part it has
+    /// not got yet from what it uses now (`replace`: all of them, so a change
+    /// made in game keeps the rest exactly as it is on screen).
+    func fillOwnProfile(forGame id: String, replace: Bool) {
+        let now: GameControlsProfile = id == gameID ? snapshot() : (defaults ?? snapshot())
+        var own: GameControlsProfile = replace ? GameControlsProfile() : (profiles[id] ?? GameControlsProfile())
+        if own.mode == nil { own.mode = now.mode }
+        if own.visible == nil { own.visible = now.visible }
+        if own.custom == nil { own.custom = now.custom }
+        profiles[id] = own
+        objectWillChange.send()
+        persist()
+    }
 
     // MARK: ml894 controller, presets, layout files
 
@@ -6154,10 +6181,6 @@ final class TouchControlsModel: ObservableObject {
         return p.mode.flatMap { TouchControlsMode(rawValue: $0) } == .xbox ? .xbox : .custom
     }
 
-    /// ml902: Settings' choice, what a game without its own gets (the defaults
-    /// kept while a game runs, else the live ones).
-    var defaultChoice: TouchControlsChoice { Self.choice(of: defaults ?? snapshot()) }
-
     /// What a game gets: its own choice, else the default. The running game's
     /// is what is on screen.
     func choice(forGame id: String) -> TouchControlsChoice {
@@ -6190,11 +6213,17 @@ final class TouchControlsModel: ObservableObject {
         // differ from the defaults (or were already its own) become its own.
         if let id = gameID {
             let live = snapshot(), base = defaults ?? live
-            var own = profiles[id] ?? GameControlsProfile()
-            if own.mode != nil || live.mode != base.mode { own.mode = live.mode }
-            if own.visible != nil || live.visible != base.visible { own.visible = live.visible }
-            if own.custom != nil || live.custom != base.custom { own.custom = live.custom }
-            profiles[id] = own.isEmpty ? nil : own
+            if GameLibrary.usesOwnSettings(id) {
+                var own = profiles[id] ?? GameControlsProfile()
+                if own.mode != nil || live.mode != base.mode { own.mode = live.mode }
+                if own.visible != nil || live.visible != base.visible { own.visible = live.visible }
+                if own.custom != nil || live.custom != base.custom { own.custom = live.custom }
+                profiles[id] = own.isEmpty ? nil : own
+            } else if live.mode != base.mode || live.visible != base.visible || live.custom != base.custom {
+                // ml903: changed in game while the game uses Madeira's settings: from
+                // now on they are its own (next turn: this runs inside a didSet).
+                DispatchQueue.main.async { GameLibrary.shared.setOverride(true, for: id, inGame: true) }
+            }
         }
         persist()
     }
@@ -7581,6 +7610,9 @@ extension Notification.Name {
     static let madeiraCloseGame = Notification.Name("MadeiraCloseGame")
     /// ml863: the toolbar ⋯ menu's "Report Compatibility" for the running game.
     static let madeiraReportGame = Notification.Name("MadeiraReportGame")
+    /// ml903: a change in game turned the game's "Override Madeira settings"
+    /// switch on; userInfo["title"] is the game's title.
+    static let madeiraGameOwnSettings = Notification.Name("MadeiraGameOwnSettings")
 }
 
 struct TouchControlsOverlay: View {
@@ -7782,6 +7814,11 @@ struct TouchControlsOverlay: View {
         // when the game appears.
         .onChange(of: m.launchPanelUp) { _, up in if !up { showChrome() } }
         // ml858: the save the toolbar asked for is done.
+        .onReceive(NotificationCenter.default.publisher(for: .madeiraGameOwnSettings)) { note in
+            // ml903: said once, when a change in game makes the settings the game's own
+            let title: String = (note.userInfo?["title"] as? String) ?? "this game"
+            showLogToast("Now using " + title + "'s own settings", for: 2.5)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .madeiraLogSaved)) { note in
             if note.userInfo?["name"] is String {
                 let folder = (note.userInfo?["folder"] as? String).map { " › \($0)" } ?? ""
@@ -7898,19 +7935,18 @@ struct TouchControlsOverlay: View {
     /// Screen scaling and the frame rate cap of the game being
     /// played. Each row shows the value the game runs with and cycles the
     /// values, applies at once and is saved for this game: the same rows as
-    /// its ⋯ menu in the Games tab (ml902: no separate "Default" entry; the
-    /// value Settings has is stored as none). The menu stays open, so a tap
-    /// shows the result right away.
+    /// its ⋯ menu in the Games tab. ml903: a change here while the game uses
+    /// Madeira's settings turns its "Override Madeira settings" switch on.
+    /// The menu stays open, so a tap shows the result right away.
     @ViewBuilder
     private func gameDisplayRows(_ id: String) -> some View {
-        let s: GameSettings = library.gameSettings[id] ?? GameSettings()
-        panelRow("Screen scaling", system: "arrow.up.left.and.arrow.down.right", value: scalingText(s),
-                 overrides: currentScaling(s) != ScreenScaling.saved) {
+        let _ = library.overrideOn     // re-render on a switch change
+        let s: GameSettings = GameLibrary.activeSettings(for: id)
+        panelRow("Screen scaling", system: "arrow.up.left.and.arrow.down.right", value: scalingText(s)) {
             cycleScaling(id, s)
         }
         Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
-        panelRow("Frame rate cap", system: "speedometer", value: capText(s),
-                 overrides: currentCap(s) != FrameCap.saved) {
+        panelRow("Frame rate cap", system: "speedometer", value: capText(s)) {
             cycleFrameCap(id, s)
         }
     }
@@ -7932,13 +7968,15 @@ struct TouchControlsOverlay: View {
         let modes: [ScreenScaling] = Array(ScreenScaling.allCases)
         let cur: Int = modes.firstIndex(of: currentScaling(s)) ?? -1
         let next: ScreenScaling = modes[(cur + 1) % modes.count]
-        library.updateSettings(for: id) { $0.scaling = (next == ScreenScaling.saved) ? nil : next.rawValue }
+        library.setOverride(true, for: id, inGame: true)   // ml903: no-op when already on
+        library.updateSettings(for: id) { $0.scaling = next.rawValue }
         ScreenScaling.reapply()
     }
 
     private func cycleFrameCap(_ id: String, _ s: GameSettings) {
         let next: FrameCap = currentCap(s).next
-        library.updateSettings(for: id) { $0.frameCap = (next == FrameCap.saved) ? nil : Int(next.rawValue) }
+        library.setOverride(true, for: id, inGame: true)   // ml903
+        library.updateSettings(for: id) { $0.frameCap = Int(next.rawValue) }
         FrameCap.apply(next, persist: false)
     }
 
@@ -7973,10 +8011,10 @@ struct TouchControlsOverlay: View {
                 .foregroundStyle(Color.white.opacity(0.5))
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
-            // ml886: per game. Says whose controls these are.
-            if let title = m.gameTitle {
-                Text(m.gameHasOwnControls || pad.gameHasOwnSettings ? "\(title)'s own controls"
-                                                                    : "Changes are saved for \(title)")
+            // ml886: per game. Says whose controls these are. ml903: the game's own
+            // while its "Override Madeira settings" switch is on; a change here turns it on.
+            if let title = m.gameTitle, let id = m.gameID {
+                Text(library.overridesSettings(id) ? "\(title)'s own settings" : "Madeira's settings")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Color.white.opacity(0.62))
                     .lineLimit(1)
@@ -8187,24 +8225,20 @@ struct TouchControlsOverlay: View {
     /// current value and a chevron, or a checkmark. Unlike menuRow it keeps
     /// the panel open.
     private func panelRow(_ title: String, system: String? = nil, value: String? = nil,
-                          checked: Bool = false, chevron: Bool = false, overrides: Bool = false,
+                          checked: Bool = false, chevron: Bool = false,
                           _ action: @escaping () -> Void) -> some View {
         Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             showChrome()
             withAnimation(.easeInOut(duration: 0.15)) { action() }
         } label: {
-            panelRowLabel(title, system: system, value: value, checked: checked, chevron: chevron,
-                          overrides: overrides)
+            panelRowLabel(title, system: system, value: value, checked: checked, chevron: chevron)
         }
         .buttonStyle(.plain)
     }
 
-    /// ml902: `overrides` -- the running game's own value differs from
-    /// Madeira's Settings: the override dot before the value.
     private func panelRowLabel(_ title: String, system: String? = nil, value: String? = nil,
-                               checked: Bool = false, chevron: Bool = false,
-                               overrides: Bool = false) -> some View {
+                               checked: Bool = false, chevron: Bool = false) -> some View {
         HStack(spacing: 12) {
             if let system {
                 Image(systemName: system)
@@ -8215,12 +8249,6 @@ struct TouchControlsOverlay: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
             Spacer(minLength: 8)
-            if overrides {
-                Circle()
-                    .fill(SteamPalette.accent)
-                    .frame(width: 7, height: 7)
-                    .accessibilityLabel("Overrides Madeira settings")
-            }
             if let value {
                 Text(value)
                     .foregroundStyle(Color.white.opacity(0.62))
@@ -8246,7 +8274,6 @@ struct TouchControlsOverlay: View {
 
     private func padModeTile(_ title: String, icon: String, native: Bool) -> some View {
         let on = pad.native == native
-        let own: Bool = on && pad.native != pad.defaultSendsXbox   // ml902
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             showChrome()
@@ -8270,7 +8297,6 @@ struct TouchControlsOverlay: View {
                             .fill(on ? SteamPalette.accent : Color(red: 0.12, green: 0.15, blue: 0.20)))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(Color.white.opacity(on ? 0.18 : 0.08), lineWidth: 1))
-            .overlay(alignment: .topTrailing) { overrideTileDot(own) }
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(.plain)
@@ -8280,7 +8306,6 @@ struct TouchControlsOverlay: View {
     /// is up now under the toolbar.
     private func choiceTile(_ c: TouchControlsChoice) -> some View {
         let on = m.choice == c
-        let own: Bool = on && m.choice != m.defaultChoice   // ml902
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             withAnimation(.easeInOut(duration: 0.18)) { openMenu = nil }
@@ -8305,22 +8330,9 @@ struct TouchControlsOverlay: View {
                             .fill(on ? SteamPalette.accent : Color(red: 0.12, green: 0.15, blue: 0.20)))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(Color.white.opacity(on ? 0.18 : 0.08), lineWidth: 1))
-            .overlay(alignment: .topTrailing) { overrideTileDot(own) }
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(.plain)
-    }
-
-    /// ml902: the override dot on a picked tile (white: the tile is accent).
-    @ViewBuilder
-    private func overrideTileDot(_ show: Bool) -> some View {
-        if show {
-            Circle()
-                .fill(Color.white)
-                .frame(width: 7, height: 7)
-                .padding(7)
-                .accessibilityLabel("Overrides Madeira settings")
-        }
     }
 
     /// One menu row. Picking it closes the menu and restarts the toolbar's
@@ -8876,10 +8888,11 @@ enum ShaderCache {
     static var desktopDir: URL? { buildDir?.appendingPathComponent("desktop", isDirectory: true) }
 
     /// What madeira-agent gets for this launch: an absolute directory, or "off".
-    /// Off when either switch is off, or when the path would not fit DXMT's
-    /// MAX_PATH environment buffer (it would silently read as empty).
+    /// Off when the game runs without one (ml903: its own switch while it
+    /// overrides Madeira's settings, else Settings'), or when the path would not
+    /// fit DXMT's MAX_PATH environment buffer (it would silently read as empty).
     static func launchValue(for game: LauncherGame) -> String {
-        guard enabled, GameLibrary.shared.isShaderCacheEnabled(for: game.id),
+        guard GameLibrary.shared.isShaderCacheEnabled(for: game.id),
               let dir = dir(forGameID: game.id) else { return "off" }
         guard dir.path.utf16.count < 250 else {
             LogStore.shared.log("DXMT shader cache: path too long for DXMT (\(dir.path.utf16.count)), off for \(game.title)",
@@ -8961,7 +8974,7 @@ enum ShaderCache {
     /// called on the main queue; done(0, 0) at once when nothing is cached.
     static func preload(for game: LauncherGame, progress: @escaping (Double) -> Void,
                         done: @escaping (Int64, Double) -> Void) {
-        guard enabled, GameLibrary.shared.isShaderCacheEnabled(for: game.id),
+        guard GameLibrary.shared.isShaderCacheEnabled(for: game.id),
               let d = dir(forGameID: game.id) else { done(0, 0); return }
         DispatchQueue.global(qos: .userInitiated).async {
             let files = ((try? FileManager.default.contentsOfDirectory(at: d, includingPropertiesForKeys: [.fileSizeKey])) ?? [])

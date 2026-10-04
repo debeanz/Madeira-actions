@@ -28,7 +28,8 @@ import UIKit
 // folder that no other entry touches and that is not part of Steam);
 // anything else is only taken out of the library. Either way the per-game
 // settings, covers and DXMT shader cache go with it. Each game can also turn
-// its shader cache off (shaderCacheOff).
+// its shader cache off (ml903: GameSettings.shaderCache, behind its "Override
+// Madeira settings" switch).
 //
 // Resolution (ml837): Unity games start at the Settings resolution until they
 // have saved one of their own (GameResolutionDefault at the end of this file).
@@ -62,10 +63,12 @@ struct LauncherGame: Identifiable, Equatable {
     }
 }
 
-/// ml849: one game's overrides of the Settings defaults. nil = the value in
-/// Settings at launch time (ml902: also what picking Settings' own value in a
-/// game's ⋯ menu stores; there is no separate "Default" entry any more). Kept
-/// in UserDefaults "madeira.launcher.gameSettings" as JSON keyed by game id.
+/// ml849: one game's own values for the Settings defaults. Kept in
+/// UserDefaults "madeira.launcher.gameSettings" as JSON keyed by game id.
+/// ml903: they apply only while the game's "Override Madeira settings" switch
+/// is on (GameLibrary.activeSettings); turning it on fills in every value the
+/// game does not have yet, turning it off keeps them for next time. nil = the
+/// Settings value.
 struct GameSettings: Codable, Equatable {
     /// Logical screen for this game as "WxH" (Settings → Desktop resolution
     /// otherwise). A Unity game also gets it as -screen-width/-height on every
@@ -79,9 +82,17 @@ struct GameSettings: Codable, Equatable {
     /// ml896: ScreenScaling raw value for this game. (ml899: its sharp-pixels
     /// switch is gone; an old saved value is simply not decoded.)
     var scaling: String? = nil
+    /// ml903: this game's shader cache switch (ml830 kept it as the list
+    /// "madeira.launcher.shaderCacheOff", moved here once).
+    var shaderCache: Bool? = nil
+    /// ml903: `resolution` was picked for this game (its ⋯ menu) rather than
+    /// filled in when its switch was turned on. Only a picked one is asked of
+    /// a Unity game on EVERY launch (ml849); a filled one is just its screen.
+    var resolutionChosen: Bool? = nil
 
     var isEmpty: Bool {
-        resolution == nil && noTSO == nil && frameCap == nil && scaling == nil
+        resolution == nil && noTSO == nil && frameCap == nil && scaling == nil && shaderCache == nil
+            && resolutionChosen == nil
     }
 
     /// The resolutions Settings offers; the per-game row cycles the same list.
@@ -104,9 +115,9 @@ final class GameLibrary: ObservableObject {
     @Published private(set) var icons: [String: UIImage] = [:]
     @Published private(set) var scanning = false
     @Published private(set) var lastScan: Date? = nil
-    /// ml830: ids whose own shader cache switch is OFF (default is on).
-    /// Persisted in UserDefaults "madeira.launcher.shaderCacheOff".
-    @Published private(set) var shaderCacheOff: Set<String> = []
+    /// ml903: ids whose "Override Madeira settings" switch is on. Persisted in
+    /// UserDefaults "madeira.launcher.overrideOn".
+    @Published private(set) var overrideOn: Set<String> = []
     /// ml849: per-game overrides (resolution, TSO switch, frame cap) by game id.
     @Published private(set) var gameSettings: [String: GameSettings] = [:]
     /// ml893: game ids pinned to the top of the Games tab.
@@ -138,7 +149,7 @@ final class GameLibrary: ObservableObject {
                 LogStore.shared.log("Games: \(count) hidden game(s) are shown again (Hide was replaced by Delete)")
             }
         }
-        shaderCacheOff = Set(defaults.stringArray(forKey: GameLibrary.shaderCacheOffKey) ?? [])
+        overrideOn = Set(defaults.stringArray(forKey: GameLibrary.overrideKey) ?? [])
     }
 
     /// Games with a lastPlayed date, newest first, at most 10.
@@ -298,23 +309,16 @@ final class GameLibrary: ObservableObject {
 
     // MARK: Shader cache (ml830)
 
-    /// This game's own shader cache switch (ShaderCache.enabled is the global
-    /// one). Reads UserDefaults rather than the @Published set, so it is safe
-    /// to call from a background queue.
+    /// Whether this game runs with a shader cache: its own switch while it
+    /// overrides Madeira's settings (ml903), else Settings' (ShaderCache.enabled).
+    /// Reads UserDefaults, so it is safe to call from a background queue.
     func isShaderCacheEnabled(for id: String) -> Bool {
-        !(UserDefaults.standard.stringArray(forKey: GameLibrary.shaderCacheOffKey) ?? []).contains(id)
+        GameLibrary.activeSettings(for: id).shaderCache ?? ShaderCache.enabled
     }
 
-    /// Main thread.
+    /// Main thread. The game's own switch (its ⋯ menu, override on).
     func setShaderCacheEnabled(_ on: Bool, for id: String) {
-        var off = shaderCacheOff
-        if on {
-            guard off.remove(id) != nil else { return }
-        } else {
-            guard off.insert(id).inserted else { return }
-        }
-        UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
-        shaderCacheOff = off
+        updateSettings(for: id) { $0.shaderCache = on }
         LogStore.shared.log("Games: shader cache \(on ? "on" : "off") for \(game(withID: id)?.title ?? id)")
     }
 
@@ -364,9 +368,109 @@ final class GameLibrary: ObservableObject {
         return dict
     }
 
-    /// This game's overrides (all nil when it has none).
+    /// This game's own values, whether or not its switch is on (all nil when it
+    /// has none). What it runs with is activeSettings(for:).
     func settings(for id: String) -> GameSettings {
         GameLibrary.loadGameSettings()[id] ?? GameSettings()
+    }
+
+    // MARK: Override Madeira settings (ml903)
+
+    private static let overrideKey = "madeira.launcher.overrideOn"
+    private static let overrideMigratedKey = "madeira.launcher.overrideMigrated"
+
+    /// Whether a game uses its own settings. Reads UserDefaults: any thread.
+    static func usesOwnSettings(_ id: String) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: overrideKey) ?? []).contains(id)
+    }
+
+    /// Main thread (the published copy).
+    func overridesSettings(_ id: String) -> Bool { overrideOn.contains(id) }
+
+    /// The settings a game runs with: its own while its switch is on, else none
+    /// (every field nil = Madeira's Settings). Any thread.
+    static func activeSettings(for id: String) -> GameSettings {
+        guard usesOwnSettings(id) else { return GameSettings() }
+        return loadGameSettings()[id] ?? GameSettings()
+    }
+
+    /// The frame rate cap a game runs with. Any thread.
+    static func effectiveFrameCap(for id: String) -> FrameCap {
+        activeSettings(for: id).frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
+    }
+
+    /// Main thread. Turn a game's switch on or off; the running game takes the
+    /// change at once (frame rate cap, scaling, touch controls, controller).
+    /// On from its ⋯ menu: the values it kept from last time come back, and
+    /// every value it has not got yet is Madeira's current one. On because of a
+    /// change made in game (`inGame`): every value is what it uses right now,
+    /// so nothing but that change differs, and the toolbar says so. Off:
+    /// Madeira's settings again; its values are kept for next time.
+    func setOverride(_ on: Bool, for id: String, inGame: Bool = false) {
+        guard on != overrideOn.contains(id) else { return }
+        if on { fillOwnSettings(for: id, replace: inGame) }
+        var ids: Set<String> = overrideOn
+        if on { ids.insert(id) } else { ids.remove(id) }
+        UserDefaults.standard.set(ids.sorted(), forKey: GameLibrary.overrideKey)
+        overrideOn = ids
+        let title: String = game(withID: id)?.title ?? id
+        LogStore.shared.log("Games: \(title) " + (on ? "uses its own settings" : "uses Madeira's settings")
+                            + (inGame ? " (changed in game)" : ""))
+        TouchControlsModel.shared.refreshGame()
+        GamepadBridge.shared.refreshGame()
+        if ScreenScaling.currentGameID == id {
+            ScreenScaling.reapply()
+            FrameCap.apply(GameLibrary.effectiveFrameCap(for: id), persist: false)
+        }
+        if on && inGame {
+            NotificationCenter.default.post(name: .madeiraGameOwnSettings, object: nil,
+                                            userInfo: ["title": title])
+        }
+    }
+
+    /// `replace`: every value from what the game uses now (Madeira's, since its
+    /// switch is off); else only the values it does not have yet.
+    private func fillOwnSettings(for id: String, replace: Bool) {
+        let d = UserDefaults.standard
+        let res: String = d.string(forKey: GameResolutionDefault.settingKey) ?? GameResolutionDefault.settingDefault
+        let noTSO: Bool = d.bool(forKey: "madeira.fexNoTSO")
+        updateSettings(for: id) { s in
+            if replace { s.resolutionChosen = nil }
+            if replace || s.resolution == nil { s.resolution = res }
+            if replace || s.noTSO == nil { s.noTSO = noTSO }
+            if replace || s.frameCap == nil { s.frameCap = Int(FrameCap.saved.rawValue) }
+            if replace || s.scaling == nil { s.scaling = ScreenScaling.saved.rawValue }
+            if replace || s.shaderCache == nil { s.shaderCache = ShaderCache.enabled }
+        }
+        TouchControlsModel.shared.fillOwnProfile(forGame: id, replace: replace)
+        GamepadBridge.shared.fillOwnProfile(forGame: id, replace: replace)
+    }
+
+    /// Once (ContentView's first appearance): a game that already had values
+    /// of its own -- any per-game setting, its shader cache turned off, its own
+    /// touch controls or controller settings -- starts with its switch on, so
+    /// nothing changes for it.
+    func migrateOverrideSwitch() {
+        let d = UserDefaults.standard
+        guard !d.bool(forKey: GameLibrary.overrideMigratedKey) else { return }
+        d.set(true, forKey: GameLibrary.overrideMigratedKey)
+        var ids: Set<String> = []
+        for (id, own) in GameLibrary.loadGameSettings() where !own.isEmpty {
+            ids.insert(id)
+            // a resolution set before the switch existed was picked for the game
+            if own.resolution != nil { updateSettings(for: id) { $0.resolutionChosen = true } }
+        }
+        for id in d.stringArray(forKey: GameLibrary.shaderCacheOffKey) ?? [] {
+            updateSettings(for: id) { $0.shaderCache = false }
+            ids.insert(id)
+        }
+        d.removeObject(forKey: GameLibrary.shaderCacheOffKey)
+        ids.formUnion(TouchControlsModel.shared.gamesWithOwnProfiles)
+        ids.formUnion(GamepadBridge.shared.gamesWithOwnProfiles)
+        for id in ids.sorted() { setOverride(true, for: id) }
+        if !ids.isEmpty {
+            LogStore.shared.log("Games: ml903 \(ids.count) game(s) had settings of their own and keep them (Override Madeira settings on)")
+        }
     }
 
     /// Main thread. A game whose overrides are all back to Default drops out
@@ -712,10 +816,11 @@ final class GameLibrary: ObservableObject {
             UserDefaults.standard.set(playSeconds, forKey: GameLibrary.playSecondsKey)
         }
         folderBytes[id] = nil
-        var off = shaderCacheOff
-        if off.remove(id) != nil {
-            UserDefaults.standard.set(off.sorted(), forKey: GameLibrary.shaderCacheOffKey)
-            shaderCacheOff = off
+        if overrideOn.contains(id) {   // ml903
+            var ids: Set<String> = overrideOn
+            ids.remove(id)
+            UserDefaults.standard.set(ids.sorted(), forKey: GameLibrary.overrideKey)
+            overrideOn = ids
         }
 
         var ownExes: Set<String> = []

@@ -1348,9 +1348,10 @@ private struct OptionRow: Identifiable {
     /// ml899: one of a set of choices: the checkmark's room is kept when it is
     /// not checked, so checking it never re-wraps the row's text.
     var radio: Bool = false
-    /// ml902: this game's own value differs from Madeira's Settings: the row
-    /// shows the override dot.
-    var overrides: Bool = false
+    /// ml903: drawn as an on/off switch (a tap or A flips it).
+    var switchOn: Bool? = nil
+    /// ml903: opens a page of its own.
+    var chevron: Bool = false
     let action: () -> Void
 }
 
@@ -1416,6 +1417,8 @@ private struct OptionsSheet: View {
     @State private var bindPicking: GamepadElement? = nil
     /// ml890: the Key binds page (Send as keyboard) is showing.
     @State private var showingBinds: Bool = false
+    /// ml903: the Controls page (touch screen controls, physical controller).
+    @State private var showingControls: Bool = false
     @State private var showingExecutables: Bool = false
     /// ml830: this game's shader cache on disk; nil until measured off main.
     @State private var cacheBytes: Int64? = nil
@@ -1472,6 +1475,9 @@ private struct OptionsSheet: View {
         if showingBinds {
             return bindRows(g)
         }
+        if showingControls {
+            return controlsRows(g)   // ml903
+        }
         if showingExecutables {
             return executableRows(g)
         }
@@ -1491,11 +1497,14 @@ private struct OptionsSheet: View {
                       action: {
                           library.setExecutable(exe, for: g)
                           showingExecutables = false
-                          model.highlight = 1
+                          model.highlight = exeRowIndex()   // ml903: the rows moved into sections
                       })
         }
     }
 
+    /// ml903: the menu in sections -- the game itself, its settings, logs and
+    /// reports, storage -- after Play (Force close while it runs) and the
+    /// favourite star.
     private func mainRows(_ g: LauncherGame) -> [OptionRow] {
         var out: [OptionRow] = []
         let canPlay = !g.only32Bit && !isEnded
@@ -1506,44 +1515,6 @@ private struct OptionsSheet: View {
                                  dismiss()
                                  onPlay(g)
                              }))
-        // ml893: pinned to the top of the Games tab.
-        let favorite: Bool = library.isFavorite(g.id)
-        out.append(OptionRow(id: "favorite", title: favorite ? "Remove from Favourites" : "Add to Favourites",
-                             systemImage: favorite ? "star.slash" : "star",
-                             destructive: false, checked: false,
-                             action: { library.toggleFavorite(g.id) }))
-        if g.candidates.count > 1 {
-            out.append(OptionRow(id: "exe", title: "Change executable", systemImage: "doc.badge.gearshape",
-                                 destructive: false, checked: false,
-                                 action: {
-                                     showingExecutables = true
-                                     model.highlight = 0
-                                 }))
-        }
-        out.append(OptionRow(id: "rename", title: "Rename", systemImage: "pencil",
-                             destructive: false, checked: false,
-                             action: {
-                                 dismiss()
-                                 onRename(g)
-                             }))
-        out.append(OptionRow(id: "cover", title: "Change cover", systemImage: "photo",
-                             destructive: false, checked: false,
-                             action: {
-                                 dismiss()
-                                 onChangeCover(g)
-                             }))
-        if covers.covers[g.id] != nil || g.steamAppID != nil {
-            out.append(OptionRow(id: "removecover", title: "Remove cover", systemImage: "xmark.rectangle",
-                                 destructive: false, checked: false,
-                                 action: {
-                                     covers.clearCover(for: g)
-                                     dismiss()
-                                 }))
-        }
-        out.append(contentsOf: shaderCacheRows(g))
-        out.append(contentsOf: perGameSettingRows(g))   // ml849
-        out.append(contentsOf: controlsRows(g))         // ml889
-        let afterControls: Int = out.count
         if case .playing(let t) = session, t == g.title {
             out.append(OptionRow(id: "forceclose", title: "Force close", systemImage: "xmark.octagon",
                                  destructive: true, checked: false,
@@ -1552,70 +1523,222 @@ private struct OptionsSheet: View {
                                      dismiss()
                                  }))
         }
+        // ml893: pinned to the top of the Games tab.
+        let favorite: Bool = library.isFavorite(g.id)
+        out.append(OptionRow(id: "favorite", title: favorite ? "Remove from Favourites" : "Add to Favourites",
+                             systemImage: favorite ? "star.slash" : "star",
+                             destructive: false, checked: false,
+                             action: { library.toggleFavorite(g.id) }))
+
+        var gameRows: [OptionRow] = []
+        if g.candidates.count > 1 {
+            gameRows.append(OptionRow(id: "exe", title: "Change executable", systemImage: "doc.badge.gearshape",
+                                      destructive: false, checked: false,
+                                      action: {
+                                          showingExecutables = true
+                                          model.highlight = 0
+                                      }))
+        }
+        gameRows.append(OptionRow(id: "rename", title: "Rename", systemImage: "pencil",
+                                  destructive: false, checked: false,
+                                  action: {
+                                      dismiss()
+                                      onRename(g)
+                                  }))
+        gameRows.append(OptionRow(id: "cover", title: "Change cover", systemImage: "photo",
+                                  destructive: false, checked: false,
+                                  action: {
+                                      dismiss()
+                                      onChangeCover(g)
+                                  }))
+        if covers.covers[g.id] != nil || g.steamAppID != nil {
+            gameRows.append(OptionRow(id: "removecover", title: "Remove cover", systemImage: "xmark.rectangle",
+                                      destructive: false, checked: false,
+                                      action: {
+                                          covers.clearCover(for: g)
+                                          dismiss()
+                                      }))
+        }
+        gameRows[0].section = "Game"
+        out.append(contentsOf: gameRows)
+
+        out.append(contentsOf: settingsRows(g))
+
+        var logRows: [OptionRow] = []
         // ml857: a dated copy of this game's log in Documents/logs (ml866: in the
         // game's folder). No dismiss: the row itself says where the file went (an
         // alert would leave the pad dead).
-        out.append(OptionRow(id: "savelog", title: "Save Log", systemImage: "doc.text",
-                             destructive: false, checked: false,
-                             trailing: savingLog ? "Saving…" : saveLogResult,
-                             action: {
-                                 guard !savingLog else { return }
-                                 savingLog = true
-                                 GameLogSaver.save(game: g) { name in
-                                     savingLog = false
-                                     saveLogResult = name.map { _ in
-                                         "Saved to logs › \(GameLogSaver.folder(for: g.title))"
-                                     } ?? "No log to save"
-                                 }
-                             }))
+        logRows.append(OptionRow(id: "savelog", title: "Save Log", systemImage: "doc.text",
+                                 destructive: false, checked: false,
+                                 trailing: savingLog ? "Saving…" : saveLogResult,
+                                 action: {
+                                     guard !savingLog else { return }
+                                     savingLog = true
+                                     GameLogSaver.save(game: g) { name in
+                                         savingLog = false
+                                         saveLogResult = name.map { _ in
+                                             "Saved to logs › \(GameLogSaver.folder(for: g.title))"
+                                         } ?? "No log to save"
+                                     }
+                                 }))
         // ml863: rate this game for the compatibility site, log attached.
-        out.append(OptionRow(id: "report", title: "Report Compatibility", systemImage: "paperplane",
-                             destructive: false, checked: false,
-                             action: { showReport = true }))
-        out.append(deleteRow(g))
-        // ml889: the rows after the Controls section do not belong to it.
-        if afterControls < out.count { out[afterControls].section = "" }
+        logRows.append(OptionRow(id: "report", title: "Report Compatibility", systemImage: "paperplane",
+                                 destructive: false, checked: false,
+                                 action: { showReport = true }))
+        logRows[0].section = "Logs and reports"
+        out.append(contentsOf: logRows)
+
+        var storageRows: [OptionRow] = clearShaderCacheRows(g)
+        storageRows.append(deleteRow(g))
+        storageRows[0].section = "Storage"
+        out.append(contentsOf: storageRows)
         return out
     }
 
-    // MARK: Shader cache (ml830)
+    // MARK: Settings (ml903)
 
-    /// "Shader cache" (per-game switch + size) and, when there is something
-    /// on disk, "Clear shader cache". Both are disabled while the game runs
-    /// or is still shutting down: its d3d11.dll reads the switch at launch
-    /// and holds the cache files open.
-    private func shaderCacheRows(_ g: LauncherGame) -> [OptionRow] {
-        let busy: Bool = busyGameIDs.contains(g.id)
-        let globalOn: Bool = ShaderCache.enabled
-        let on: Bool = library.isShaderCacheEnabled(for: g.id)
+    /// One switch decides whether this game uses Madeira's settings or its own.
+    /// Its own are listed only while it is on, grouped like Madeira's Settings:
+    /// Display, Performance, Graphics, Controls. Turning it on fills in every
+    /// value the game has not got yet with Madeira's current one; off keeps
+    /// them for next time (GameLibrary.setOverride).
+    private func settingsRows(_ g: LauncherGame) -> [OptionRow] {
         let id: String = g.id
-        var trailing: String = "…"
-        if !globalOn {
-            trailing = "Off in Settings"
-        } else if !on {
-            trailing = "Off"
-        } else if let bytes = cacheBytes {
-            trailing = ShaderCache.text(bytes)
-        }
+        let on: Bool = library.overridesSettings(id)
         var out: [OptionRow] = []
-        out.append(OptionRow(id: "shadercache", title: "Shader cache",
-                             systemImage: "square.stack.3d.down.right",
-                             destructive: false, checked: globalOn && on,
-                             trailing: trailing,
-                             disabled: !globalOn || busy,
-                             action: {
-                                 // No dismiss: the row stays where it is, and so does the highlight.
-                                 GameLibrary.shared.setShaderCacheEnabled(!on, for: id)
-                             }))
-        if let bytes = cacheBytes, bytes > 0 {
-            out.append(OptionRow(id: "clearshadercache",
-                                 title: clearingCache ? "Clearing shader cache…" : "Clear shader cache",
-                                 systemImage: "xmark.bin",
-                                 destructive: true, checked: false,
-                                 disabled: busy || clearingCache,
-                                 action: { clearShaderCache(id: id) }))
-        }
+        out.append(OptionRow(id: "override", title: "Override Madeira settings",
+                             systemImage: "gearshape.2",
+                             destructive: false, checked: false,
+                             note: on ? "Changes below are for this game only." : "This game uses Madeira's settings.",
+                             section: "Settings", switchOn: on,
+                             action: { library.setOverride(!on, for: id) }))
+        guard on else { return out }
+        out.append(contentsOf: perGameSettingRows(g))
+        out.append(shaderCacheRow(g))
+        out.append(controlsSummaryRow(g))
         return out
+    }
+
+    /// Resolution and screen scaling (Display), the frame rate cap and the x86
+    /// memory-ordering switch (Performance): the game's own values, each row
+    /// cycling them on tap or A. Resolution and the TSO switch reach the game
+    /// only at launch, so they are disabled while it runs; the scaling and the
+    /// cap apply at once when this game is the one playing, and Settings' cap
+    /// comes back when it ends.
+    private func perGameSettingRows(_ g: LauncherGame) -> [OptionRow] {
+        let busy: Bool = busyGameIDs.contains(g.id)
+        let id: String = g.id
+        let s: GameSettings = library.gameSettings[id] ?? GameSettings()
+        let defaults = UserDefaults.standard
+        var playingThis: Bool = false
+        if case .playing(let t) = session, t == g.title { playingThis = true }
+        var out: [OptionRow] = []
+
+        let globalRes: String = defaults.string(forKey: GameResolutionDefault.settingKey) ?? GameResolutionDefault.settingDefault
+        let curRes: String = s.resolution ?? globalRes
+        out.append(OptionRow(id: "resolution", title: "Resolution",
+                             systemImage: "rectangle.expand.vertical",
+                             destructive: false, checked: false,
+                             trailing: curRes,
+                             disabled: busy,
+                             header: "Display",
+                             action: {
+                                 let opts: [String] = GameSettings.resolutionOptions
+                                 let cur: Int = opts.firstIndex(of: curRes) ?? -1
+                                 let next: String = opts[(cur + 1) % opts.count]
+                                 library.updateSettings(for: id) {
+                                     $0.resolution = next
+                                     $0.resolutionChosen = true   // ml903: asked of a Unity game every launch
+                                 }
+                             }))
+
+        // ml896: how the picture fills the screen; applies at once when this
+        // game is the one playing.
+        let curScale: ScreenScaling = s.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? ScreenScaling.saved
+        out.append(OptionRow(id: "scaling", title: "Screen scaling",
+                             systemImage: "arrow.up.left.and.arrow.down.right",
+                             destructive: false, checked: false,
+                             trailing: curScale.label,
+                             action: {
+                                 let modes: [ScreenScaling] = Array(ScreenScaling.allCases)
+                                 let cur: Int = modes.firstIndex(of: curScale) ?? -1
+                                 let next: ScreenScaling = modes[(cur + 1) % modes.count]
+                                 library.updateSettings(for: id) { $0.scaling = next.rawValue }
+                                 ScreenScaling.reapply()
+                             }))
+
+        let curCap: FrameCap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
+        out.append(OptionRow(id: "framecap", title: "Frame rate cap",
+                             systemImage: "speedometer",
+                             destructive: false, checked: false,
+                             trailing: curCap.label,
+                             header: "Performance",
+                             action: {
+                                 let next: FrameCap = curCap.next
+                                 library.updateSettings(for: id) { $0.frameCap = Int(next.rawValue) }
+                                 if playingThis { FrameCap.apply(next, persist: false) }
+                             }))
+
+        let curNoTSO: Bool = s.noTSO ?? defaults.bool(forKey: "madeira.fexNoTSO")
+        out.append(OptionRow(id: "notso", title: "Skip x86 memory-ordering emulation",
+                             systemImage: "cpu",
+                             destructive: false, checked: false,
+                             trailing: curNoTSO ? "On" : "Off",
+                             disabled: busy,
+                             note: "Turning this on may improve performance in some games. If this game runs slowly, it is worth a try.",   // ml872
+                             action: {
+                                 library.updateSettings(for: id) { $0.noTSO = !curNoTSO }
+                             }))
+        return out
+    }
+
+    /// ml830: the game's own shader cache switch (Graphics). Disabled while the
+    /// game runs or is still shutting down: its d3d11.dll reads the switch at
+    /// launch and holds the cache files open.
+    private func shaderCacheRow(_ g: LauncherGame) -> OptionRow {
+        let busy: Bool = busyGameIDs.contains(g.id)
+        let id: String = g.id
+        let on: Bool = library.isShaderCacheEnabled(for: id)
+        return OptionRow(id: "shadercache", title: "Shader cache",
+                         systemImage: "square.stack.3d.down.right",
+                         destructive: false, checked: false,
+                         trailing: on ? "On" : "Off",
+                         disabled: busy,
+                         header: "Graphics",
+                         action: {
+                             // No dismiss: the row stays where it is, and so does the highlight.
+                             library.setShaderCacheEnabled(!on, for: id)
+                         })
+    }
+
+    /// ml903: opens the Controls page; says what is picked now.
+    private func controlsSummaryRow(_ g: LauncherGame) -> OptionRow {
+        let touchNow: TouchControlsChoice = touch.choice(forGame: g.id)
+        let padText: String = pad.sendsXbox(forGame: g.id) ? "XInput" : "keyboard keys"
+        let summary: String = "Touch: \(touchNow.title) · Controller: \(padText)"
+        return OptionRow(id: "controls", title: "Touch screen and controller",
+                         systemImage: "gamecontroller",
+                         destructive: false, checked: false,
+                         note: summary,
+                         header: "Controls", chevron: true,
+                         action: { openControls() })
+    }
+
+    // MARK: Storage (ml830)
+
+    /// "Clear shader cache" with its size, when there is something on disk.
+    /// Disabled while the game runs: its d3d11.dll holds the cache files open.
+    private func clearShaderCacheRows(_ g: LauncherGame) -> [OptionRow] {
+        guard let bytes = cacheBytes, bytes > 0 else { return [] }
+        let busy: Bool = busyGameIDs.contains(g.id)
+        let id: String = g.id
+        return [OptionRow(id: "clearshadercache",
+                          title: clearingCache ? "Clearing shader cache…" : "Clear shader cache",
+                          systemImage: "xmark.bin",
+                          destructive: true, checked: false,
+                          trailing: clearingCache ? nil : ShaderCache.text(bytes),
+                          disabled: busy || clearingCache,
+                          action: { clearShaderCache(id: id) })]
     }
 
     /// Measure this game's cache on a utility queue (the enumerator blocks).
@@ -1637,8 +1760,8 @@ private struct OptionsSheet: View {
             let bytes: Int64 = ShaderCache.sizeBytes(forGameID: id)
             DispatchQueue.main.async {
                 // The Clear row is about to disappear: if the pad is on it,
-                // move the highlight up to "Shader cache" (right above it)
-                // instead of letting it land on the next destructive row.
+                // move the highlight up to the row above it instead of letting
+                // it land on Delete, the destructive row below.
                 let before: [OptionRow] = rows
                 let clearIndex: Int? = before.firstIndex(where: { $0.id == "clearshadercache" })
                 clearingCache = false
@@ -1650,142 +1773,47 @@ private struct OptionsSheet: View {
         }
     }
 
-    // MARK: Per-game settings (ml849)
-
-    /// Resolution, the x86 memory-ordering switch and the frame rate cap for
-    /// this game. Each row shows the value the game runs with and cycles the
-    /// values on tap or A, the way the shader cache row toggles. ml902: there
-    /// is no separate "Default" entry -- a game without its own value shows
-    /// Settings' one, and picking the value Settings has stores none, so the
-    /// game keeps following Settings; a value that differs from Settings shows
-    /// the override dot. Resolution and the TSO switch reach the
-    /// game only at launch, so they are disabled while it runs; the cap
-    /// applies at once when this game is the one playing, and Settings' cap
-    /// comes back when it ends.
-    private func perGameSettingRows(_ g: LauncherGame) -> [OptionRow] {
-        let busy: Bool = busyGameIDs.contains(g.id)
-        let id: String = g.id
-        let s: GameSettings = library.gameSettings[id] ?? GameSettings()
-        let defaults = UserDefaults.standard
-        var out: [OptionRow] = []
-
-        let globalRes: String = defaults.string(forKey: "madeira.desktopResolution") ?? GameResolutionDefault.settingDefault
-        let curRes: String = s.resolution ?? globalRes
-        out.append(OptionRow(id: "resolution", title: "Resolution",
-                             systemImage: "rectangle.expand.vertical",
-                             destructive: false, checked: false,
-                             trailing: curRes,
-                             disabled: busy,
-                             overrides: curRes != globalRes,
-                             action: {
-                                 let opts: [String] = GameSettings.resolutionOptions
-                                 let cur: Int = opts.firstIndex(of: curRes) ?? -1
-                                 let next: String = opts[(cur + 1) % opts.count]
-                                 library.updateSettings(for: id) { $0.resolution = (next == globalRes) ? nil : next }
-                             }))
-
-        let globalNoTSO: Bool = defaults.bool(forKey: "madeira.fexNoTSO")
-        let curNoTSO: Bool = s.noTSO ?? globalNoTSO
-        out.append(OptionRow(id: "notso", title: "Skip x86 memory-ordering emulation",
-                             systemImage: "cpu",
-                             destructive: false, checked: false,
-                             trailing: curNoTSO ? "On" : "Off",
-                             disabled: busy,
-                             note: "Turning this on may improve performance in some games. If this game runs slowly, it is worth a try.",   // ml872
-                             overrides: curNoTSO != globalNoTSO,
-                             action: {
-                                 let next: Bool = !curNoTSO
-                                 library.updateSettings(for: id) { $0.noTSO = (next == globalNoTSO) ? nil : next }
-                             }))
-
-        let curCap: FrameCap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved
-        var playingThis: Bool = false
-        if case .playing(let t) = session, t == g.title { playingThis = true }
-        out.append(OptionRow(id: "framecap", title: "Frame rate cap",
-                             systemImage: "speedometer",
-                             destructive: false, checked: false,
-                             trailing: curCap.label,
-                             disabled: false,
-                             overrides: curCap != FrameCap.saved,
-                             action: {
-                                 let next: FrameCap = curCap.next
-                                 library.updateSettings(for: id) {
-                                     $0.frameCap = (next == FrameCap.saved) ? nil : Int(next.rawValue)
-                                 }
-                                 if playingThis { FrameCap.apply(next, persist: false) }
-                             }))
-
-        // ml896: how the picture fills the screen; applies at once when this
-        // game is the one playing.
-        let curScale: ScreenScaling = s.scaling.flatMap { ScreenScaling(rawValue: $0) } ?? ScreenScaling.saved
-        out.append(OptionRow(id: "scaling", title: "Screen scaling",
-                             systemImage: "arrow.up.left.and.arrow.down.right",
-                             destructive: false, checked: false,
-                             trailing: curScale.label,
-                             disabled: false,
-                             overrides: curScale != ScreenScaling.saved,
-                             action: {
-                                 let modes: [ScreenScaling] = Array(ScreenScaling.allCases)
-                                 let cur: Int = modes.firstIndex(of: curScale) ?? -1
-                                 let next: ScreenScaling = modes[(cur + 1) % modes.count]
-                                 library.updateSettings(for: id) {
-                                     $0.scaling = (next == ScreenScaling.saved) ? nil : next.rawValue
-                                 }
-                                 ScreenScaling.reapply()
-                             }))
-        return out
-    }
-
     // MARK: Controls (ml889)
 
-    /// This game's controls, one section: its touch screen controls (off, the
-    /// fixed Xbox controller, or the keyboard layout the in-game pencil edits)
-    /// and its physical controller (XInput, or sent as keyboard keys -- then a
-    /// Key binds row opens the binds page, ml890). A game without its own
-    /// shows the Settings defaults; picking makes them its own. Usable before
-    /// the game runs and, live, while it runs.
+    /// The Controls page (ml903; a section of the menu before): this game's
+    /// touch screen controls (off, the fixed Xbox controller, or the keyboard
+    /// layout the in-game pencil edits) and its physical controller (XInput, or
+    /// sent as keyboard keys -- then a Key binds row opens the binds page,
+    /// ml890). Usable before the game runs and, live, while it runs.
     private func controlsRows(_ g: LauncherGame) -> [OptionRow] {
         let id: String = g.id
         let touchNow: TouchControlsChoice = touch.choice(forGame: id)
         let sendsXbox: Bool = pad.sendsXbox(forGame: id)
-        // ml902: the picked row shows the override dot when it is not Settings' choice
-        let touchOwn: Bool = touchNow != touch.defaultChoice
-        let padOwn: Bool = sendsXbox != pad.defaultSendsXbox
         var out: [OptionRow] = []
 
         out.append(OptionRow(id: "touch-off", title: "Off", systemImage: "nosign",
                              destructive: false, checked: touchNow == .off,
-                             section: "Controls", header: "Touch screen controls", radio: true,
-                             overrides: touchOwn && touchNow == .off,
+                             header: "Touch screen controls", radio: true,
                              action: { touch.setChoice(.off, forGame: id) }))
         out.append(OptionRow(id: "touch-xbox", title: "Xbox controller (XInput)", systemImage: "gamecontroller",
                              destructive: false, checked: touchNow == .xbox,
                              note: "A fixed layout.", radio: true,
-                             overrides: touchOwn && touchNow == .xbox,
                              action: { touch.setChoice(.xbox, forGame: id) }))
         out.append(OptionRow(id: "touch-keyboard", title: "Keyboard layout", systemImage: "keyboard",
                              destructive: false, checked: touchNow == .custom,
                              note: "Arrange it with the pencil while playing.", radio: true,
-                             overrides: touchOwn && touchNow == .custom,
                              action: { touch.setChoice(.custom, forGame: id) }))
 
         out.append(OptionRow(id: "pad-xinput", title: "XInput", systemImage: "gamecontroller.fill",
                              destructive: false, checked: sendsXbox,
                              note: "The game sees an Xbox controller.",
                              header: "Physical controller", radio: true,
-                             overrides: padOwn && sendsXbox,
                              action: { pad.setSendsXbox(true, forGame: id) }))
         out.append(OptionRow(id: "pad-keyboard", title: "Send as keyboard", systemImage: "keyboard",
                              destructive: false, checked: !sendsXbox,
                              note: "For games without controller support: each button sends a key you choose.",
                              radio: true,
-                             overrides: padOwn && !sendsXbox,
                              action: { pad.setSendsXbox(false, forGame: id) }))
         guard !sendsXbox else { return out }
-        // ml890: the binds are a page of their own, so the menu stays short.
+        // ml890: the binds are a page of their own, so the page stays short.
         out.append(OptionRow(id: "pad-keybinds", title: "Key binds", systemImage: "slider.horizontal.3",
                              destructive: false, checked: false,
-                             note: "Choose the key each button sends.", indent: true,
+                             note: "Choose the key each button sends.", indent: true, chevron: true,
                              action: { openBinds() }))
         return out
     }
@@ -1873,7 +1901,18 @@ private struct OptionsSheet: View {
 
     private func closeBinds() {
         showingBinds = false
-        model.highlight = mainRows(current).firstIndex(where: { $0.id == "pad-keybinds" }) ?? 0
+        model.highlight = controlsRows(current).firstIndex(where: { $0.id == "pad-keybinds" }) ?? 0
+    }
+
+    /// ml903: the Controls page.
+    private func openControls() {
+        showingControls = true
+        model.highlight = 0
+    }
+
+    private func closeControls() {
+        showingControls = false
+        model.highlight = mainRows(current).firstIndex(where: { $0.id == "controls" }) ?? 0
     }
 
     // MARK: Delete (ml830)
@@ -1971,14 +2010,18 @@ private struct OptionsSheet: View {
         return main.firstIndex(where: { $0.id == "delete" }) ?? max(0, main.count - 1)
     }
 
-    private var inSubMode: Bool { showingExecutables || confirmingDelete || bindPicking != nil || showingBinds }
+    private var inSubMode: Bool {
+        showingExecutables || confirmingDelete || bindPicking != nil || showingBinds || showingControls
+    }
 
     /// Back chevron, B, and the confirmation's Cancel.
     private func leaveSubMode() {
         if bindPicking != nil {
             closeBindPicker()   // ml889: back to the Key binds page
         } else if showingBinds {
-            closeBinds()        // ml890
+            closeBinds()        // ml890: back to the Controls page
+        } else if showingControls {
+            closeControls()     // ml903
         } else if confirmingDelete {
             guard !deleting else { return }
             confirmingDelete = false
@@ -1986,8 +2029,13 @@ private struct OptionsSheet: View {
             model.highlight = deleteRowIndex(current)
         } else if showingExecutables {
             showingExecutables = false
-            model.highlight = 1
+            model.highlight = exeRowIndex()
         }
+    }
+
+    /// ml903: where "Change executable" sits in the main list.
+    private func exeRowIndex() -> Int {
+        mainRows(current).firstIndex(where: { $0.id == "exe" }) ?? 0
     }
 
     private func rowButton(_ row: OptionRow, focused: Bool) -> some View {
@@ -2000,7 +2048,7 @@ private struct OptionsSheet: View {
                      destructive: row.destructive, checked: row.checked,
                      focused: focused, subtitle: nil, thumbnail: nil,
                      trailing: row.trailing, disabled: disabled, note: row.note,
-                     radio: row.radio, overrides: row.overrides)
+                     radio: row.radio, switchOn: row.switchOn, chevron: row.chevron)
         }
         .buttonStyle(SheetRowStyle())
     }
@@ -2106,6 +2154,9 @@ private struct OptionsSheet: View {
         .onChange(of: showingBinds) { _, _ in   // ml890
             configure(rows.count)
         }
+        .onChange(of: showingControls) { _, _ in   // ml903
+            configure(rows.count)
+        }
         .onChange(of: busyGameIDs.contains(game.id)) { _, busy in
             // The captured onSelect must see the new disabled states.
             configure(rows.count)
@@ -2146,6 +2197,9 @@ private struct OptionsSheet: View {
         }
         if showingBinds {
             return ("Key binds", g.title, nil)   // ml890
+        }
+        if showingControls {
+            return ("Controls", g.title, nil)    // ml903
         }
         if showingExecutables {
             return ("Executable", g.title, nil)
@@ -2465,8 +2519,9 @@ private struct SheetRow: View {
     var note: String? = nil
     /// ml899: keep the checkmark's room when unchecked (OptionRow.radio).
     var radio: Bool = false
-    /// ml902: the override dot (OptionRow.overrides).
-    var overrides: Bool = false
+    /// ml903: an on/off switch (OptionRow.switchOn) and a page chevron.
+    var switchOn: Bool? = nil
+    var chevron: Bool = false
 
     private let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
 
@@ -2524,18 +2579,27 @@ private struct SheetRow: View {
                 }
             }
             Spacer(minLength: 8)
-            if overrides {
-                Circle()
-                    .fill(LauncherPalette.accent)
-                    .frame(width: 7, height: 7)
-                    .accessibilityLabel("Overrides Madeira settings")
-            }
             if let trailing {
                 Text(trailing)
                     .font(.subheadline.monospacedDigit())
                     .foregroundStyle(LauncherPalette.textSecondary)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
+            }
+            if let switchOn {
+                let knob: Alignment = switchOn ? .trailing : .leading
+                Capsule()
+                    .fill(switchOn ? Color.green : Color.white.opacity(0.18))
+                    .frame(width: 46, height: 28)
+                    .overlay(alignment: knob) {
+                        Circle().fill(Color.white).frame(width: 24, height: 24).padding(2)
+                    }
+                    .accessibilityLabel(switchOn ? "On" : "Off")
+            }
+            if chevron {
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(LauncherPalette.textSecondary)
             }
             if checked {
                 Image(systemName: "checkmark")
@@ -3336,7 +3400,7 @@ struct ReportSheet: View {
     /// Main thread: the game's own settings, else Settings' defaults — what it
     /// actually ran with.
     private func gatherAutomaticInfo() {
-        let s = GameLibrary.shared.settings(for: game.id)
+        let s = GameLibrary.activeSettings(for: game.id)   // ml903: what it runs with
         let resolution = s.resolution ?? (UserDefaults.standard.string(forKey: "madeira.desktopResolution") ?? GameResolutionDefault.settingDefault)
         let noTSO = s.noTSO ?? UserDefaults.standard.bool(forKey: "madeira.fexNoTSO")
         let cap = s.frameCap.flatMap { FrameCap(rawValue: Int32($0)) } ?? FrameCap.saved

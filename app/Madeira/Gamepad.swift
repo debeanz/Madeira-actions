@@ -347,10 +347,16 @@ final class GamepadBridge: ObservableObject {
         // that differ from the defaults (or were already its own). "Use
         // controller" stays global and never creates one.
         if let id = gameID {
-            var own = profiles[id] ?? PadProfile()
-            if own.native != nil || native != defaultNative { own.native = native }
-            if own.mapping != nil || mapping != defaultMapping { own.mapping = mapping }
-            profiles[id] = own.isEmpty ? nil : own
+            if GameLibrary.usesOwnSettings(id) {
+                var own = profiles[id] ?? PadProfile()
+                if own.native != nil || native != defaultNative { own.native = native }
+                if own.mapping != nil || mapping != defaultMapping { own.mapping = mapping }
+                profiles[id] = own.isEmpty ? nil : own
+            } else if native != defaultNative || mapping != defaultMapping {
+                // ml903: changed in game while the game uses Madeira's settings: from
+                // now on they are its own (next turn: this runs inside a didSet).
+                DispatchQueue.main.async { GameLibrary.shared.setOverride(true, for: id, inGame: true) }
+            }
         }
         persist()
     }
@@ -375,7 +381,8 @@ final class GamepadBridge: ObservableObject {
             defaultMapping = mapping
         }
         gameID = id
-        let own = id.flatMap { profiles[$0] }
+        // ml903: a game's own settings only while its switch is on.
+        let own = id.flatMap { GameLibrary.usesOwnSettings($0) ? profiles[$0] : nil }
         let n = own?.native ?? defaultNative, m = own?.mapping ?? defaultMapping
         // Only what differs is set (the didSets release what is held), so a
         // game without its own settings changes nothing.
@@ -389,13 +396,36 @@ final class GamepadBridge: ObservableObject {
         }
     }
 
-    /// Whether the running game has controller settings of its own.
-    var gameHasOwnSettings: Bool { gameID.map { profiles[$0] != nil } ?? false }
-
     /// The default "send as" (what a game without its own uses).
-    /// Settings' choice, what a game without its own gets (ml902: also the
-    /// override dot's reference in the ⋯ menus).
-    var defaultSendsXbox: Bool { gameID == nil ? native : defaultNative }
+    private var defaultSendsXbox: Bool { gameID == nil ? native : defaultNative }
+
+    /// ml903: games with controller settings of their own (the switch's migration).
+    var gamesWithOwnProfiles: Set<String> { Set(profiles.keys) }
+
+    /// ml903: the running game's switch changed: its own settings (on) or the
+    /// defaults (off) go live.
+    func refreshGame() {
+        guard let id = gameID else { return }
+        let own = GameLibrary.usesOwnSettings(id) ? profiles[id] : nil
+        let n = own?.native ?? defaultNative, m = own?.mapping ?? defaultMapping
+        loading = true
+        if n != native { native = n }
+        if m != mapping { mapping = m }
+        loading = false
+    }
+
+    /// ml903: a game's switch was turned on. Its profile gets every part it has
+    /// not got yet from what it uses now (`replace`: all of them).
+    func fillOwnProfile(forGame id: String, replace: Bool) {
+        let nowNative: Bool = id == gameID ? native : defaultSendsXbox
+        let nowMapping: GamepadMapping = id == gameID ? mapping : (gameID == nil ? mapping : defaultMapping)
+        var own: PadProfile = replace ? PadProfile() : (profiles[id] ?? PadProfile())
+        if own.native == nil { own.native = nowNative }
+        if own.mapping == nil { own.mapping = nowMapping }
+        profiles[id] = own
+        objectWillChange.send()
+        persist()
+    }
 
     // MARK: ml889 a game's physical controller from its ⋯ menu (Games tab)
 
