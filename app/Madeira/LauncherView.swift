@@ -2633,13 +2633,13 @@ private struct SheetRow: View {
     }
 
     /// ml913: lines up under the title (past the icon's column).
-    /// ml917: StopSlider, not Slider -- SwiftUI's vibrates at the stops. The
-    /// sheet's sliders are index-based (range 0...count-1, step 1).
+    /// ml918: SnapSlider -- the iOS slider, free under the finger and settling
+    /// on a stop (a snapping one vibrated at every stop). The sheet's sliders
+    /// are index-based (range 0...count-1, step 1 for the pad).
     private func sliderBar(_ sl: SheetSlider) -> some View {
         let count: Int = Int(sl.range.upperBound.rounded()) + 1
         let index: Int = Int(sl.value.rounded())
-        return StopSlider(count: count, index: index, tint: LauncherPalette.accent,
-                          accessibilityText: trailing ?? "") { k in
+        return SnapSlider(count: count, index: index, tint: LauncherPalette.accent) { k in
             sl.set(Double(k))
         }
         .disabled(self.disabled)

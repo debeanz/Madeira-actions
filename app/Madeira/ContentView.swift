@@ -1901,9 +1901,8 @@ struct ContentView: View {
                     .monospacedDigit()
             }
             if stops.count > 1 {
-                // ml917: StopSlider, not Slider: no haptics at the stops
-                StopSlider(count: stops.count, index: index,
-                           accessibilityText: GraphicsProbe.scaleText(shown)) { i in
+                // ml918: the iOS slider again, moving freely while dragged
+                SnapSlider(count: stops.count, index: index) { i in
                     if i != index { metalFXScale = stops[i] }
                 }
             }
@@ -9326,91 +9325,48 @@ enum ShaderCache {
 }
 
 
-// MARK: - Stop slider (ml917)
+// MARK: - Snap slider (ml918)
 
-/// The MetalFX multiplier's slider, drawn here instead of SwiftUI's Slider.
-/// On iOS 26 Slider vibrates as the value moves through its stops -- with
-/// `step:` and still without it (ml916 tried), when its binding snaps -- and
-/// the user asked for no vibration. Nothing here touches the haptic engine.
-/// Index-based: stops 0...count-1; a drag or a tap lands on the nearest stop.
-struct StopSlider: View {
+/// The MetalFX multiplier's slider: SwiftUI's Slider over a stop index that
+/// moves freely under the finger and settles on the nearest stop when let go.
+/// The stop it is nearest is chosen live, so the value beside it updates as
+/// the thumb passes each stop.
+///
+/// Why not snap while dragging: a stepped Slider (ml913-915), and one whose
+/// binding snapped it to the stops as it moved (ml916), vibrated at every stop
+/// and every arrival at an end -- far more than the app's other sliders. This
+/// one is driven like them, so it vibrates like them (ml917's hand-drawn
+/// slider had none, but the user wants the iOS one).
+struct SnapSlider: View {
     let count: Int
     let index: Int
-    let tint: Color
-    let accessibilityText: String
+    let tint: Color?
     let onChange: (Int) -> Void
-    @Environment(\.isEnabled) private var isEnabled
+    /// The finger's position while dragging; nil at rest (the thumb sits on
+    /// the stop).
+    @State private var dragValue: Double? = nil
+    @State private var dragging = false
 
-    private let thumb: CGFloat = 27
-
-    init(count: Int, index: Int, tint: Color = Color.accentColor, accessibilityText: String = "",
-         onChange: @escaping (Int) -> Void) {
+    init(count: Int, index: Int, tint: Color? = nil, onChange: @escaping (Int) -> Void) {
         self.count = count
         self.index = index
         self.tint = tint
-        self.accessibilityText = accessibilityText
         self.onChange = onChange
     }
 
     var body: some View {
-        GeometryReader { g in
-            track(width: g.size.width, height: g.size.height)
-        }
-        .frame(height: 32)
-        .opacity(isEnabled ? 1 : 0.45)
-        .accessibilityElement()
-        .accessibilityValue(accessibilityText)
-        .accessibilityAdjustableAction { direction in
-            switch direction {
-            case .increment:
-                if index + 1 < count { onChange(index + 1) }
-            case .decrement:
-                if index > 0 { onChange(index - 1) }
-            @unknown default:
-                break
-            }
-        }
-    }
-
-    /// The thumb's centre for stop i.
-    private func position(_ i: Int, width: CGFloat) -> CGFloat {
-        let usable: CGFloat = max(width - thumb, 1)
-        let last: CGFloat = CGFloat(max(count - 1, 1))
-        return thumb / 2 + usable * CGFloat(i) / last
-    }
-
-    /// The stop nearest x.
-    private func stop(at x: CGFloat, width: CGFloat) -> Int {
-        let usable: CGFloat = max(width - thumb, 1)
-        let f: CGFloat = (x - thumb / 2) / usable
-        let i: Int = Int((f * CGFloat(max(count - 1, 1))).rounded())
-        return min(max(i, 0), max(count - 1, 0))
-    }
-
-    private func track(width: CGFloat, height: CGFloat) -> some View {
-        let x: CGFloat = position(index, width: width)
-        return ZStack(alignment: .leading) {
-            Capsule()
-                .fill(Color.gray.opacity(0.35))
-                .frame(height: 4)
-            Capsule()
-                .fill(tint)
-                .frame(width: x, height: 4)
-            Circle()
-                .fill(Color.white)
-                .frame(width: thumb, height: thumb)
-                .shadow(color: Color.black.opacity(0.25), radius: 3, x: 0, y: 1)
-                .offset(x: x - thumb / 2)
-        }
-        .frame(width: width, height: height)
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { v in
-                    guard isEnabled, count > 1 else { return }
-                    let k: Int = stop(at: v.location.x, width: width)
-                    if k != index { onChange(k) }
-                }
-        )
+        let top: Double = Double(max(count - 1, 1))
+        let binding: Binding<Double> = Binding<Double>(
+            get: { dragValue ?? Double(index) },
+            set: { v in
+                if dragging { dragValue = v }
+                let k: Int = min(max(Int(v.rounded()), 0), max(count - 1, 0))
+                if k != index { onChange(k) }
+            })
+        return Slider(value: binding, in: 0...top, onEditingChanged: { editing in
+            dragging = editing
+            if !editing { dragValue = nil }   // settle on the stop
+        })
+        .tint(tint)
     }
 }
