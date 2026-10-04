@@ -1685,20 +1685,34 @@ private struct OptionsSheet: View {
 
         // ml912: only for a game that draws with Direct3D 11, the one API it works for.
         if library.drawsWithDirect3D11(g) {
-            // ml913: a multiplier slider, 1x = off; A steps it up, past 2x back to off
-            let curFX: Double = GraphicsProbe.snap(s.metalFXScale ?? GraphicsProbe.savedScale)
-            let setFX: (Double) -> Void = { v in
-                library.updateSettings(for: id) { $0.metalFXScale = GraphicsProbe.snap(v) }
+            // ml913: a multiplier slider, 1x = off; A steps it up, past the end back to off
+            // ml915: its stops run from Off to as far as this game's resolution
+            // can be upscaled on this screen, and the note says what a stop does.
+            let resSize: (w: Int, h: Int) = GameSettings.size(curRes) ?? (w: 1920, h: 1080)
+            let most: Double = GraphicsProbe.maxFactor(width: resSize.w, height: resSize.h,
+                                                       screen: UIScreen.main.nativeBounds.size)
+            let stops: [Double] = GraphicsProbe.stops(upTo: most)
+            let curIndex: Int = GraphicsProbe.stopIndex(GraphicsProbe.snap(s.metalFXScale ?? GraphicsProbe.savedScale), in: stops)
+            let curFX: Double = stops[curIndex]
+            let setStop: (Int) -> Void = { i in
+                let stop: Double = stops[min(max(i, 0), stops.count - 1)]
+                library.updateSettings(for: id) { $0.metalFXScale = stop }
+            }
+            var fxSlider: SheetSlider? = nil
+            if stops.count > 1 {
+                let top: Double = Double(stops.count - 1)
+                fxSlider = SheetSlider(value: Double(curIndex), range: 0...top, step: 1,
+                                       set: { v in setStop(Int(v.rounded())) })
             }
             out.append(OptionRow(id: "metalfx", title: "MetalFX upscaling",
                                  systemImage: "sparkles",
                                  destructive: false, checked: false,
                                  trailing: GraphicsProbe.scaleText(curFX),
-                                 disabled: busy || !own,
-                                 note: "1\u{00D7} is off. Higher is sharper and costs a little more GPU time; past what fills the screen it adds nothing.",
-                                 slider: SheetSlider(value: curFX, range: 1.0...2.0, step: 0.1, set: setFX),
+                                 disabled: busy || !own || stops.count < 2,
+                                 note: GraphicsProbe.effectText(width: resSize.w, height: resSize.h, factor: curFX, most: most),
+                                 slider: fxSlider,
                                  action: {
-                                     setFX(curFX >= 1.95 ? 1.0 : curFX + 0.1)
+                                     setStop(curIndex + 1 < stops.count ? curIndex + 1 : 0)
                                  }))
         }
 

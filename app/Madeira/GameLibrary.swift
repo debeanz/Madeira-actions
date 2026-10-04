@@ -1640,34 +1640,79 @@ enum GraphicsProbe {
         snap(UserDefaults.standard.double(forKey: metalFXKey))
     }
 
-    /// ml914: the multiplier a launch hands DXMT for a game drawn at
-    /// width x height, nil when MetalFX is not used: the pick, never past what
-    /// fills the screen. Report Compatibility asks the same, so a report says
-    /// what the game ran with.
-    static func launchFactor(pick: Double, width: Int, height: Int, screen: CGSize) -> Double? {
-        let chosen: Double = snap(pick)
-        guard chosen >= 1.05, width > 0, height > 0 else { return nil }
+    /// ml915: the most MetalFX can upscale a game drawn at width x height on
+    /// this screen: what fills it (the device's own pixels, so every iPhone
+    /// and iPad gets its own), at most 2x (DXMT's documented range), on 0.01
+    /// steps rounded down. 1 = no room: the resolution already fills it.
+    static func maxFactor(width: Int, height: Int, screen: CGSize) -> Double {
+        guard width > 0, height > 0 else { return 1.0 }
         let screenLong: Double = Double(max(screen.width, screen.height))
         let screenShort: Double = Double(min(screen.width, screen.height))
         let fit: Double = min(screenLong / Double(width), screenShort / Double(height))
         let fitDown: Double = (fit * 100).rounded(.down) / 100
-        let factor: Double = min(chosen, max(fitDown, 1.0))
+        return min(max(fitDown, 1.0), 2.0)
+    }
+
+    /// ml915: the slider's stops up to that most: Off, every 0.1x below it,
+    /// then the most itself, so the slider ends exactly where the screen does.
+    static func stops(upTo most: Double) -> [Double] {
+        var out: [Double] = [1.0]
+        var k: Int = 11
+        while Double(k) / 10 < most - 0.049 {
+            out.append(Double(k) / 10)
+            k += 1
+        }
+        if most >= 1.05 { out.append(most) }
+        return out
+    }
+
+    /// ml915: the stop a stored multiplier lands on: the highest not above it.
+    static func stopIndex(_ x: Double, in stops: [Double]) -> Int {
+        var best: Int = 0
+        for (i, s) in stops.enumerated() where s <= x + 0.001 { best = i }
+        return best
+    }
+
+    /// ml914: the multiplier a launch hands DXMT for a game drawn at
+    /// width x height, nil when MetalFX is not used. Report Compatibility asks
+    /// the same, so a report says what the game ran with.
+    /// ml915: the pick's stop on this screen's slider for that resolution.
+    static func launchFactor(pick: Double, width: Int, height: Int, screen: CGSize) -> Double? {
+        let all: [Double] = stops(upTo: maxFactor(width: width, height: height, screen: screen))
+        let factor: Double = all[stopIndex(snap(pick), in: all)]
         return factor >= 1.05 ? factor : nil
     }
 
-    /// A slider value on its 0.1 steps, 1...2.
+    /// A stored multiplier, 1...2 on 0.01 steps.
     static func snap(_ x: Double) -> Double {
         let clamped: Double = min(max(x, 1.0), 2.0)
-        return (clamped * 10).rounded() / 10
+        return (clamped * 100).rounded() / 100
     }
 
-    /// "Off" at 1x, else "1.5x".
+    /// "Off" at 1x, else "1.5x", "1.19x".
     static func scaleText(_ x: Double) -> String {
         let v: Double = snap(x)
         if v < 1.05 { return "Off" }
-        var t: String = String(format: "%.1f", v)
-        if t.hasSuffix(".0") { t.removeLast(2) }
+        var t: String = String(format: "%.2f", v)
+        while t.hasSuffix("0") { t.removeLast() }
+        if t.hasSuffix(".") { t.removeLast() }
         return t + "\u{00D7}"
+    }
+
+    /// ml915: what the slider does at that stop, for the line under it.
+    static func effectText(width: Int, height: Int, factor: Double, most: Double) -> String {
+        let res: String = "\(width)\u{00D7}\(height)"
+        if most < 1.05 {
+            return res + " already fills this screen, so there is nothing to upscale. Pick a lower resolution to use MetalFX."
+        }
+        if factor < 1.05 {
+            return "Off: " + res + " is stretched to the screen as it is."
+        }
+        let w: Int = Int(Double(width) * factor)
+        let h: Int = Int(Double(height) * factor)
+        var line: String = res + " is upscaled to \(w)\u{00D7}\(h)"
+        if abs(factor - most) < 0.001 && most < 1.995 { line += ", as big as this screen shows it" }
+        return line + "."
     }
 
     static func usesDirect3D11(exe: URL) -> Bool {

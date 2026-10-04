@@ -1883,6 +1883,39 @@ struct ContentView: View {
         return "\(v) (\(b))"
     }
 
+    /// ml915: Settings' MetalFX slider: stops from Off to as far as Settings'
+    /// resolution can be upscaled on this screen, and what the stop does.
+    private var metalFXSettingRow: some View {
+        let size: (w: Int, h: Int) = desktopSize
+        let most: Double = GraphicsProbe.maxFactor(width: size.w, height: size.h,
+                                                   screen: UIScreen.main.nativeBounds.size)
+        let stops: [Double] = GraphicsProbe.stops(upTo: most)
+        let index: Int = GraphicsProbe.stopIndex(GraphicsProbe.snap(metalFXScale), in: stops)
+        let shown: Double = stops[index]
+        let binding: Binding<Double> = Binding<Double>(
+            get: { Double(index) },
+            set: { v in
+                let i: Int = min(max(Int(v.rounded()), 0), stops.count - 1)
+                metalFXScale = stops[i]
+            })
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("MetalFX upscaling")
+                Spacer()
+                Text(GraphicsProbe.scaleText(shown))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            if stops.count > 1 {
+                Slider(value: binding, in: 0...Double(stops.count - 1), step: 1)
+            }
+            Text(GraphicsProbe.effectText(width: size.w, height: size.h, factor: shown, most: most))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+    }
+
     private var desktopSize: (w: Int, h: Int) {
         let parts = desktopResolution.split(separator: "x").compactMap { Int($0) }
         guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return (1920, 1080) }
@@ -2267,8 +2300,8 @@ struct ContentView: View {
             metalFXFactor = GraphicsProbe.launchFactor(pick: chosenFX, width: screenW0, height: screenH0, screen: native)
             if let f = metalFXFactor {
                 var line: String = "Games: " + game.title + " — MetalFX upscaling x" + String(format: "%.2f", f)
-                if f < chosenFX {
-                    line += ", the most that fits the screen (" + String(format: "%.1f", chosenFX) + "x picked)"
+                if f < chosenFX - 0.001 {
+                    line += ", the most this resolution's slider goes on this screen (" + String(format: "%.2f", chosenFX) + "x saved)"
                 }
                 logStore.log(line)
             } else {
@@ -3346,14 +3379,18 @@ struct ContentView: View {
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .first(where: { $0.activationState == .foregroundActive }) else { return }
-        let root = scene.keyWindow?.rootViewController
         // UIKit caches supportedInterfaceOrientations. Invalidate it before
         // asking the scene for new geometry, then repeat on the next run-loop
         // turn after SwiftUI has completed its full-screen layout swap.
-        root?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        // ml915: EVERY window's root, not just the key window's. ControlsWindow
+        // (toolbar, touch controls) is attached a moment before a game asks
+        // for landscape, so its cached mask still allowed portrait: in game the
+        // phone turned the toolbar, the controls and (topmost window) the home
+        // indicator to portrait while the game picture stayed landscape.
+        Self.refreshOrientationMasks(in: scene)
         if #available(iOS 16.0, *) {
             DispatchQueue.main.async {
-                root?.setNeedsUpdateOfSupportedInterfaceOrientations()
+                Self.refreshOrientationMasks(in: scene)
                 scene.requestGeometryUpdate(
                     UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: orientations)
                 ) { error in
@@ -3373,6 +3410,13 @@ struct ContentView: View {
                     GameCursorHost.attach()
                 }
             }
+        }
+    }
+
+    /// ml915: every window in the scene re-reads its supported orientations.
+    private static func refreshOrientationMasks(in scene: UIWindowScene) {
+        for w in scene.windows {
+            w.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
         }
     }
 
@@ -3496,18 +3540,10 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                     // ml912
                     // ml913: a multiplier, 1x (off) by default
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text("MetalFX upscaling")
-                            Spacer()
-                            Text(GraphicsProbe.scaleText(metalFXScale))
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                        Slider(value: $metalFXScale, in: 1.0...2.0, step: 0.1)
-                    }
-                    .disabled(runtimeInUse)   // launch-only
-                    Text("DirectX 11 games only. 1\u{00D7} is off. Higher makes the picture sharper and costs a little more GPU time; past what fills your screen it adds nothing. A lower game resolution is where the speed comes from. A game's ⋯ menu can change it for that game. Applies the next time a game starts.")
+                    // ml915: its stops follow the resolution above and this screen
+                    metalFXSettingRow
+                        .disabled(runtimeInUse)   // launch-only
+                    Text("DirectX 11 games only. The slider goes as far as this resolution can be upscaled on this screen (at most 2\u{00D7}). Higher is sharper and costs a little more GPU time; a lower resolution is where the speed comes from. A game's ⋯ menu can change it for that game. Applies the next time a game starts.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -6859,8 +6895,10 @@ final class ControlsRootController: UIViewController {
     override var childForStatusBarHidden: UIViewController? { host }
     override var childForStatusBarStyle: UIViewController? { host }
     override var childForHomeIndicatorAutoHidden: UIViewController? { host }
+    /// ml915: the app's lock (landscape in game), like OrientationFollowingController.
+    /// Outside a game the lock is the hosting controller's own default anyway.
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
-        host.supportedInterfaceOrientations
+        MadeiraAppDelegate.orientationLock
     }
     /// ml826: this window is topmost and never hidden, so it must NOT defer edge
     /// gestures outside a game — that would make the home swipe need two
