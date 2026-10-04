@@ -73,6 +73,7 @@ int64_t fex_get_jit_write_offset(void) { return 0; }
 #ifndef MADEIRA_SIMULATOR_REAL_RUNTIME
 int wineserver_start(const char *prefix_path) { (void)prefix_path; simulator_log("[simulator] Wine runtime is unavailable"); return -1; }
 int wineserver_is_running(void) { return 0; }
+int wineserver_is_ready(void) { return 0; }
 void wineserver_stop(void) {}
 void wineserver_inject_client_fd(int fd) { (void)fd; }
 int wine_process_start(const char *prefix_path) { (void)prefix_path; return -1; }

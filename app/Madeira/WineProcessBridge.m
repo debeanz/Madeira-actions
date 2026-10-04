@@ -812,6 +812,32 @@ static uint16_t madeira_pe_machine(const char *unix_path) {
 #define MADEIRA_IMAGE_FILE_MACHINE_AMD64 0x8664
 #define MADEIRA_IMAGE_FILE_MACHINE_ARM64 0xaa64
 
+/* ml901: point `dst` at `src`, touching the file system only when it does not
+ * already. Every Wine start removed and re-created each prefix link -- 397 of
+ * them in September, about 1,560 since the WoW64 farms and the larger DLL sets
+ * (0.1.167: system32 260, sysx64 250, sysaa64 260, syswow64 749, plus wbem and
+ * winsxs) -- although they only change when a reinstall moves the bundle. A
+ * link that already reads back as `src` is kept; anything else (missing,
+ * stale, a real file) gets the old remove + create. YES when `dst` points at
+ * `src` afterwards. */
+static unsigned madeira_links_kept, madeira_links_made;
+
+static BOOL madeira_ensure_link(NSFileManager *fm, NSString *dst, NSString *src)
+{
+    char cur[PATH_MAX];
+    const char *want = src.fileSystemRepresentation;
+    ssize_t n = readlink(dst.fileSystemRepresentation, cur, sizeof(cur) - 1);
+
+    if (n > 0 && want) {
+        cur[n] = 0;
+        if (!strcmp(cur, want)) { madeira_links_kept++; return YES; }
+    }
+    [fm removeItemAtPath:dst error:nil];
+    if (![fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil]) return NO;
+    madeira_links_made++;
+    return YES;
+}
+
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
         /* Perf: the guest main thread runs ON this pthread. Promote to
@@ -1201,6 +1227,8 @@ static void *wine_process_thread(void *arg) {
 
         // Ensure Wine prefix has system32 directory with DLLs from bundle
         {
+            CFAbsoluteTime linksStart = CFAbsoluteTimeGetCurrent();   // ml901
+            madeira_links_kept = madeira_links_made = 0;
             NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
             NSString *dllSource = [bundlePath stringByAppendingPathComponent:[NSString stringWithUTF8String:bundle_subdir]];
             NSString *prefix = [NSString stringWithUTF8String:g_prefix_path];
@@ -1214,9 +1242,8 @@ static void *wine_process_thread(void *arg) {
             for (NSString *dll in dlls) {
                 NSString *src = [dllSource stringByAppendingPathComponent:dll];
                 NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
-                // Remove stale symlinks and re-create (bundle path changes on reinstall)
-                [fm removeItemAtPath:dst error:nil];
-                if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                // Re-created only when stale (bundle path changes on reinstall), ml901
+                if (madeira_ensure_link(fm, dst, src))
                     linked++;
             }
             LOG("Symlinked %d DLLs from %{public}s to %{public}s", linked, bundle_subdir, sys32Dir.UTF8String);
@@ -1283,9 +1310,9 @@ static void *wine_process_thread(void *arg) {
                     int farmLinked = 0;
                     for (NSString *f in files) {
                         NSString *dst = [farmDir stringByAppendingPathComponent:f];
-                        [fm removeItemAtPath:dst error:nil];  // self-heal stale links on reinstall
                         NSString *src = [archSource stringByAppendingPathComponent:f];
-                        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                        // self-heals stale links on reinstall (ml901: only those)
+                        if (madeira_ensure_link(fm, dst, src))
                             farmLinked++;
                     }
                     dprintf(STDERR_FILENO, "[WineProc] Farm %s: %d links -> %s\n",
@@ -1315,9 +1342,11 @@ static void *wine_process_thread(void *arg) {
                             NSString *n = [NSString stringWithUTF8String:wbem[w]];
                             NSString *src = [archSource stringByAppendingPathComponent:n];
                             NSString *dst = [wbemDir stringByAppendingPathComponent:n];
-                            [fm removeItemAtPath:dst error:nil];
-                            if (![fm fileExistsAtPath:src]) continue;  /* farm doesn't build it */
-                            if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                            if (![fm fileExistsAtPath:src]) {      /* farm doesn't build it */
+                                [fm removeItemAtPath:dst error:nil];
+                                continue;
+                            }
+                            if (madeira_ensure_link(fm, dst, src))
                                 wbemLinked++;
                         }
                         dprintf(STDERR_FILENO, "[WineProc] Farm %s\\wbem: %d/%zu links -> %s\n",
@@ -1340,9 +1369,11 @@ static void *wine_process_thread(void *arg) {
                         NSString *n = [NSString stringWithUTF8String:wbem[w]];
                         NSString *src = [dllSource stringByAppendingPathComponent:n];
                         NSString *dst = [wbemDir stringByAppendingPathComponent:n];
-                        [fm removeItemAtPath:dst error:nil];
-                        if (![fm fileExistsAtPath:src]) continue;
-                        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                        if (![fm fileExistsAtPath:src]) {
+                            [fm removeItemAtPath:dst error:nil];
+                            continue;
+                        }
+                        if (madeira_ensure_link(fm, dst, src))
                             wbemLinked++;
                     }
                     dprintf(STDERR_FILENO, "[WineProc] system32\\wbem: %d/%zu links -> %s\n",
@@ -1621,9 +1652,12 @@ static void *wine_process_thread(void *arg) {
                                 [NSString stringWithUTF8String:asmdef->files[f].in_farm]];
                             NSString *link = [asmDir stringByAppendingPathComponent:
                                 [NSString stringWithUTF8String:asmdef->files[f].in_assembly]];
-                            [fm removeItemAtPath:link error:nil];  /* the bundle path changes on reinstall */
-                            if (![fm fileExistsAtPath:src]) continue;
-                            if (![fm createSymbolicLinkAtPath:link withDestinationPath:src error:nil]) {
+                            if (![fm fileExistsAtPath:src]) {
+                                [fm removeItemAtPath:link error:nil];
+                                continue;
+                            }
+                            /* the bundle path changes on reinstall */
+                            if (!madeira_ensure_link(fm, link, src)) {
                                 dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to link %s\n",
                                         link.UTF8String);
                                 ok = NO;
@@ -1639,8 +1673,11 @@ static void *wine_process_thread(void *arg) {
                         [text appendString:@"</assembly>\n"];
                         if (!ok) { sxsSkipped++; continue; }
 
-                        if (![[text dataUsingEncoding:NSUTF8StringEncoding]
-                                writeToFile:manifest atomically:YES]) {
+                        /* ml901: rewritten only when its bytes changed */
+                        NSData *bytes = [text dataUsingEncoding:NSUTF8StringEncoding];
+                        NSData *have = [NSData dataWithContentsOfFile:manifest];
+                        if (!(have && [have isEqualToData:bytes]) &&
+                            ![bytes writeToFile:manifest atomically:YES]) {
                             dprintf(STDERR_FILENO, "[WineProc] winsxs: FAILED to write %s\n",
                                     manifest.UTF8String);
                             sxsSkipped++;
@@ -1762,13 +1799,16 @@ static void *wine_process_thread(void *arg) {
                     }
                     NSString *src = [vcrtSource stringByAppendingPathComponent:dll];
                     NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
-                    [fm removeItemAtPath:dst error:nil];
-                    if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                    if (madeira_ensure_link(fm, dst, src))
                         vcrtLinked++;
                 }
                 LOG("Symlinked %d MS VC++ Runtime DLLs (x86_64 native) over arm64ec builtins, skipped %d", vcrtLinked, vcrtSkipped);
                 dprintf(STDERR_FILENO, "[WineProc] Symlinked %d MS VC++ Runtime DLLs over arm64ec builtins (skipped %d for native EC SEH)\n", vcrtLinked, vcrtSkipped);
             }
+
+            dprintf(STDERR_FILENO, "[WineProc] ml901 prefix links: %u already right, %u made, %.0f ms (farms + winsxs + shell folders)\n",
+                    madeira_links_kept, madeira_links_made,
+                    (CFAbsoluteTimeGetCurrent() - linksStart) * 1000.0);
         }
 
         // Build the launch path for Wine's PE loader.

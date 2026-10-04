@@ -13095,11 +13095,36 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
         int spill_tries = 0;
+        int kernel_pick = 0;
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
 
 #ifdef WINE_IOS
+        /* ml901: KERNEL PICK OR SCAN IS DECIDED ON THE CALLER'S RANGE, NOT ON
+         * THE WINDOW-BIASED ONE BELOW.
+         *
+         * The bias keeps 64-bit views out of the guest windows, and the one
+         * placement that could put a view inside a window is map_reserved_area()
+         * (a window is a Wine reserved area), which still gets the biased
+         * range. The kernel's own pick never can: every window and placeholder
+         * is held PROT_NONE for the whole session, and a teardown replaces it
+         * in place.
+         *
+         * But the bias also lowered `end` below host_addr_space_limit, and that
+         * alone sent every unconstrained request to map_free_area instead of
+         * the kernel. On a device whose map ends at 63 GB the windows sit at
+         * 16-24 GB, the bias keeps [address_space_start, 16 GB), and
+         * address_space_start is 0x10000 once a 64-bit process has booted, so
+         * each placement stepped through the 4 GB __PAGEZERO 64 KB at a time.
+         * 0.1.167 device log: [va-scan] SLOW ... tries=66194 on every one of
+         * them, explorer.exe 3.8 s from its connect to its first child (0.6 s
+         * before the WoW64 port), and every later process the same.
+         *
+         * So a request the kernel placed before the bias existed goes to the
+         * kernel again; everything else keeps the biased scan unchanged. */
+        kernel_pick = !(start > address_space_start || end < host_addr_space_limit || top_down);
+
         /* WoW64 guest window: a window is a Wine reserved area, so without
          * this the ordinary furniture search would place 64-bit views inside
          * a 32-bit pseudo-process's [B, B+4G) and starve it.  Requests that
@@ -13163,7 +13188,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             goto done;
         }
 
-        if (start > address_space_start || end < host_addr_space_limit || top_down)
+        if (!kernel_pick && (start > address_space_start || end < host_addr_space_limit || top_down))
         {
             unsigned int tries0 = ios_va_scan_tries;
             unsigned int skips0 = ios_va_scan_skips;

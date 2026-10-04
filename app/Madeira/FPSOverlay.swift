@@ -2,35 +2,6 @@ import SwiftUI
 import UIKit
 import QuartzCore
 
-/// Keeps the ProMotion panel promoted to 120Hz while MAX mode is on.
-/// CAMetalLayer presents alone don't express frame-rate intent — iOS
-/// parks the display at 60Hz and only promotes on touch (observed
-/// 2026-07-05: MAX mode ran 60 except ~119 bursts while touching). An
-/// active CADisplayLink with preferredFrameRateRange(120) is the
-/// documented way for present-driven Metal apps to hold the panel at
-/// 120. The tick itself does nothing.
-final class ProMotionIntent {
-    static let shared = ProMotionIntent()
-    private var link: CADisplayLink?
-
-    func setActive(_ active: Bool) {
-        if active {
-            guard link == nil else { return }
-            let l = CADisplayLink(target: self, selector: #selector(tick))
-            // ml899: minimum 80, so the panel cannot settle at 60 while a 120 or
-            // uncapped game wants more.
-            l.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
-            l.add(to: .main, forMode: .common)
-            link = l
-        } else {
-            link?.invalidate()
-            link = nil
-        }
-    }
-
-    @objc private func tick(_ sender: CADisplayLink) {}
-}
-
 /// UserDefaults key for the Settings toggle and the full-screen HUD button.
 /// Defaults to on; the value is read wherever the overlay is drawn.
 let perfOverlayEnabledKey = "madeira.perfOverlayEnabled"
@@ -54,10 +25,6 @@ struct FPSOverlay: View {
     var compact: Bool = false
     @ObservedObject private var perf = PerfMonitor.shared
     @AppStorage(perfOverlayEnabledKey) private var enabled = true
-    /// DXMT's g_madeira_vsync_mode, read fresh (no local copy to go stale).
-    /// ml833: only used to set the ProMotion intent on appear now.
-    private var cap: FrameCap { FrameCap.current }
-
     var body: some View {
         Group {
             if !enabled {
@@ -98,10 +65,7 @@ struct FPSOverlay: View {
                             .stroke(Color.white.opacity(0.12), lineWidth: 1))
             }
         }
-        .onAppear {
-            perf.start()
-            ProMotionIntent.shared.setActive(cap == .cap120 || cap == .uncapped)
-        }
+        .onAppear { perf.start() }
         .onDisappear { perf.stop() }
     }
 

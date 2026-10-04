@@ -5086,8 +5086,16 @@ struct ContentView: View {
             self.startWineserver()
             winios_phase("wineserver-up")
 
-            // Step 3: Start Wine (debugger still attached for PE loading BRK calls)
-            Thread.sleep(forTimeInterval: 2.0)
+            // Step 3: Start Wine once the server's main loop is up. ml901: this
+            // was a fixed 2 s from when the debugger stayed attached here; the
+            // server is ready about 30 ms after its thread starts. Never waits
+            // longer than the old 2 s.
+            let serverWaitStart = CFAbsoluteTimeGetCurrent()
+            while wineserver_is_ready() == 0 && CFAbsoluteTimeGetCurrent() - serverWaitStart < 2.0 {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            logStore.log(String(format: "Wineserver ready after %.0f ms",
+                                (CFAbsoluteTimeGetCurrent() - serverWaitStart) * 1000.0))
             winios_phase("wine-start")
             self.startWineProcess()
 

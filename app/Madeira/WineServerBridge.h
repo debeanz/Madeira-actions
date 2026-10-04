@@ -13,6 +13,10 @@ int wineserver_start(const char *prefix_path);
 // Check if wineserver is running
 int wineserver_is_running(void);
 
+// ml901: 1 once the wineserver thread has finished init and entered its main
+// loop (the Wine process can be started then).
+int wineserver_is_ready(void);
+
 // Stop the wineserver (signals the thread to exit)
 void wineserver_stop(void);
 

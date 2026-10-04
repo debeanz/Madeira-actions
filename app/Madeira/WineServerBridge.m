@@ -188,6 +188,13 @@ int wineserver_is_running(void) {
     return g_wineserver_running;
 }
 
+/* ml901: main_ios.c sets this around main_loop(). */
+extern volatile int madeira_wineserver_ready;
+
+int wineserver_is_ready(void) {
+    return g_wineserver_running && madeira_wineserver_ready;
+}
+
 void wineserver_stop(void) {
     wine_log_msg("Wineserver stop requested");
     g_wineserver_should_stop = 1;

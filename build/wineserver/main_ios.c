@@ -5,6 +5,11 @@
 #include "main.c"
 #undef main
 
+/* ml901: set while main_loop() runs. The app starts the Wine process as soon
+ * as this is 1 instead of after a fixed 2 s (see wineserver_is_ready()); init
+ * above takes ~30 ms on device. */
+volatile int madeira_wineserver_ready = 0;
+
 /* Our replacement that adds logging */
 int wineserver_main(int argc, char *argv[])
 {
@@ -47,7 +52,9 @@ int wineserver_main(int argc, char *argv[])
     ws_log("[wineserver] init_registry...");
     init_registry();
     ws_log("[wineserver] entering main_loop!");
+    madeira_wineserver_ready = 1;
     main_loop();
+    madeira_wineserver_ready = 0;
     ws_log("[wineserver] main_loop returned");
     return 0;
 }

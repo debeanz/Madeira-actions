@@ -117,7 +117,7 @@ final class GameLibrary: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        GameLibrary.dropRemovedResolutions()   // ml899
+        GameLibrary.dropRemovedValues()   // ml899, ml901
         gameSettings = GameLibrary.loadGameSettings()
         favorites = Set(defaults.stringArray(forKey: GameLibrary.favoritesKey) ?? [])
         if let raw = defaults.dictionary(forKey: GameLibrary.playSecondsKey) {
@@ -323,17 +323,30 @@ final class GameLibrary: ObservableObject {
 
     /// ml899: a resolution no longer offered (960x540, 1280x960) falls back to
     /// the default -- Settings' to 1920x1080, a game's own to Default.
-    private static func dropRemovedResolutions() {
+    /// ml901: the same for a frame cap no longer offered (120 fps, uncapped):
+    /// Settings' goes back to 60 fps, a game's own to Default.
+    private static func dropRemovedValues() {
         let defaults = UserDefaults.standard
         let offered = Set(GameSettings.resolutionOptions)
         if let r = defaults.string(forKey: GameResolutionDefault.settingKey), !offered.contains(r) {
             defaults.removeObject(forKey: GameResolutionDefault.settingKey)
         }
+        if let c = defaults.object(forKey: FrameCap.key) as? Int, FrameCap(rawValue: Int32(c)) == nil {
+            defaults.removeObject(forKey: FrameCap.key)
+        }
         var all = loadGameSettings()
         var changed = false
         for (id, var s) in all {
+            var dropped = false
             if let r = s.resolution, !offered.contains(r) {
                 s.resolution = nil
+                dropped = true
+            }
+            if let c = s.frameCap, FrameCap(rawValue: Int32(c)) == nil {
+                s.frameCap = nil
+                dropped = true
+            }
+            if dropped {
                 if s.isEmpty { all.removeValue(forKey: id) } else { all[id] = s }
                 changed = true
             }
