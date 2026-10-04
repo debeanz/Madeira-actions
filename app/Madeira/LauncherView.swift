@@ -1223,6 +1223,8 @@ private struct OptionsSheet: View {
     /// ml889: the controller input whose key is being picked (the Controls
     /// section's key binds), or nil.
     @State private var bindPicking: GamepadElement? = nil
+    /// ml890: the Key binds page (Send as keyboard) is showing.
+    @State private var showingBinds: Bool = false
     @State private var showingExecutables: Bool = false
     /// ml830: this game's shader cache on disk; nil until measured off main.
     @State private var cacheBytes: Int64? = nil
@@ -1275,6 +1277,9 @@ private struct OptionsSheet: View {
         let g = current
         if let el = bindPicking {
             return bindChoiceRows(g, el)
+        }
+        if showingBinds {
+            return bindRows(g)
         }
         if showingExecutables {
             return executableRows(g)
@@ -1529,8 +1534,8 @@ private struct OptionsSheet: View {
 
     /// This game's controls, one section: its touch screen controls (off, the
     /// fixed Xbox controller, or the keyboard layout the in-game pencil edits)
-    /// and its physical controller (XInput, or sent as keyboard keys -- then
-    /// every input's key bind is listed under it). A game without its own
+    /// and its physical controller (XInput, or sent as keyboard keys -- then a
+    /// Key binds row opens the binds page, ml890). A game without its own
     /// shows the Settings defaults; picking makes them its own. Usable before
     /// the game runs and, live, while it runs.
     private func controlsRows(_ g: LauncherGame) -> [OptionRow] {
@@ -1562,20 +1567,31 @@ private struct OptionsSheet: View {
                              note: "For games without controller support: each button sends a key you choose.",
                              action: { pad.setSendsXbox(false, forGame: id) }))
         guard !sendsXbox else { return out }
+        // ml890: the binds are a page of their own, so the menu stays short.
+        out.append(OptionRow(id: "pad-keybinds", title: "Key binds", systemImage: "slider.horizontal.3",
+                             destructive: false, checked: false,
+                             note: "Choose the key each button sends.", indent: true,
+                             action: { openBinds() }))
+        return out
+    }
 
-        let m: GamepadMapping = pad.mapping(forGame: id)
+    /// ml890: the Key binds page: one row per stick and button with what it
+    /// sends now; a row opens its key picker.
+    private func bindRows(_ g: LauncherGame) -> [OptionRow] {
+        let m: GamepadMapping = pad.mapping(forGame: g.id)
+        var out: [OptionRow] = []
         for el in [GamepadElement.leftStick, .rightStick] {
             let mode: StickMode = el == .leftStick ? m.leftStick : m.rightStick
             out.append(OptionRow(id: "bind-\(el.rawValue)", title: el.label, systemImage: el.symbol,
                                  destructive: false, checked: false,
-                                 trailing: mode.label, indent: true,
+                                 trailing: mode.label,
                                  action: { openBindPicker(el) }))
         }
         for el in GamepadElement.buttons {
             let action: ControlAction = m.buttons[el] ?? .none
             out.append(OptionRow(id: "bind-\(el.rawValue)", title: el.label, systemImage: el.symbol,
                                  destructive: false, checked: false,
-                                 trailing: GamepadActionCatalogue.label(for: action), indent: true,
+                                 trailing: GamepadActionCatalogue.label(for: action),
                                  action: { openBindPicker(el) }))
         }
         return out
@@ -1583,7 +1599,7 @@ private struct OptionsSheet: View {
 
     /// ml889: the key picker for one input: a stick's four modes, or every key
     /// and mouse button of the Settings catalogue for a button. Picking one
-    /// binds it and goes back to the Controls section.
+    /// binds it and goes back to the Key binds page.
     private func bindChoiceRows(_ g: LauncherGame, _ el: GamepadElement) -> [OptionRow] {
         let id: String = g.id
         let m: GamepadMapping = pad.mapping(forGame: id)
@@ -1632,7 +1648,17 @@ private struct OptionsSheet: View {
     private func closeBindPicker() {
         guard let el = bindPicking else { return }
         bindPicking = nil
-        model.highlight = mainRows(current).firstIndex(where: { $0.id == "bind-\(el.rawValue)" }) ?? 0
+        model.highlight = bindRows(current).firstIndex(where: { $0.id == "bind-\(el.rawValue)" }) ?? 0
+    }
+
+    private func openBinds() {
+        showingBinds = true
+        model.highlight = 0
+    }
+
+    private func closeBinds() {
+        showingBinds = false
+        model.highlight = mainRows(current).firstIndex(where: { $0.id == "pad-keybinds" }) ?? 0
     }
 
     // MARK: Delete (ml830)
@@ -1730,12 +1756,14 @@ private struct OptionsSheet: View {
         return main.firstIndex(where: { $0.id == "delete" }) ?? max(0, main.count - 1)
     }
 
-    private var inSubMode: Bool { showingExecutables || confirmingDelete || bindPicking != nil }
+    private var inSubMode: Bool { showingExecutables || confirmingDelete || bindPicking != nil || showingBinds }
 
     /// Back chevron, B, and the confirmation's Cancel.
     private func leaveSubMode() {
         if bindPicking != nil {
-            closeBindPicker()   // ml889
+            closeBindPicker()   // ml889: back to the Key binds page
+        } else if showingBinds {
+            closeBinds()        // ml890
         } else if confirmingDelete {
             guard !deleting else { return }
             confirmingDelete = false
@@ -1859,6 +1887,9 @@ private struct OptionsSheet: View {
         .onChange(of: bindPicking) { _, _ in   // ml889
             configure(rows.count)
         }
+        .onChange(of: showingBinds) { _, _ in   // ml890
+            configure(rows.count)
+        }
         .onChange(of: busyGameIDs.contains(game.id)) { _, busy in
             // The captured onSelect must see the new disabled states.
             configure(rows.count)
@@ -1896,6 +1927,9 @@ private struct OptionsSheet: View {
     private func headerTexts(_ g: LauncherGame) -> (title: String, subtitle: String, note: String?) {
         if let el = bindPicking {
             return ("\(el.label) sends", g.title, nil)   // ml889
+        }
+        if showingBinds {
+            return ("Key binds", g.title, nil)   // ml890
         }
         if showingExecutables {
             return ("Executable", g.title, nil)

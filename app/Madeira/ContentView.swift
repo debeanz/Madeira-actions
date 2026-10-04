@@ -7207,7 +7207,9 @@ struct TouchControlsOverlay: View {
     /// ml861: the ⋯ dropdown (Save Log, Close <game>). ml865: or the controller
     /// button's panel (Off / Xbox / Custom) — one at a time, in the same place.
     /// The toolbar stays up while either is open.
-    private enum ToolbarMenu { case game, controls }
+    /// ml890: the controls panel's Key binds menu and one input's key list
+    /// open in the same place.
+    private enum ToolbarMenu: Equatable { case game, controls, binds, bindPick(GamepadElement) }
     @State private var openMenu: ToolbarMenu? = nil
     private var chromeShown: Bool { chromeVisible || m.editing || openMenu != nil }
     /// ml858: what the toolbar's Save Log did ("Saved: Celeste (…)"), shown under
@@ -7286,8 +7288,10 @@ struct TouchControlsOverlay: View {
                     if let menu = openMenu {
                         Group {
                             switch menu {
-                            case .game:     gameMenu
-                            case .controls: controlsMenu
+                            case .game:              gameMenu
+                            case .controls:          controlsMenu
+                            case .binds:             bindsMenu
+                            case .bindPick(let el):  bindPickMenu(el)
                             }
                         }
                         .background { ChromeRectReporter(slot: "menu") }
@@ -7467,16 +7471,21 @@ struct TouchControlsOverlay: View {
     /// here: the keyboard layout has the toolbar's pencil, the Xbox preset is
     /// fixed. It scrolls on a phone too short for all of it.
     private var controlsMenu: some View {
-        ViewThatFits(in: .vertical) {
+        panelChrome(ViewThatFits(in: .vertical) {
             controlsMenuContent
             ScrollView(.vertical, showsIndicators: false) { controlsMenuContent }
-        }
-        .frame(width: 320)
-        .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.95)))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(Color.white.opacity(0.10), lineWidth: 1))
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        })
+    }
+
+    /// The controls panels' opaque card (ml822: no glass over the game).
+    private func panelChrome<V: View>(_ content: V) -> some View {
+        content
+            .frame(width: 320)
+            .background(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color(red: 0.09, green: 0.11, blue: 0.15).opacity(0.95)))
+            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
     private var controlsMenuContent: some View {
@@ -7511,8 +7520,8 @@ struct TouchControlsOverlay: View {
     }
 
     /// ml887: the physical controller, per game like the touch controls: sent
-    /// to the game as an Xbox controller (XInput), or as keyboard keys. ml889:
-    /// the keys are bound in the game's ⋯ menu and Settings, not in here.
+    /// to the game as an Xbox controller (XInput), or as keyboard keys. ml890:
+    /// with keyboard keys, a Key binds row opens the binds menu.
     private var physicalControllerSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
@@ -7537,18 +7546,162 @@ struct TouchControlsOverlay: View {
             .padding(.horizontal, 12)
             .padding(.top, 10)
             .padding(.bottom, 12)
+            if !pad.native {
+                Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+                panelRow("Key binds", system: "slider.horizontal.3", chevron: true) { openMenu = .binds }
+            }
         }
+    }
+
+    // MARK: ml890 the physical controller's key binds, in the controls panel
+
+    /// One row per stick and button with what it sends now; a row opens its
+    /// key list. Changes are live (and the running game's own, like the rest).
+    private var bindsMenu: some View {
+        panelChrome(VStack(spacing: 0) {
+            panelHeader("Key binds") { openMenu = .controls }
+            Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+            ViewThatFits(in: .vertical) {
+                bindsList
+                ScrollView(.vertical, showsIndicators: false) { bindsList }
+            }
+        })
+    }
+
+    private var bindsList: some View {
+        VStack(spacing: 0) {
+            ForEach([GamepadElement.leftStick, .rightStick] + GamepadElement.buttons) { el in
+                panelRow(el.label, system: el.symbol, value: bindValue(el), chevron: true) {
+                    openMenu = .bindPick(el)
+                }
+            }
+        }
+    }
+
+    private func bindValue(_ el: GamepadElement) -> String {
+        switch el {
+        case .leftStick:  return pad.mapping.leftStick.label
+        case .rightStick: return pad.mapping.rightStick.label
+        default:          return GamepadActionCatalogue.label(for: pad.mapping.buttons[el] ?? ControlAction.none)
+        }
+    }
+
+    /// One input's choices: a stick's modes, or the keys and mouse buttons of
+    /// the Settings catalogue. Picking one binds it and goes back to the list.
+    private func bindPickMenu(_ el: GamepadElement) -> some View {
+        panelChrome(VStack(spacing: 0) {
+            panelHeader("\(el.label) sends") { openMenu = .binds }
+            Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
+            ViewThatFits(in: .vertical) {
+                bindPickList(el)
+                ScrollView(.vertical, showsIndicators: false) { bindPickList(el) }
+            }
+        })
+    }
+
+    @ViewBuilder
+    private func bindPickList(_ el: GamepadElement) -> some View {
+        if el.isStick {
+            let bound: StickMode = el == .leftStick ? pad.mapping.leftStick : pad.mapping.rightStick
+            VStack(spacing: 0) {
+                ForEach(StickMode.allCases) { mode in
+                    panelRow(mode.label, checked: mode == bound) {
+                        if el == .leftStick { pad.mapping.leftStick = mode } else { pad.mapping.rightStick = mode }
+                        openMenu = .binds
+                    }
+                }
+            }
+        } else {
+            let bound: ControlAction = pad.mapping.buttons[el] ?? ControlAction.none
+            VStack(spacing: 0) {
+                ForEach(Array(GamepadActionCatalogue.all.enumerated()), id: \.offset) { _, item in
+                    panelRow(item.0, checked: item.1 == bound) {
+                        pad.mapping.buttons[el] = item.1
+                        openMenu = .binds
+                    }
+                }
+            }
+        }
+    }
+
+    /// A panel's title row with its back chevron.
+    private func panelHeader(_ title: String, back: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            showChrome()
+            withAnimation(.easeInOut(duration: 0.15)) { back() }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(SteamPalette.accent)
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Color.white)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 46)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// A row of the key-bind panels: an optional symbol, the title, then the
+    /// current value and a chevron, or a checkmark. Unlike menuRow it keeps
+    /// the panel open.
+    private func panelRow(_ title: String, system: String? = nil, value: String? = nil,
+                          checked: Bool = false, chevron: Bool = false,
+                          _ action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            showChrome()
+            withAnimation(.easeInOut(duration: 0.15)) { action() }
+        } label: {
+            HStack(spacing: 12) {
+                if let system {
+                    Image(systemName: system)
+                        .foregroundStyle(SteamPalette.accent)
+                        .frame(width: 22)
+                }
+                Text(title)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 8)
+                if let value {
+                    Text(value)
+                        .foregroundStyle(Color.white.opacity(0.62))
+                        .lineLimit(1)
+                }
+                if checked {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(SteamPalette.accent)
+                }
+                if chevron {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.35))
+                }
+            }
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func padModeTile(_ title: String, icon: String, native: Bool) -> some View {
         let on = pad.native == native
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            withAnimation(.easeInOut(duration: 0.18)) { openMenu = nil }
             showChrome()
             guard !on else { return }
-            pad.native = native
-            showLogToast(native ? "Physical controller: XInput" : "Physical controller: sent as keyboard", for: 1.6)
+            // ml890: the panel stays open, so Key binds appears right under it.
+            withAnimation(.easeInOut(duration: 0.18)) { pad.native = native }
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: icon)
