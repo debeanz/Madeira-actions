@@ -1153,6 +1153,13 @@ private struct OptionRow: Identifiable {
     var disabled: Bool = false
     /// ml871: a plain line under the title.
     var note: String? = nil
+    /// ml889: a section title above this row ("Controls"; "" draws only the gap
+    /// and rule that end the previous section) and a group heading under it
+    /// ("Touch screen controls"). Neither takes the pad's highlight.
+    var section: String? = nil
+    var header: String? = nil
+    /// ml889: indented under the row above it (a key bind under "Send as keyboard").
+    var indent: Bool = false
     let action: () -> Void
 }
 
@@ -1213,8 +1220,9 @@ private struct OptionsSheet: View {
     @ObservedObject private var pad = GamepadBridge.shared
     @ObservedObject private var touch = TouchControlsModel.shared   // ml887: per-game touch controls
     @StateObject private var model = SheetRowsModel()
-    /// ml887: this game's controller key binds, over this menu.
-    @State private var showBinds: Bool = false
+    /// ml889: the controller input whose key is being picked (the Controls
+    /// section's key binds), or nil.
+    @State private var bindPicking: GamepadElement? = nil
     @State private var showingExecutables: Bool = false
     /// ml830: this game's shader cache on disk; nil until measured off main.
     @State private var cacheBytes: Int64? = nil
@@ -1265,6 +1273,9 @@ private struct OptionsSheet: View {
 
     private var rows: [OptionRow] {
         let g = current
+        if let el = bindPicking {
+            return bindChoiceRows(g, el)
+        }
         if showingExecutables {
             return executableRows(g)
         }
@@ -1329,6 +1340,8 @@ private struct OptionsSheet: View {
         }
         out.append(contentsOf: shaderCacheRows(g))
         out.append(contentsOf: perGameSettingRows(g))   // ml849
+        out.append(contentsOf: controlsRows(g))         // ml889
+        let afterControls: Int = out.count
         if case .playing(let t) = session, t == g.title {
             out.append(OptionRow(id: "forceclose", title: "Force close", systemImage: "xmark.octagon",
                                  destructive: true, checked: false,
@@ -1358,6 +1371,8 @@ private struct OptionsSheet: View {
                              destructive: false, checked: false,
                              action: { showReport = true }))
         out.append(deleteRow(g))
+        // ml889: the rows after the Controls section do not belong to it.
+        if afterControls < out.count { out[afterControls].section = "" }
         return out
     }
 
@@ -1507,40 +1522,117 @@ private struct OptionsSheet: View {
                                      FrameCap.apply(cap, persist: false)
                                  }
                              }))
-
-        // ml887: this game's controls, also before it runs. While it runs they
-        // are changed from its own toolbar (the controller button).
-        let touchOwn: TouchControlsChoice? = touch.ownChoice(forGame: id)
-        out.append(OptionRow(id: "touchcontrols", title: "Touch controls",
-                             systemImage: "hand.tap",
-                             destructive: false, checked: false,
-                             trailing: touchOwn?.title ?? "Default (\(touch.defaultChoice.title))",
-                             disabled: busy,
-                             action: {
-                                 let order: [TouchControlsChoice?] = [nil, .off, .xbox, .custom]
-                                 let cur: Int = order.firstIndex(where: { $0 == touchOwn }) ?? 0
-                                 touch.setOwnChoice(order[(cur + 1) % order.count], forGame: id)
-                             }))
-        let padOwn: Bool? = pad.ownSendsXbox(forGame: id)
-        let sendsText: (Bool) -> String = { $0 ? "Xbox controller" : "Keyboard keys" }
-        out.append(OptionRow(id: "padmode", title: "Controller sends",
-                             systemImage: "gamecontroller",
-                             destructive: false, checked: false,
-                             trailing: padOwn.map(sendsText) ?? "Default (\(sendsText(pad.defaultSendsXbox)))",
-                             disabled: busy,
-                             note: "For a physical controller. Keyboard keys is for games without controller support.",
-                             action: {
-                                 let order: [Bool?] = [nil, true, false]
-                                 let cur: Int = order.firstIndex(where: { $0 == padOwn }) ?? 0
-                                 pad.setOwnSendsXbox(order[(cur + 1) % order.count], forGame: id)
-                             }))
-        out.append(OptionRow(id: "padbinds", title: "Controller key binds",
-                             systemImage: "slider.horizontal.3",
-                             destructive: false, checked: false,
-                             trailing: pad.hasOwnMapping(forGame: id) ? "This game's" : "Default",
-                             disabled: busy,
-                             action: { showBinds = true }))
         return out
+    }
+
+    // MARK: Controls (ml889)
+
+    /// This game's controls, one section: its touch screen controls (off, the
+    /// fixed Xbox controller, or the keyboard layout the in-game pencil edits)
+    /// and its physical controller (XInput, or sent as keyboard keys -- then
+    /// every input's key bind is listed under it). A game without its own
+    /// shows the Settings defaults; picking makes them its own. Usable before
+    /// the game runs and, live, while it runs.
+    private func controlsRows(_ g: LauncherGame) -> [OptionRow] {
+        let id: String = g.id
+        let touchNow: TouchControlsChoice = touch.choice(forGame: id)
+        let sendsXbox: Bool = pad.sendsXbox(forGame: id)
+        var out: [OptionRow] = []
+
+        out.append(OptionRow(id: "touch-off", title: "Off", systemImage: "nosign",
+                             destructive: false, checked: touchNow == .off,
+                             section: "Controls", header: "Touch screen controls",
+                             action: { touch.setChoice(.off, forGame: id) }))
+        out.append(OptionRow(id: "touch-xbox", title: "Xbox controller (XInput)", systemImage: "gamecontroller",
+                             destructive: false, checked: touchNow == .xbox,
+                             note: "A fixed layout.",
+                             action: { touch.setChoice(.xbox, forGame: id) }))
+        out.append(OptionRow(id: "touch-keyboard", title: "Keyboard layout", systemImage: "keyboard",
+                             destructive: false, checked: touchNow == .custom,
+                             note: "Arrange it with the pencil while playing.",
+                             action: { touch.setChoice(.custom, forGame: id) }))
+
+        out.append(OptionRow(id: "pad-xinput", title: "XInput", systemImage: "gamecontroller.fill",
+                             destructive: false, checked: sendsXbox,
+                             note: "The game sees an Xbox controller.",
+                             header: "Physical controller",
+                             action: { pad.setSendsXbox(true, forGame: id) }))
+        out.append(OptionRow(id: "pad-keyboard", title: "Send as keyboard", systemImage: "keyboard",
+                             destructive: false, checked: !sendsXbox,
+                             note: "For games without controller support: each button sends a key you choose.",
+                             action: { pad.setSendsXbox(false, forGame: id) }))
+        guard !sendsXbox else { return out }
+
+        let m: GamepadMapping = pad.mapping(forGame: id)
+        for el in [GamepadElement.leftStick, .rightStick] {
+            let mode: StickMode = el == .leftStick ? m.leftStick : m.rightStick
+            out.append(OptionRow(id: "bind-\(el.rawValue)", title: el.label, systemImage: el.symbol,
+                                 destructive: false, checked: false,
+                                 trailing: mode.label, indent: true,
+                                 action: { openBindPicker(el) }))
+        }
+        for el in GamepadElement.buttons {
+            let action: ControlAction = m.buttons[el] ?? .none
+            out.append(OptionRow(id: "bind-\(el.rawValue)", title: el.label, systemImage: el.symbol,
+                                 destructive: false, checked: false,
+                                 trailing: GamepadActionCatalogue.label(for: action), indent: true,
+                                 action: { openBindPicker(el) }))
+        }
+        return out
+    }
+
+    /// ml889: the key picker for one input: a stick's four modes, or every key
+    /// and mouse button of the Settings catalogue for a button. Picking one
+    /// binds it and goes back to the Controls section.
+    private func bindChoiceRows(_ g: LauncherGame, _ el: GamepadElement) -> [OptionRow] {
+        let id: String = g.id
+        let m: GamepadMapping = pad.mapping(forGame: id)
+        if el.isStick {
+            let bound: StickMode = el == .leftStick ? m.leftStick : m.rightStick
+            return StickMode.allCases.map { mode in
+                OptionRow(id: "pick-\(mode.rawValue)", title: mode.label,
+                          systemImage: mode == StickMode.none ? "nosign" : (mode == .mouse ? "computermouse" : "keyboard"),
+                          destructive: false, checked: mode == bound,
+                          action: {
+                              var next: GamepadMapping = pad.mapping(forGame: id)
+                              if el == .leftStick { next.leftStick = mode } else { next.rightStick = mode }
+                              pad.setMapping(next, forGame: id)
+                              closeBindPicker()
+                          })
+            }
+        }
+        let bound: ControlAction = m.buttons[el] ?? .none
+        return GamepadActionCatalogue.all.enumerated().map { pair -> OptionRow in
+            let item: (String, ControlAction) = pair.element
+            return OptionRow(id: "pick-\(pair.offset)", title: item.0, systemImage: Self.bindSymbol(item.1),
+                             destructive: false, checked: item.1 == bound,
+                             action: {
+                                 var next: GamepadMapping = pad.mapping(forGame: id)
+                                 next.buttons[el] = item.1
+                                 pad.setMapping(next, forGame: id)
+                                 closeBindPicker()
+                             })
+        }
+    }
+
+    private static func bindSymbol(_ a: ControlAction) -> String {
+        switch a {
+        case .none:                   return "nosign"
+        case .mouseLeft, .mouseRight: return "computermouse"
+        default:                      return "keyboard"
+        }
+    }
+
+    private func openBindPicker(_ el: GamepadElement) {
+        bindPicking = el
+        let list: [OptionRow] = bindChoiceRows(current, el)
+        model.highlight = list.firstIndex(where: { $0.checked }) ?? 0   // the pad starts on the current bind
+    }
+
+    private func closeBindPicker() {
+        guard let el = bindPicking else { return }
+        bindPicking = nil
+        model.highlight = mainRows(current).firstIndex(where: { $0.id == "bind-\(el.rawValue)" }) ?? 0
     }
 
     // MARK: Delete (ml830)
@@ -1638,11 +1730,13 @@ private struct OptionsSheet: View {
         return main.firstIndex(where: { $0.id == "delete" }) ?? max(0, main.count - 1)
     }
 
-    private var inSubMode: Bool { showingExecutables || confirmingDelete }
+    private var inSubMode: Bool { showingExecutables || confirmingDelete || bindPicking != nil }
 
     /// Back chevron, B, and the confirmation's Cancel.
     private func leaveSubMode() {
-        if confirmingDelete {
+        if bindPicking != nil {
+            closeBindPicker()   // ml889
+        } else if confirmingDelete {
             guard !deleting else { return }
             confirmingDelete = false
             confirmedPlan = nil
@@ -1677,8 +1771,33 @@ private struct OptionsSheet: View {
                 ScrollView {
                     VStack(spacing: 8) {
                         ForEach(Array(list.enumerated()), id: \.element.id) { i, row in
-                            rowButton(row, focused: highlighted == i)
-                                .id(row.id)
+                            VStack(alignment: .leading, spacing: 8) {
+                                // ml889: section title and group heading above the row
+                                if let section = row.section {
+                                    Rectangle()
+                                        .fill(Color.white.opacity(0.08))
+                                        .frame(height: 1)
+                                        .padding(.top, 10)
+                                    if !section.isEmpty {
+                                        Text(section)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(.white)
+                                            .padding(.top, 2)
+                                    }
+                                }
+                                if let header = row.header {
+                                    Text(header)
+                                        .font(.caption.weight(.semibold))
+                                        .tracking(0.6)
+                                        .textCase(.uppercase)
+                                        .foregroundStyle(LauncherPalette.textSecondary)
+                                        .padding(.top, 4)
+                                        .padding(.leading, 4)
+                                }
+                                rowButton(row, focused: highlighted == i)
+                                    .padding(.leading, row.indent ? 28 : 0)
+                            }
+                            .id(row.id)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -1708,9 +1827,6 @@ private struct OptionsSheet: View {
         .sheet(isPresented: $showReport) {   // ml863
             ReportSheet(game: current, note: nil) { showReport = false }
         }
-        .sheet(isPresented: $showBinds) {    // ml887
-            GameControllerBindsView(gameID: current.id, title: current.title) { showBinds = false }
-        }
         .onAppear {
             configure(list.count)
             loadCacheSize()
@@ -1738,6 +1854,9 @@ private struct OptionsSheet: View {
             configure(rows.count)
         }
         .onChange(of: confirmingDelete) { _, _ in
+            configure(rows.count)
+        }
+        .onChange(of: bindPicking) { _, _ in   // ml889
             configure(rows.count)
         }
         .onChange(of: busyGameIDs.contains(game.id)) { _, busy in
@@ -1775,6 +1894,9 @@ private struct OptionsSheet: View {
     /// Header lines: title, monospaced subtitle, optional note (the delete
     /// confirmation's AppData note / reason, or a failed delete's error).
     private func headerTexts(_ g: LauncherGame) -> (title: String, subtitle: String, note: String?) {
+        if let el = bindPicking {
+            return ("\(el.label) sends", g.title, nil)   // ml889
+        }
         if showingExecutables {
             return ("Executable", g.title, nil)
         }

@@ -3160,15 +3160,7 @@ struct ContentView: View {
                         touchControls.editing = true
                         desktopFullScreen = true
                     } label: {
-                        Label("Edit Custom Layout", systemImage: "pencil")
-                    }
-                    // ml887: the PHYSICAL controller's keyboard binds, on a picture
-                    // of the controller (the bind editor).
-                    Button {
-                        touchControls.openBindEditor()
-                        desktopFullScreen = true
-                    } label: {
-                        Label("Edit Controller Key Binds", systemImage: "keyboard")
+                        Label("Edit Keyboard Layout", systemImage: "pencil")
                     }
                 }
 
@@ -5332,58 +5324,6 @@ enum ControlAction: Codable, Equatable, Hashable {
             return String(format: "%02X", vk)
         }
     }
-
-    /// ml886: a bind's name as the bind editor writes it ("Space", "L click").
-    var bindName: String {
-        switch self {
-        case .none:        return "None"
-        case .mouseLeft:   return "L click"
-        case .mouseRight:  return "R click"
-        case .key(let vk): return ControlAction.keyName(vk)
-        default:           return label
-        }
-    }
-
-    /// ml886: the key names of MappingPanel's catalogue, for captions.
-    static func keyName(_ vk: Int32) -> String {
-        switch vk {
-        case 0x20: return "Space"
-        case 0x0D: return "Enter"
-        case 0x1B: return "Esc"
-        case 0x09: return "Tab"
-        case 0x10: return "Shift"
-        case 0x11: return "Ctrl"
-        case 0x12: return "Alt"
-        case 0x08: return "Bksp"
-        case 0x14: return "Caps"
-        case 0x5B: return "Win"
-        case 0x2D: return "Ins"
-        case 0x2E: return "Del"
-        case 0x24: return "Home"
-        case 0x23: return "End"
-        case 0x21: return "PgUp"
-        case 0x22: return "PgDn"
-        case 0x70...0x7B: return "F\(vk - 0x6F)"
-        case 0x60...0x69: return "N\(vk - 0x60)"
-        case 0x6A: return "N*"
-        case 0x6B: return "N+"
-        case 0x6D: return "N−"
-        case 0x6E: return "N."
-        case 0x6F: return "N/"
-        case 0xBD: return "-"
-        case 0xBB: return "="
-        case 0xDB: return "["
-        case 0xDD: return "]"
-        case 0xDC: return "\\"
-        case 0xBA: return ";"
-        case 0xDE: return "'"
-        case 0xBC: return ","
-        case 0xBE: return "."
-        case 0xBF: return "/"
-        case 0xC0: return "`"
-        default:   return keyLabel(vk)     // letters, digits, arrows
-        }
-    }
 }
 
 /// ml831: the Xbox inputs a touch control can send (ControlAction.pad names).
@@ -5588,6 +5528,8 @@ enum TouchControlsMode: String, Codable, CaseIterable {
 
 /// ml865: the three-way switch behind the game toolbar's controller button and
 /// Settings: no on-screen controls, the Xbox preset, or the custom layout.
+/// ml889: the custom layout is shown as the keyboard layout (the raw value
+/// stays, it is in saved files).
 enum TouchControlsChoice: String, CaseIterable, Identifiable {
     case off, xbox, custom
 
@@ -5597,7 +5539,7 @@ enum TouchControlsChoice: String, CaseIterable, Identifiable {
         switch self {
         case .off:    return "Off"
         case .xbox:   return "Xbox"
-        case .custom: return "Custom"
+        case .custom: return "Keyboard"
         }
     }
 
@@ -5605,7 +5547,7 @@ enum TouchControlsChoice: String, CaseIterable, Identifiable {
         switch self {
         case .off:    return "nosign"
         case .xbox:   return "gamecontroller"
-        case .custom: return "square.grid.2x2"
+        case .custom: return "keyboard"
         }
     }
 
@@ -5614,7 +5556,7 @@ enum TouchControlsChoice: String, CaseIterable, Identifiable {
         switch self {
         case .off:    return "Touch controls off"
         case .xbox:   return "Xbox controller"
-        case .custom: return "Custom layout"
+        case .custom: return "Keyboard layout"
         }
     }
 
@@ -5624,9 +5566,9 @@ enum TouchControlsChoice: String, CaseIterable, Identifiable {
         case .off:
             return "No on-screen controls. The screen works as a trackpad, and a physical controller still works."
         case .xbox:
-            return "A ready-made Xbox controller layout. Games read it as player 1, alongside any physical controller."
+            return "A fixed Xbox controller layout (XInput). Games read it as player 1, alongside any physical controller."
         case .custom:
-            return "Your own layout: any mix of controller buttons, keys and mouse buttons. While it has controller buttons, games also see an Xbox controller."
+            return "A keyboard layout you arrange yourself with the pencil, starting from a ready-made PC layout. Controller buttons can be added too; then games also see an Xbox controller."
         }
     }
 }
@@ -5690,28 +5632,7 @@ final class TouchControlsModel: ObservableObject {
     /// Transient, never persisted. ml865: the editor can give a custom layout its
     /// first controller button or take its last away; the pad follows when
     /// editing ends, not per edit.
-    @Published var editing = false {
-        didSet {
-            guard oldValue && !editing else { return }
-            bindEditing = false                     // ml887: one editor, one close
-            pushPadConnected()
-        }
-    }
-    /// ml887: the editor is open on the PHYSICAL controller's key binds
-    /// (GamepadBridge.mapping): it shows `bindControls`, the Xbox preset as a
-    /// picture of the controller, whatever the touch controls are.
-    @Published private(set) var bindEditing = false
-    @Published private(set) var bindControls: [TouchControl] = []
-    /// What the editor shows: the touch layout, or the controller picture.
-    var editorControls: [TouchControl] { bindEditing ? bindControls : controls }
-
-    /// ml887: open the physical controller's bind editor.
-    func openBindEditor() {
-        selected = nil
-        bindControls = Self.defaultLayout(.xbox)
-        bindEditing = true
-        editing = true
-    }
+    @Published var editing = false              { didSet { if oldValue && !editing { pushPadConnected() } } }
     @Published var selected: UUID?              // transient
     /// ml827: the loading / "Closing game…" panel is up (ContentView.showLaunchOverlay).
     /// The controls, toolbar and performance HUD wait for the game's first frame.
@@ -5783,16 +5704,25 @@ final class TouchControlsModel: ObservableObject {
         if let d = try? Data(contentsOf: Self.url),
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             let m = s.mode.flatMap { TouchControlsMode(rawValue: $0) } ?? .custom
+            // ml889: a keyboard layout that is still exactly the old seed was never
+            // customised, so it becomes the natural preset.
+            let custom = Self.isLegacySeed(s.controls) ? Self.defaultLayout(.custom) : s.controls
             mode      = m
             legacyPad = s.padControls
             if m == .xbox {
-                customStash = s.controls
+                customStash = custom
                 controls    = Self.defaultLayout(.xbox)
             } else {
-                controls = s.controls
+                controls = custom
             }
             visible  = s.visible
             profiles = s.games ?? [:]
+        } else {
+            // ml889: nothing saved yet (a first install): the Xbox controller
+            // preset is on. The keyboard layout is seeded when first picked.
+            mode     = .xbox
+            controls = Self.defaultLayout(.xbox)
+            visible  = true
         }
         loading = false
         // ml831: next turn, so GamepadBridge.shared is never first touched from
@@ -5852,44 +5782,36 @@ final class TouchControlsModel: ObservableObject {
     /// ml886: whether the running game has controls of its own.
     var gameHasOwnControls: Bool { gameID.map { profiles[$0] != nil } ?? false }
 
-    // MARK: ml887 a game's touch controls from its ⋯ menu (Games tab)
+    // MARK: ml889 a game's touch controls from its ⋯ menu (Games tab)
 
     private static func choice(of p: GameControlsProfile) -> TouchControlsChoice {
         guard p.visible ?? false else { return .off }
         return p.mode.flatMap { TouchControlsMode(rawValue: $0) } == .xbox ? .xbox : .custom
     }
 
-    /// The default touch controls' choice: what a game without its own gets.
-    var defaultChoice: TouchControlsChoice { Self.choice(of: defaults ?? snapshot()) }
-
-    /// A game's own choice, nil when it follows the default.
-    func ownChoice(forGame id: String) -> TouchControlsChoice? {
-        guard let own = profiles[id], own.mode != nil || own.visible != nil else { return nil }
-        return Self.choice(of: Self.merged(own, over: defaults ?? snapshot()))
+    /// What a game gets: its own choice, else the default. The running game's
+    /// is what is on screen.
+    func choice(forGame id: String) -> TouchControlsChoice {
+        if id == gameID { return choice }
+        return Self.choice(of: Self.merged(profiles[id], over: defaults ?? snapshot()))
     }
 
-    /// Set a game's own choice (nil: follow the default again; its own custom
-    /// layout, if it has one, stays). For a game that is not running — the
-    /// running one is changed from its own toolbar.
-    func setOwnChoice(_ c: TouchControlsChoice?, forGame id: String) {
-        guard id != gameID else { return }
-        var own = profiles[id] ?? GameControlsProfile()
-        switch c {
-        case nil:
-            own.mode = nil
-            own.visible = nil
-        case .off?:
-            own.visible = false
-        case .xbox?:
-            own.visible = true
-            own.mode = TouchControlsMode.xbox.rawValue
-        case .custom?:
-            own.visible = true
-            own.mode = TouchControlsMode.custom.rawValue
+    /// Pick a game's touch controls. The running game's change at once (and
+    /// save() keeps them as its own); any other game's become its own, its
+    /// keyboard layout untouched. Picking what it already has changes nothing.
+    func setChoice(_ c: TouchControlsChoice, forGame id: String) {
+        if id == gameID {
+            choice = c
+            return
         }
-        profiles[id] = own.isEmpty ? nil : own
+        guard c != choice(forGame: id) else { return }
+        var own = profiles[id] ?? GameControlsProfile()
+        own.visible = c != .off
+        if c != .off { own.mode = (c == .xbox ? TouchControlsMode.xbox : .custom).rawValue }
+        profiles[id] = own
         objectWillChange.send()
         persist()
+        LogStore.shared.log("[controls] ml889 touch controls for a game: \(c.rawValue)")
     }
 
     private func save() {
@@ -5966,14 +5888,48 @@ final class TouchControlsModel: ObservableObject {
         controls = Self.defaultLayout(mode)
     }
 
+    /// ml889: the four-control keyboard layout builds before ml889 seeded. A saved
+    /// layout that is still exactly this was never customised.
+    private static func isLegacySeed(_ c: [TouchControl]) -> Bool {
+        let seed: [(Double, Double, Double, ControlAction)] = [
+            (0.16, 0.72, 1.35, .joystickWASD), (0.84, 0.72, 1.05, .mouseLeft),
+            (0.73, 0.60, 0.88, .key(0x20)), (0.90, 0.55, 0.78, .key(0x1B)),
+        ]
+        guard c.count == seed.count else { return false }
+        for (t, s) in zip(c, seed) where t.nx != s.0 || t.ny != s.1 || t.scale != s.2 || t.action != s.3 {
+            return false
+        }
+        return true
+    }
+
     private static func defaultLayout(_ mode: TouchControlsMode) -> [TouchControl] {
+        // ml885: positions are fractions of the screen, sizes are points, so on a
+        // shorter screen everything is scaled by its height (down to 0.85).
+        let screen = UIScreen.main.bounds.size
+        let k = min(max(Double(min(screen.width, screen.height)) / 430, 0.85), 1.0)
         switch mode {
         case .custom:
+            // ml889: a natural PC keyboard layout, placed like the Xbox preset:
+            // WASD under the left thumb, Shift (run) at its inner shoulder and
+            // Ctrl (crouch) below-right of it; Space (jump) with E, F and R above
+            // it as the right thumb's diamond; right click (aim) and left click
+            // (attack) on the shoulders; Tab and Esc at the bottom centre. The
+            // rest of the screen stays the mouse.
+            func c(_ x: Double, _ y: Double, _ s: Double, _ a: ControlAction) -> TouchControl {
+                TouchControl(nx: x, ny: y, scale: (s * k * 100).rounded() / 100, action: a)
+            }
             return [
-                TouchControl(nx: 0.16, ny: 0.72, scale: 1.35, action: .joystickWASD),
-                TouchControl(nx: 0.84, ny: 0.72, scale: 1.05, action: .mouseLeft),
-                TouchControl(nx: 0.73, ny: 0.60, scale: 0.88, action: .key(0x20)),
-                TouchControl(nx: 0.90, ny: 0.55, scale: 0.78, action: .key(0x1B)),
+                c(0.165, 0.680, 1.85, .joystickWASD),
+                c(0.262, 0.495, 0.80, .key(0x10)),      // Shift
+                c(0.325, 0.825, 0.90, .key(0x11)),      // Ctrl
+                c(0.826, 0.845, 1.05, .key(0x20)),      // Space
+                c(0.768, 0.705, 0.94, .key(0x45)),      // E
+                c(0.884, 0.705, 0.94, .key(0x46)),      // F
+                c(0.826, 0.580, 0.94, .key(0x52)),      // R
+                c(0.120, 0.430, 1.05, .mouseRight),
+                c(0.880, 0.430, 1.05, .mouseLeft),
+                c(0.462, 0.885, 0.66, .key(0x09)),      // Tab
+                c(0.538, 0.885, 0.66, .key(0x1B)),      // Esc
             ]
         case .xbox:
             // ml885: laid out like the controller, on a landscape iPhone Pro Max
@@ -5987,11 +5943,7 @@ final class TouchControlsModel: ObservableObject {
             //  - every control inside the safe area, 15+ pt between rims.
             // Sizes: 118 pt left stick, 102 pt right stick, 60 pt face buttons
             // 54 pt from the diamond's centre, 83 pt D-pad, 67 pt bumpers,
-            // 64 pt triggers, 40-42 pt small buttons. Positions are fractions of
-            // the screen, sizes are points, so on a shorter screen everything
-            // is scaled by its height (down to 0.85) to keep the same spacing.
-            let screen = UIScreen.main.bounds.size
-            let k = min(max(Double(min(screen.width, screen.height)) / 430, 0.85), 1.0)
+            // 64 pt triggers, 40-42 pt small buttons (scaled by k above).
             func c(_ x: Double, _ y: Double, _ s: Double, _ n: PadInput) -> TouchControl {
                 TouchControl(nx: x, ny: y, scale: (s * k * 100).rounded() / 100,
                              action: .pad(n.rawValue))
@@ -7291,8 +7243,7 @@ struct TouchControlsOverlay: View {
                     // editor. In play they are ControlsInputView (UIKit, per
                     // finger), underneath this hosting view.
                     if m.editing {
-                        // ml887: or the controller picture, in the key-bind editor
-                        ForEach(m.editorControls) { c in
+                        ForEach(m.controls) { c in
                             TouchControlButton(control: c, screen: geo.size)
                         }
                     }
@@ -7361,11 +7312,11 @@ struct TouchControlsOverlay: View {
                             .allowsHitTesting(false)
                             .transition(.opacity)
                     }
-                    if m.editing, let c = m.editorControls.first(where: { $0.id == m.selected }) {
+                    if m.editing, let i = m.index(of: m.selected) {
                         // ml865: a fresh panel per control, so it opens on that
                         // control's tab.
-                        MappingPanel(control: c, screen: geo.size)
-                            .id(c.id)
+                        MappingPanel(control: m.controls[i], screen: geo.size)
+                            .id(m.controls[i].id)
                     }
                 }
             }
@@ -7448,13 +7399,7 @@ struct TouchControlsOverlay: View {
                 MetalBackedView.toggleKeyboard()
             }
             // ml865: only the custom layout is edited; the Xbox preset is fixed.
-            // ml887: the controller key-bind editor closes with the same check.
-            if m.bindEditing {
-                glassButton("checkmark", steam: true, primary: true) {
-                    m.editing = false
-                    m.selected = nil
-                }
-            } else if m.choice == .custom {
+            if m.choice == .custom {
                 glassButton(m.editing ? "checkmark" : "pencil",
                             steam: m.editing, primary: m.editing) {
                     m.editing.toggle()
@@ -7517,10 +7462,10 @@ struct TouchControlsOverlay: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    /// ml865: the controller button's panel — Off, the Xbox preset or the custom
-    /// layout, and the custom layout's editor. Opaque like the ⋯ menu (ml822).
-    /// ml887: it scrolls on a phone too short for all of it (the physical
-    /// controller section made it ~330 pt tall).
+    /// ml865: the controller button's panel — Off, the Xbox preset or the
+    /// keyboard layout. Opaque like the ⋯ menu (ml822). ml889: no editing in
+    /// here: the keyboard layout has the toolbar's pencil, the Xbox preset is
+    /// fixed. It scrolls on a phone too short for all of it.
     private var controlsMenu: some View {
         ViewThatFits(in: .vertical) {
             controlsMenuContent
@@ -7561,18 +7506,13 @@ struct TouchControlsOverlay: View {
             .padding(.top, 10)
             .padding(.bottom, 12)
             Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
-            menuRow("Edit Custom Layout", system: "pencil") {
-                if m.bindEditing { m.editing = false }   // ml887: leave the key-bind editor
-                m.choice = .custom
-                m.editing = true
-            }
-            Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
             physicalControllerSection
         }
     }
 
     /// ml887: the physical controller, per game like the touch controls: sent
-    /// to the game as an Xbox controller, or as the keyboard keys bound to it.
+    /// to the game as an Xbox controller (XInput), or as keyboard keys. ml889:
+    /// the keys are bound in the game's ⋯ menu and Settings, not in here.
     private var physicalControllerSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
@@ -7591,21 +7531,12 @@ struct TouchControlsOverlay: View {
             .padding(.horizontal, 16)
             .padding(.top, 14)
             HStack(spacing: 8) {
-                padModeTile("Xbox", icon: "gamecontroller", native: true)
-                padModeTile("Keyboard", icon: "keyboard", native: false)
+                padModeTile("XInput", icon: "gamecontroller", native: true)
+                padModeTile("Send as keyboard", icon: "keyboard", native: false)
             }
             .padding(.horizontal, 12)
             .padding(.top, 10)
             .padding(.bottom, 12)
-            Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1)
-            menuRow("Edit Key Binds", system: "slider.horizontal.3") {
-                // Binding keys only means something in keyboard mode.
-                if pad.native {
-                    pad.native = false
-                    showLogToast("Controller sends keyboard keys", for: 1.6)
-                }
-                m.openBindEditor()
-            }
         }
     }
 
@@ -7617,7 +7548,7 @@ struct TouchControlsOverlay: View {
             showChrome()
             guard !on else { return }
             pad.native = native
-            showLogToast(native ? "Controller: Xbox controller" : "Controller: keyboard keys", for: 1.6)
+            showLogToast(native ? "Physical controller: XInput" : "Physical controller: sent as keyboard", for: 1.6)
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: icon)
@@ -7625,7 +7556,9 @@ struct TouchControlsOverlay: View {
                 Text(title)
                     .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.7)
             }
+            .padding(.horizontal, 6)
             .foregroundStyle(on ? Color.white : Color.white.opacity(0.72))
             .frame(maxWidth: .infinity)
             .frame(height: 46)
@@ -7762,7 +7695,6 @@ struct TouchControlButton: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
-    @ObservedObject private var pad = GamepadBridge.shared   // ml887: bind captions
     @State private var dragBase: CGPoint?
     @State private var dragStart: CGPoint?
     /// ml833: double-tap-and-hold resizes (the editor's pinch is gone). When the
@@ -7843,8 +7775,7 @@ struct TouchControlButton: View {
                                  lineWidth: isSelected ? 2 : 1))
         .overlay(alignment: .topTrailing) {
             // ml833: hidden while resizing, where the scale readout sits.
-            // ml887: and on the key-bind editor's controller picture.
-            if isSelected && resizeBase == nil && !m.bindEditing {
+            if isSelected && resizeBase == nil {
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     m.controls.removeAll { $0.id == control.id }
@@ -7876,31 +7807,12 @@ struct TouchControlButton: View {
                     .allowsHitTesting(false)
             }
         }
-        .overlay(alignment: .bottom) {
-            // ml887: in the controller key-bind editor, what each button sends.
-            if m.bindEditing, let p = control.action.padInput {
-                Text(pad.bindSummary(p))
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(isSelected ? SteamPalette.accent : SteamPalette.panel))
-                    .overlay(Capsule().stroke(SteamPalette.border, lineWidth: 1))
-                    .fixedSize()
-                    .alignmentGuide(.bottom) { d in d[.top] - 4 }
-                    .allowsHitTesting(false)
-            }
-        }
         .position(ControlsGeometry.center(control, in: screen))
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
                     guard m.editing else { return }
                     if m.selected != control.id { m.selected = control.id }
-                    // ml887: the key-bind editor's controller picture never
-                    // moves or resizes.
-                    guard !m.bindEditing else { return }
                     guard let i = m.index(of: control.id) else { return }
                     // Re-base on a NEW gesture (its startLocation differs), so a
                     // cancelled drag (no onEnded) cannot leave a stale base that
@@ -7965,12 +7877,9 @@ struct MappingPanel: View {
     let control: TouchControl
     let screen: CGSize
     @ObservedObject private var m = TouchControlsModel.shared
-    @ObservedObject private var pad = GamepadBridge.shared   // ml887: the key binds
     /// 0 keyboard, 1 controller. ml865: opens on the tab of the control's own
     /// input — a custom layout mixes both (an Esc key beside the pad).
     @State private var tab: Int
-    /// ml887: which D-pad direction is being bound (up, right, down, left).
-    @State private var dir = 0
 
     init(control: TouchControl, screen: CGSize) {
         self.control = control
@@ -7978,37 +7887,21 @@ struct MappingPanel: View {
         _tab = State(initialValue: control.action.isPad ? 1 : 0)
     }
 
-    /// ml887: in the controller key-bind editor the panel binds keys to the
-    /// PHYSICAL controller's input this picture's control stands for, instead of
-    /// choosing what a touch control is.
-    private var bindPad: PadInput? { m.bindEditing ? control.action.padInput : nil }
 
     var body: some View {
         // ml833: Steam Big Picture style — opaque #1B2838 panel, #171A21 tab
         // strip, accent-filled selection. No glass/material in the editor.
         VStack(spacing: 0) {
-            Group {
-                if let p = bindPad {
-                    bindHeader(p)
-                } else {
-                    HStack(spacing: 8) {
-                        tabButton(0, "keyboard", "Keyboard")
-                        tabButton(1, "gamecontroller", "Controller")
-                    }
-                }
+            HStack(spacing: 8) {
+                tabButton(0, "keyboard", "Keyboard")
+                tabButton(1, "gamecontroller", "Controller")
             }
             .padding(8)
             .background(SteamPalette.base)
             Rectangle().fill(SteamPalette.border).frame(height: 1)
             ScrollView {
-                Group {
-                    if let p = bindPad {
-                        bindTab(p)
-                    } else {
-                        tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab)
-                    }
-                }
-                .padding(12)
+                (tab == 0 ? AnyView(keyboardTab) : AnyView(controllerTab))
+                    .padding(12)
             }
         }
         .frame(width: layout.size.width, height: layout.size.height)
@@ -8105,23 +7998,6 @@ struct MappingPanel: View {
            ("N.", .key(0x6E)), ("N/", .key(0x6F))]
     }
 
-    private var modifiers: [(String, ControlAction)] {
-        [("Esc", .key(0x1B)), ("Tab", .key(0x09)), ("Caps", .key(0x14)),
-         ("Shift", .key(0x10)), ("Ctrl", .key(0x11)), ("Alt", .key(0x12)),
-         ("Space", .key(0x20)), ("Enter", .key(0x0D)), ("Bksp", .key(0x08)),
-         ("Win", .key(0x5B))]
-    }
-    private var navigation: [(String, ControlAction)] {
-        [("←", .key(0x25)), ("↑", .key(0x26)), ("→", .key(0x27)), ("↓", .key(0x28)),
-         ("Ins", .key(0x2D)), ("Del", .key(0x2E)), ("Home", .key(0x24)),
-         ("End", .key(0x23)), ("PgUp", .key(0x21)), ("PgDn", .key(0x22))]
-    }
-    private var symbols: [(String, ControlAction)] {
-        [("-", .key(0xBD)), ("=", .key(0xBB)), ("[", .key(0xDB)), ("]", .key(0xDD)),
-         ("\\", .key(0xDC)), (";", .key(0xBA)), ("'", .key(0xDE)), (",", .key(0xBC)),
-         (".", .key(0xBE)), ("/", .key(0xBF)), ("`", .key(0xC0))]
-    }
-
     private var keyboardTab: some View {
         VStack(alignment: .leading, spacing: 12) {
             section("Pointer, sticks & special", [
@@ -8132,182 +8008,24 @@ struct MappingPanel: View {
             section("Letters", letters)
             section("Numbers", digits)
             section("Function", fkeys)
-            section("Modifiers & editing", modifiers)
-            section("Navigation", navigation)
-            section("Symbols", symbols)
+            section("Modifiers & editing", [
+                ("Esc", .key(0x1B)), ("Tab", .key(0x09)), ("Caps", .key(0x14)),
+                ("Shift", .key(0x10)), ("Ctrl", .key(0x11)), ("Alt", .key(0x12)),
+                ("Space", .key(0x20)), ("Enter", .key(0x0D)), ("Bksp", .key(0x08)),
+                ("Win", .key(0x5B)),
+            ])
+            section("Navigation", [
+                ("←", .key(0x25)), ("↑", .key(0x26)), ("→", .key(0x27)), ("↓", .key(0x28)),
+                ("Ins", .key(0x2D)), ("Del", .key(0x2E)), ("Home", .key(0x24)),
+                ("End", .key(0x23)), ("PgUp", .key(0x21)), ("PgDn", .key(0x22)),
+            ])
+            section("Symbols", [
+                ("-", .key(0xBD)), ("=", .key(0xBB)), ("[", .key(0xDB)), ("]", .key(0xDD)),
+                ("\\", .key(0xDC)), (";", .key(0xBA)), ("'", .key(0xDE)), (",", .key(0xBC)),
+                (".", .key(0xBE)), ("/", .key(0xBF)), ("`", .key(0xC0)),
+            ])
             section("Numpad", numpad)
         }
-    }
-
-    // MARK: ml887 the physical controller's key binds
-
-    private static func padTitle(_ p: PadInput) -> String {
-        switch p {
-        case .ls:   return "Left stick"
-        case .rs:   return "Right stick"
-        case .dpad: return "D-pad"
-        default:    return p.rawValue
-        }
-    }
-
-    /// The D-pad's four buttons, in the direction chips' order.
-    private static let dpadElements: [GamepadElement] = [.dpadUp, .dpadRight, .dpadDown, .dpadLeft]
-    private static let dpadArrows = ["↑", "→", "↓", "←"]
-
-    private func bindHeader(_ p: PadInput) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "gamecontroller")
-                .font(.system(size: 14, weight: .semibold))
-            Text("\(Self.padTitle(p)) sends")
-                .font(.system(size: 13, weight: .semibold))
-                .lineLimit(1)
-            Spacer(minLength: 4)
-            Text(pad.bindSummary(p))
-                .font(.system(size: 13, weight: .bold, design: .rounded))
-                .foregroundStyle(SteamPalette.accent)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-        }
-        .foregroundStyle(Color.white)
-        .frame(maxWidth: .infinity, minHeight: 30)
-        .padding(.horizontal, 6)
-    }
-
-    private func bindTab(_ p: PadInput) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let side = p.stick {
-                // A stick drives a key cluster, the mouse, or nothing.
-                stickModes(side)
-            } else if p == .dpad {
-                // The D-pad: pick a direction, then its key.
-                HStack(spacing: 8) {
-                    ForEach(0..<4, id: \.self) { i in directionChip(i) }
-                }
-                buttonBinds(Self.dpadElements[dir])
-            } else if let el = p.gamepadElement {
-                buttonBinds(el)
-            }
-        }
-    }
-
-    /// Everything a button (or a D-pad direction) can send.
-    private func buttonBinds(_ el: GamepadElement) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            bindSection("Mouse & more", [("L click", .mouseLeft), ("R click", .mouseRight),
-                                         ("Keyboard", .keyboardToggle), ("None", .none)], el)
-            bindSection("Letters", letters, el)
-            bindSection("Numbers", digits, el)
-            bindSection("Function", fkeys, el)
-            bindSection("Modifiers & editing", modifiers, el)
-            bindSection("Navigation", navigation, el)
-            bindSection("Symbols", symbols, el)
-            bindSection("Numpad", numpad, el)
-        }
-    }
-
-    /// One D-pad direction, with the key it sends now.
-    private func directionChip(_ i: Int) -> some View {
-        let on = dir == i
-        let name = (pad.mapping.buttons[Self.dpadElements[i]] ?? ControlAction.none).bindName
-        return Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            dir = i
-        } label: {
-            VStack(spacing: 1) {
-                Text(Self.dpadArrows[i])
-                    .font(.system(size: 14, weight: .bold))
-                Text(name)
-                    .font(.system(size: 10, weight: .semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
-            }
-            .foregroundStyle(on ? Color.white : SteamPalette.chipText)
-            .frame(maxWidth: .infinity, minHeight: 40)
-            .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
-                .fill(on ? SteamPalette.accent : SteamPalette.surface))
-            .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
-                .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
-    }
-
-    /// What a stick drives: WASD, the arrow keys, mouse look or nothing
-    /// (GamepadMapping's StickMode, the same choices as Settings).
-    private func stickModes(_ side: PadInput.Side) -> some View {
-        let current = side == .left ? pad.mapping.leftStick : pad.mapping.rightStick
-        return VStack(alignment: .leading, spacing: 8) {
-            Text("The stick drives")
-                .font(.system(size: 11, weight: .semibold))
-                .tracking(0.6)
-                .textCase(.uppercase)
-                .foregroundStyle(SteamPalette.secondary)
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
-                      spacing: 8) {
-                ForEach(StickMode.allCases) { mode in
-                    stickModeChip(mode, on: current == mode, side: side)
-                }
-            }
-            Text("Mouse look speed, the deadzone and the trigger press point are in Settings › Physical controller.")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(SteamPalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private func stickModeChip(_ mode: StickMode, on: Bool, side: PadInput.Side) -> some View {
-        Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            if side == .left { pad.mapping.leftStick = mode } else { pad.mapping.rightStick = mode }
-        } label: {
-            Text(mode.label)
-                .font(.system(size: 12, weight: .semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .foregroundStyle(on ? Color.white : SteamPalette.chipText)
-                .frame(maxWidth: .infinity, minHeight: 34)
-                .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
-                    .fill(on ? SteamPalette.accent : SteamPalette.surface))
-                .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
-                    .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func bindSection(_ title: String, _ items: [(String, ControlAction)],
-                             _ el: GamepadElement) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .tracking(0.6)
-                .textCase(.uppercase)
-                .foregroundStyle(SteamPalette.secondary)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 48), spacing: 8)], spacing: 8) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, it in
-                    bindChip(it.0, it.1, el)
-                }
-            }
-        }
-    }
-
-    private func bindChip(_ label: String, _ action: ControlAction, _ el: GamepadElement) -> some View {
-        let on = (pad.mapping.buttons[el] ?? ControlAction.none) == action
-        return Button {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            pad.mapping.buttons[el] = action
-        } label: {
-            Text(label)
-                .font(.system(size: 12, weight: .semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.55)
-                .foregroundStyle(on ? Color.white : SteamPalette.chipText)
-                .padding(.horizontal, 4)
-                .frame(maxWidth: .infinity, minHeight: 32)
-                .background(RoundedRectangle(cornerRadius: SteamPalette.corner)
-                    .fill(on ? SteamPalette.accent : SteamPalette.surface))
-                .overlay(RoundedRectangle(cornerRadius: SteamPalette.corner)
-                    .stroke(on ? SteamPalette.accent : SteamPalette.border, lineWidth: 1))
-        }
-        .buttonStyle(.plain)
     }
 
     private var controllerTab: some View {
