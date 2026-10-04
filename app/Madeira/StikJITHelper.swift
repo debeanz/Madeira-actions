@@ -1,5 +1,13 @@
 import UIKit
 
+/// ml906: the startup JIT step is under way. StikDebug stops every thread of
+/// the app while it prepares the pool (~3.5 s), so ContentView covers the UI
+/// with a "Getting ready" screen instead of leaving it looking frozen.
+final class JITWarmup: ObservableObject {
+    static let shared = JITWarmup()
+    @Published var active = false
+}
+
 /// Helper to enable JIT via StikDebug/StikJIT URL scheme.
 /// Opens StikDebug with an embedded script, polls for CS_DEBUGGED,
 /// then allocates JIT memory and detaches the debugger.
@@ -119,13 +127,17 @@ enum StikJITHelper {
         if go { earlyInFlight = true }
         earlyLock.unlock()
         guard go else { return }
+        // ml906: the "Getting ready" screen goes up first (callers are on main).
+        if Thread.isMainThread { JITWarmup.shared.active = true }
+        else { DispatchQueue.main.async { JITWarmup.shared.active = true } }
         // The BRK freezes the whole process for ~3.5 s; let the frame being
-        // drawn now reach the screen first.
+        // drawn now (with that screen) reach the screen first.
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) {
             defer {
                 earlyLock.lock()
                 earlyInFlight = false
                 earlyLock.unlock()
+                DispatchQueue.main.async { JITWarmup.shared.active = false }
             }
             if poolReady { return }
             LogStore.shared.log("[jit-pool] ml872 StikDebug is attached — taking the JIT pool now, " +

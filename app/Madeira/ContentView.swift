@@ -240,6 +240,12 @@ final class MetalBackedView: UIView {
         liveTarget()?.setNeedsLayout()
     }
 
+    /// ml906: put the picture where the current scaling says. A scaling change
+    /// made while the surface was off screen (Settings) never laid it out.
+    static func refreshLayout() {
+        liveTarget()?.setNeedsLayout()
+    }
+
     /// Where the game picture goes in this view; touch mapping uses the same
     /// rect. ml896: Fit (every earlier build) shows all of it with bars, Fill
     /// covers the view and crops, Stretch fills it out of shape, Whole-number
@@ -1744,6 +1750,7 @@ struct ContentView: View {
     @ObservedObject private var gameDialogs = GameDialogs.shared   // ml879: dialog windows on screen
     @ObservedObject private var touchControls = TouchControlsModel.shared
     @ObservedObject private var gamepad = GamepadBridge.shared
+    @ObservedObject private var jitWarmup = JITWarmup.shared   // ml906
     @State private var pointerPanel = false
     @State private var selectedTab: MadeiraTab = .games
     @State private var desktopFullScreen = false
@@ -2001,12 +2008,25 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             StikJITHelper.allocateEarly()
         }
+        // ml906: over everything while the startup JIT step holds the app still.
+        .overlay {
+            if jitWarmup.active { JITWarmupView() }
+        }
         .onChange(of: selectedTab) { _, tab in
             // Both surfaces are window-level views above the whole SwiftUI
             // tree: the games' Metal host AND the desktop compositor. The
             // compositor used to stay visible on every tab.
             applySurfaceVisibility(tab: tab)
             syncGamepadUIMode()
+            // ml906: Madeira's Settings change Madeira's controls even while a game
+            // runs; the game's own (switch on) come back when Settings close.
+            if tab == .settings {
+                touchControls.beginEditingDefaults()
+                GamepadBridge.shared.beginEditingDefaults()
+            } else {
+                touchControls.endEditingDefaults()
+                GamepadBridge.shared.endEditingDefaults()
+            }
         }
         .onChange(of: desktopShutDown) { _, _ in
             applySurfaceVisibility(tab: selectedTab)
@@ -2020,6 +2040,8 @@ struct ContentView: View {
             // re-showed the window (log: two "[cursor] ml806 attach" lines after
             // the game had already ended).
             if !full { GameCursorHost.setHidden(true) }
+            // ml906: back in the game: the scaling may have changed in Settings
+            if full { DispatchQueue.main.async { MetalBackedView.refreshLayout() } }
             // ml806: leaving full screen MUST re-apply surface visibility. A
             // game session never changes selectedTab (it stays on .games, see
             // playGameHosted), so the .onChange(of: selectedTab) above never
@@ -2122,9 +2144,19 @@ struct ContentView: View {
         let hidden = tab != .desktop || desktopShutDown || showLaunchOverlay || gameSessionOnly
         MetalHostView.shared.isHidden = hidden
         winios_set_compositor_hidden(hidden ? 1 : 0)
+        if !hidden { MetalBackedView.refreshLayout() }   // ml906
         // ml806: the pointer is its own window, so it does NOT inherit the
         // host's hidden state — take it down with the game surface.
         if hidden { GameCursorHost.setHidden(true) }
+    }
+
+    /// ml906: a game is starting or running, or the desktop is on: Settings that
+    /// only take effect at launch are greyed out.
+    private var runtimeInUse: Bool {
+        switch launcherSession {
+        case .launching, .playing, .enablingJIT: return true
+        default: return desktopIsRunning
+        }
     }
 
     /// "Running" on the Start Desktop button: the runtime is up and the
@@ -3340,6 +3372,16 @@ struct ContentView: View {
                     }
                 }
 
+                // ml906: what the greyed-out rows below mean
+                if runtimeInUse {
+                    Section {
+                        Label("Greyed-out settings take effect at launch. Close the game or exit the desktop to change them.",
+                              systemImage: "info.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 // ml897: sections by what the settings control.
                 Section("Controls") {
                     // ml865: the same Off / Xbox / Keyboard switch as the game
@@ -3412,6 +3454,7 @@ struct ContentView: View {
                             Text(r).tag(r)
                         }
                     }
+                    .disabled(runtimeInUse)   // ml906: launch-only
                     Text("Screen size games see when launched from the Games tab (they default to it and can pick smaller modes), and the size of the Wine desktop. Bigger screens look sharper but cost GPU time and shrink the Explorer UI. Takes effect on the next launch. Games start at this size on their first launch; after that they keep their own setting.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -3434,12 +3477,19 @@ struct ContentView: View {
                         }
                     }
                     .onChange(of: frameCapSetting) { _, v in
-                        if let c = FrameCap(rawValue: Int32(v)) { FrameCap.apply(c, persist: true) }
+                        if let c = FrameCap(rawValue: Int32(v)) {
+                            FrameCap.apply(c, persist: true)
+                            // ml906: a running game with its own cap keeps it
+                            if let id = ScreenScaling.currentGameID {
+                                FrameCap.apply(GameLibrary.effectiveFrameCap(for: id), persist: false)
+                            }
+                        }
                     }
                     Text("A lower cap runs cooler: the game's frame loop waits on the display, so the CPU translation work per second falls with it. The cap never changes on its own.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Toggle("Skip x86 memory-ordering emulation", isOn: $fexNoTSO)
+                        .disabled(runtimeInUse)   // ml906: launch-only
                     Text("Experimental. Turns off FEX's TSO emulation for a large CPU saving in many games, but titles that rely on strict x86 memory ordering can glitch or crash. Applies on the next launch. Turning this on may improve performance in some games, so if one runs slowly, it is worth trying for just that game from its ⋯ menu.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -3453,6 +3503,7 @@ struct ContentView: View {
 
                 Section("Graphics") {
                     Toggle("Shader cache", isOn: $shaderCacheEnabled)
+                        .disabled(runtimeInUse)   // ml906: launch-only
                     Button(role: .destructive) {
                         shaderCacheSizeText = "…"
                         DispatchQueue.global(qos: .utility).async {
@@ -3463,7 +3514,7 @@ struct ContentView: View {
                     } label: {
                         LabeledContent("Clear all shader caches", value: shaderCacheSizeText)
                     }
-                    .disabled(!busyGameIDs.isEmpty)
+                    .disabled(!busyGameIDs.isEmpty || runtimeInUse)   // ml906: files in use
                     Text("Saves converted shaders so a game doesn't rebuild them every launch, which means fewer stutters the second time you visit an area. On for every game by default; each game keeps its own cache, and its ⋯ menu shows the size and can turn it off or clear it for that game. Applies the next time a game starts. Stored per Madeira build; an update starts fresh. Per-title DXMT overrides can be supplied through madeira-dxmt.txt in Files.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -3480,11 +3531,13 @@ struct ContentView: View {
                         Text("Stability").tag("Stability")
                         Text("Performance").tag("Performance")
                     }
+                    .disabled(runtimeInUse)   // ml906: launch-only
                     NavigationLink("Diagnostics") {
                         List {
                             Section {
                                 Toggle("Detailed runtime diagnostics", isOn: $input.diagnostics)
                                 Toggle("Verbose Wine trace (slow)", isOn: $wineVerbose)
+                                    .disabled(runtimeInUse)   // ml906: launch-only
                                 Text("Logs every file open, module load, exception dispatch and process event to madeira-log.txt. Use it to capture a crash, then turn it off. Applies on the next launch.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
@@ -6002,6 +6055,11 @@ final class TouchControlsModel: ObservableObject {
     /// that game's (save()), never as the defaults.
     func setGame(_ id: String?) {
         guard id != gameID else { return }
+        // ml906: a game that starts or ends while Settings edit Madeira's controls
+        if editingDefaults {
+            editingDefaults = false
+            defaults = snapshot()
+        }
         if gameID == nil { defaults = snapshot() }
         let base = defaults ?? snapshot()
         gameID = id
@@ -6020,6 +6078,29 @@ final class TouchControlsModel: ObservableObject {
 
     /// ml903: games with touch controls of their own (the switch's migration).
     var gamesWithOwnProfiles: Set<String> { Set(profiles.keys) }
+
+    /// ml906: Madeira's Settings are open while a game runs. Madeira's own
+    /// touch controls are on the model for Settings to show and change; every
+    /// change is Madeira's (saved as the defaults), never the game's.
+    private var editingDefaults = false
+
+    /// ml906: Settings opened while a game runs (ContentView, tab change).
+    func beginEditingDefaults() {
+        guard gameID != nil, !editingDefaults else { return }
+        let d = defaults ?? snapshot()
+        editingDefaults = true
+        if d != snapshot() { apply(d) }
+    }
+
+    /// ml906: Settings closed: what they left is Madeira's, and the running
+    /// game's own controls come back if its switch is on.
+    func endEditingDefaults() {
+        guard editingDefaults else { return }
+        editingDefaults = false
+        defaults = snapshot()
+        persist()
+        refreshGame()
+    }
 
     /// ml903: the running game's switch changed: its own controls (on) or the
     /// defaults (off) go on screen.
@@ -6213,7 +6294,7 @@ final class TouchControlsModel: ObservableObject {
         // ml886: while a game runs, a change is that game's; the defaults are
         // written as they were when it started. ml887: only the parts that
         // differ from the defaults (or were already its own) become its own.
-        if let id = gameID {
+        if let id = gameID, !editingDefaults {   // ml906: Settings' changes are Madeira's
             let live = snapshot(), base = defaults ?? live
             if GameLibrary.usesOwnSettings(id) {
                 var own = profiles[id] ?? GameControlsProfile()
@@ -6235,7 +6316,7 @@ final class TouchControlsModel: ObservableObject {
     /// not, or it would give the running game a profile it never asked for).
     private func persist() {
         guard !loading else { return }
-        let base = gameID == nil ? snapshot() : (defaults ?? snapshot())
+        let base = (gameID == nil || editingDefaults) ? snapshot() : (defaults ?? snapshot())   // ml906
         let s = Saved(controls: base.custom ?? [], visible: base.visible ?? false, mode: base.mode,
                       padControls: legacyPad, games: profiles.isEmpty ? nil : profiles,
                       opacity: opacity < 1 ? opacity : nil)
@@ -7595,6 +7676,41 @@ enum TouchControlsHost {
         guard let w = window, w.frame != bounds else { return }
         w.frame = bounds
         fputs("[controls] ml826 overlay reframed to \(bounds)\n", stderr)
+    }
+}
+
+/// ml906: covers the app while the startup JIT step holds it still (StikDebug
+/// stops every thread for ~3.5 s). The spinner is UIKit's activity indicator,
+/// a Core Animation animation that keeps turning while the app is stopped.
+struct JITWarmupView: View {
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.9).ignoresSafeArea()
+            VStack(spacing: 14) {
+                SpinnerView()
+                    .frame(width: 44, height: 44)
+                Text("Getting ready")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Text("Setting up JIT with StikDebug. This takes a few seconds.")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+            }
+            .padding(24)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {}   // nothing behind it reacts meanwhile
+    }
+
+    private struct SpinnerView: UIViewRepresentable {
+        func makeUIView(context: Context) -> UIActivityIndicatorView {
+            let v = UIActivityIndicatorView(style: .large)
+            v.color = .white
+            v.startAnimating()
+            return v
+        }
+        func updateUIView(_ v: UIActivityIndicatorView, context: Context) {}
     }
 }
 

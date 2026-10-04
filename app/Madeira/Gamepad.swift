@@ -345,8 +345,9 @@ final class GamepadBridge: ObservableObject {
         guard !loading else { return }
         // ml887: while a game runs, a change is that game's — only the parts
         // that differ from the defaults (or were already its own). "Use
-        // controller" stays global and never creates one.
-        if let id = gameID {
+        // controller" stays global and never creates one. ml906: not while
+        // Madeira's Settings are open: those changes are Madeira's.
+        if let id = gameID, !editingDefaults {
             if GameLibrary.usesOwnSettings(id) {
                 var own = profiles[id] ?? PadProfile()
                 if own.native != nil || native != defaultNative { own.native = native }
@@ -363,8 +364,9 @@ final class GamepadBridge: ObservableObject {
 
     private func persist() {
         guard !loading else { return }
-        let n = gameID == nil ? native : defaultNative
-        let m = gameID == nil ? mapping : defaultMapping
+        let live: Bool = gameID == nil || editingDefaults   // ml906
+        let n = live ? native : defaultNative
+        let m = live ? mapping : defaultMapping
         let s = Saved(enabled: enabled, native: n, mapping: m, games: profiles.isEmpty ? nil : profiles)
         guard let d = try? JSONEncoder().encode(s) else { return }
         try? d.write(to: Self.url, options: .atomic)
@@ -376,6 +378,12 @@ final class GamepadBridge: ObservableObject {
     /// over the defaults; changes from then on are saved as that game's.
     func setGame(_ id: String?) {
         guard id != gameID else { return }
+        // ml906: a game that starts or ends while Settings edit Madeira's values
+        if editingDefaults {
+            editingDefaults = false
+            defaultNative = native
+            defaultMapping = mapping
+        }
         if gameID == nil {
             defaultNative = native
             defaultMapping = mapping
@@ -401,6 +409,32 @@ final class GamepadBridge: ObservableObject {
 
     /// ml903: games with controller settings of their own (the switch's migration).
     var gamesWithOwnProfiles: Set<String> { Set(profiles.keys) }
+
+    /// ml906: Madeira's Settings are open while a game runs. Madeira's own
+    /// controller settings are live for Settings to show and change; every
+    /// change is Madeira's (saved as the defaults), never the game's.
+    private var editingDefaults = false
+
+    /// ml906: Settings opened while a game runs (ContentView, tab change).
+    func beginEditingDefaults() {
+        guard gameID != nil, !editingDefaults else { return }
+        editingDefaults = true
+        loading = true
+        if defaultNative != native { native = defaultNative }
+        if defaultMapping != mapping { mapping = defaultMapping }
+        loading = false
+    }
+
+    /// ml906: Settings closed: what they left is Madeira's, and the running
+    /// game's own settings come back if its switch is on.
+    func endEditingDefaults() {
+        guard editingDefaults else { return }
+        editingDefaults = false
+        defaultNative = native
+        defaultMapping = mapping
+        persist()
+        refreshGame()
+    }
 
     /// ml903: the running game's switch changed: its own settings (on) or the
     /// defaults (off) go live.
