@@ -1843,7 +1843,6 @@ struct ContentView: View {
     @State private var freeSpaceText = "Calculating…"   // ml893: System status
     /// ml896: Settings › Screen defaults (a game's ⋯ menu can override them).
     @AppStorage(ScreenScaling.key) private var screenScalingSetting: String = ScreenScaling.fit.rawValue
-    @AppStorage("madeira.libraryCompatibilityMode") private var compatibilityMode = "Stability"
     @AppStorage("madeira.steamMinimalLayout") private var steamMinimalLayout = true
     @AppStorage(perfOverlayEnabledKey) private var perfOverlayEnabled = true
     /// Present pacing default (FrameCap raw value).
@@ -3527,11 +3526,6 @@ struct ContentView: View {
                 }
 
                 Section("Emulation") {
-                    Picker("Default profile", selection: $compatibilityMode) {
-                        Text("Stability").tag("Stability")
-                        Text("Performance").tag("Performance")
-                    }
-                    .disabled(runtimeInUse)   // ml906: launch-only
                     NavigationLink("Diagnostics") {
                         List {
                             Section {
@@ -3909,15 +3903,11 @@ struct ContentView: View {
         }
     }
 
+    /// ml907: the Stability / Performance "Default profile" is gone. It never
+    /// changed a launch: Performance only unset FEX_O0, which
+    /// runWineFullSequence unsets for every launch anyway.
     private func prepareDirectLaunch(_ title: String) {
         selectedTab = .desktop
-        logStore.log("\(title): \(compatibilityMode) launch profile selected")
-        if compatibilityMode == "Performance" {
-            // The production path's tested FEX defaults remain the performance
-            // profile. Stability is intentionally metadata-only until a
-            // conservative flag set has been validated on real titles.
-            unsetenv("FEX_O0")
-        }
     }
 
     /// Documents/madeira-log.txt, written by wine_log_set_file in
