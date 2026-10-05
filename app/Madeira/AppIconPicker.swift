@@ -10,7 +10,10 @@ import UIKit
 // ml925: the halo designs on black in twelve liquid-glass gradients
 // (AppIcon-g-<design>-<glass>[-big]). ml927: and on the Apple Watch app icon's
 // background, its grey ramp and an edge lit from the top-left
-// (AppIcon-gw-...), with a Black / Graphite choice.
+// (AppIcon-gw-...), with a Black / Graphite choice. ml928: the same designs
+// and gradients remade in Liquid Composer, a web version of Apple's Icon
+// Composer (AppIcon-r-... on black, AppIcon-rw-... on graphite), in their own
+// "iOS remake" section that follows the design and background picked above.
 
 enum AppIconColour: String, CaseIterable, Identifiable {
     case dark, light, games
@@ -37,6 +40,14 @@ enum AppIconBackground: String, CaseIterable, Identifiable {
         switch self {
         case .black: return "Black"
         case .graphite: return "Graphite"
+        }
+    }
+
+    /// ml928: the Liquid Composer remakes' asset names start with this.
+    var remakePrefix: String {
+        switch self {
+        case .black: return "r"
+        case .graphite: return "rw"
         }
     }
 }
@@ -93,8 +104,9 @@ enum AppIconCatalog {
         return key + "-" + colour.rawValue + (big ? "-big" : "")
     }
 
-    static func glassTag(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground) -> String {
-        return background.rawValue + "-" + design + "-" + glass + (big ? "-big" : "")
+    static func glassTag(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground, remake: Bool = false) -> String {
+        let prefix: String = remake ? background.remakePrefix : background.rawValue
+        return prefix + "-" + design + "-" + glass + (big ? "-big" : "")
     }
 
     /// nil is the primary icon: the plain pointer, black, normal size.
@@ -107,12 +119,12 @@ enum AppIconCatalog {
         return "IconPreview-" + tag(key, colour, big)
     }
 
-    static func glassIconName(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground) -> String {
-        return "AppIcon-" + glassTag(design, glass, big, background)
+    static func glassIconName(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground, remake: Bool = false) -> String {
+        return "AppIcon-" + glassTag(design, glass, big, background, remake: remake)
     }
 
-    static func glassPreviewName(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground) -> String {
-        return "IconPreview-" + glassTag(design, glass, big, background)
+    static func glassPreviewName(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground, remake: Bool = false) -> String {
+        return "IconPreview-" + glassTag(design, glass, big, background, remake: remake)
     }
 
     static func title(of key: String, in list: [AppIconDesign]) -> String {
@@ -127,6 +139,7 @@ enum AppIconCatalog {
         var glassDesign = "splithalo"
         var glass = ""                  // set when a glass icon is in use
         var background: AppIconBackground = .graphite
+        var remake = false              // a Liquid Composer remake is in use
     }
 
     static func current() -> Current {
@@ -137,15 +150,20 @@ enum AppIconCatalog {
             c.big = true
             rest = String(rest.dropLast(4))
         }
-        for background in AppIconBackground.allCases where rest.hasPrefix(background.rawValue + "-") {
-            let parts = rest.dropFirst(background.rawValue.count + 1).split(separator: "-")
-            if parts.count == 2 {
-                c.design = ""
-                c.glassDesign = String(parts[0])
-                c.glass = String(parts[1])
-                c.background = background
+        for background in AppIconBackground.allCases {
+            for remake in [false, true] {
+                let prefix: String = (remake ? background.remakePrefix : background.rawValue) + "-"
+                if !rest.hasPrefix(prefix) { continue }
+                let parts = rest.dropFirst(prefix.count).split(separator: "-")
+                if parts.count == 2 {
+                    c.design = ""
+                    c.glassDesign = String(parts[0])
+                    c.glass = String(parts[1])
+                    c.background = background
+                    c.remake = remake
+                }
+                return c
             }
-            return c
         }
         for colour in AppIconColour.allCases where rest.hasSuffix("-" + colour.rawValue) {
             c.design = String(rest.dropLast(colour.rawValue.count + 1))
@@ -159,7 +177,9 @@ enum AppIconCatalog {
         let size = c.big ? " · Bigger" : ""
         if !c.glass.isEmpty {
             let design = c.glassDesign == "halo" ? "Halo" : title(of: c.glassDesign, in: glassDesigns) + " + Halo"
-            return design + " · " + title(of: c.glass, in: glasses) + " · " + c.background.title + size
+            let remake: String = c.remake ? " · iOS remake" : ""
+            let head: String = design + " · " + title(of: c.glass, in: glasses)
+            return head + " · " + c.background.title + remake + size
         }
         return title(of: c.design, in: designs) + " · " + c.colour.title + size
     }
@@ -243,6 +263,18 @@ struct AppIconPickerView: View {
                     }
                 }
 
+                Text("iOS remake")
+                    .font(.headline)
+                    .padding(.top, 10)
+                Text("The same designs and gradients rebuilt in Liquid Composer, a web version of Apple's Icon Composer, with the ring and the pointer as glass layers. Uses the design and background picked above.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LazyVGrid(columns: columns, spacing: 18) {
+                    ForEach(AppIconCatalog.glasses) { g in
+                        remakeTile(g)
+                    }
+                }
+
                 if let e = errorText {
                     Text(e)
                         .font(.caption)
@@ -274,6 +306,11 @@ struct AppIconPickerView: View {
     private func glassTile(_ g: AppIconDesign) -> some View {
         let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, big, glassBackground)
         return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, big, glassBackground), name: name)
+    }
+
+    private func remakeTile(_ g: AppIconDesign) -> some View {
+        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, big, glassBackground, remake: true)
+        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, big, glassBackground, remake: true), name: name)
     }
 
     private func tile(title: String, image: String, name: String?) -> some View {
