@@ -7,6 +7,8 @@ import UIKit
 // in black, white and navy, with the normal and the bigger pointer; the plain
 // black pointer is the primary icon. IconPreviews holds a small square of each
 // for this screen, since an app icon set can't be loaded as an image.
+// ml925: the halo designs on black in twelve liquid-glass gradients
+// (AppIcon-g-<design>-<glass>[-big]).
 
 enum AppIconColour: String, CaseIterable, Identifiable {
     case dark, light, games
@@ -47,8 +49,35 @@ enum AppIconCatalog {
         AppIconDesign(key: "ripple", title: "Ripple"),
     ]
 
+    /// ml925: each has the halo ring; "halo" is the ring on its own.
+    static let glassDesigns: [AppIconDesign] = [
+        AppIconDesign(key: "splithalo", title: "Split"),
+        AppIconDesign(key: "slothalo", title: "Slot"),
+        AppIconDesign(key: "halo", title: "Halo"),
+        AppIconDesign(key: "swallowhalo", title: "Swallowtail"),
+    ]
+
+    static let glasses: [AppIconDesign] = [
+        AppIconDesign(key: "classic", title: "Classic"),
+        AppIconDesign(key: "frost", title: "Frost"),
+        AppIconDesign(key: "pearl", title: "Pearl"),
+        AppIconDesign(key: "ice", title: "Ice"),
+        AppIconDesign(key: "silver", title: "Silver"),
+        AppIconDesign(key: "diagonal", title: "Diagonal"),
+        AppIconDesign(key: "glow", title: "Glow"),
+        AppIconDesign(key: "aurora", title: "Aurora"),
+        AppIconDesign(key: "smoke", title: "Smoke"),
+        AppIconDesign(key: "clear", title: "Clear"),
+        AppIconDesign(key: "champagne", title: "Champagne"),
+        AppIconDesign(key: "liquid", title: "Liquid"),
+    ]
+
     static func tag(_ key: String, _ colour: AppIconColour, _ big: Bool) -> String {
         return key + "-" + colour.rawValue + (big ? "-big" : "")
+    }
+
+    static func glassTag(_ design: String, _ glass: String, _ big: Bool) -> String {
+        return "g-" + design + "-" + glass + (big ? "-big" : "")
     }
 
     /// nil is the primary icon: the plain pointer, black, normal size.
@@ -61,26 +90,59 @@ enum AppIconCatalog {
         return "IconPreview-" + tag(key, colour, big)
     }
 
-    /// The design, colour and size of the icon on the Home Screen now.
-    static func current() -> (design: AppIconDesign, colour: AppIconColour, big: Bool) {
-        let fallback: (design: AppIconDesign, colour: AppIconColour, big: Bool) = (designs[0], .dark, false)
-        guard let name = UIApplication.shared.alternateIconName, name.hasPrefix("AppIcon-") else { return fallback }
-        var rest = String(name.dropFirst("AppIcon-".count))
+    static func glassIconName(_ design: String, _ glass: String, _ big: Bool) -> String {
+        return "AppIcon-" + glassTag(design, glass, big)
+    }
+
+    static func glassPreviewName(_ design: String, _ glass: String, _ big: Bool) -> String {
+        return "IconPreview-" + glassTag(design, glass, big)
+    }
+
+    static func title(of key: String, in list: [AppIconDesign]) -> String {
+        return list.first(where: { $0.key == key })?.title ?? key
+    }
+
+    /// What the icon on the Home Screen is now, for the picker to start on.
+    struct Current {
         var big = false
+        var colour: AppIconColour = .dark
+        var design = "normal"           // a favourite, or ""
+        var glassDesign = "splithalo"
+        var glass = ""                  // set when a glass icon is in use
+    }
+
+    static func current() -> Current {
+        var c = Current()
+        guard let name = UIApplication.shared.alternateIconName, name.hasPrefix("AppIcon-") else { return c }
+        var rest = String(name.dropFirst("AppIcon-".count))
         if rest.hasSuffix("-big") {
-            big = true
+            c.big = true
             rest = String(rest.dropLast(4))
         }
-        for c in AppIconColour.allCases where rest.hasSuffix("-" + c.rawValue) {
-            let key = String(rest.dropLast(c.rawValue.count + 1))
-            if let d = designs.first(where: { $0.key == key }) { return (d, c, big) }
+        if rest.hasPrefix("g-") {
+            let parts = rest.dropFirst(2).split(separator: "-")
+            if parts.count == 2 {
+                c.design = ""
+                c.glassDesign = String(parts[0])
+                c.glass = String(parts[1])
+            }
+            return c
         }
-        return fallback
+        for colour in AppIconColour.allCases where rest.hasSuffix("-" + colour.rawValue) {
+            c.design = String(rest.dropLast(colour.rawValue.count + 1))
+            c.colour = colour
+        }
+        return c
     }
 
     static func currentSummary() -> String {
         let c = current()
-        return c.design.title + " · " + c.colour.title + (c.big ? " · Bigger" : "")
+        let size = c.big ? " · Bigger" : ""
+        if !c.glass.isEmpty {
+            let design = c.glassDesign == "halo" ? "Halo" : title(of: c.glassDesign, in: glassDesigns) + " + Halo"
+            return design + " · " + title(of: c.glass, in: glasses) + size
+        }
+        return title(of: c.design, in: designs) + " · " + c.colour.title + size
     }
 }
 
@@ -107,6 +169,7 @@ struct AppIconSettingsRow: View {
 struct AppIconPickerView: View {
     @State private var colour: AppIconColour = .dark
     @State private var big = false
+    @State private var glassDesign = "splithalo"
     @State private var currentName: String? = UIApplication.shared.alternateIconName
     @State private var errorText: String?
 
@@ -115,23 +178,45 @@ struct AppIconPickerView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                Picker("Pointer size", selection: $big) {
+                    Text("Normal pointer").tag(false)
+                    Text("Bigger pointer").tag(true)
+                }
+                .pickerStyle(.segmented)
+
+                Text("Favourites")
+                    .font(.headline)
+                    .padding(.top, 6)
                 Picker("Colour", selection: $colour) {
                     ForEach(AppIconColour.allCases) { c in
                         Text(c.title).tag(c)
                     }
                 }
                 .pickerStyle(.segmented)
-                Picker("Pointer size", selection: $big) {
-                    Text("Normal pointer").tag(false)
-                    Text("Bigger pointer").tag(true)
-                }
-                .pickerStyle(.segmented)
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(AppIconCatalog.designs) { d in
-                        tile(d)
+                        favouriteTile(d)
                     }
                 }
-                .padding(.top, 4)
+
+                Text("Liquid glass")
+                    .font(.headline)
+                    .padding(.top, 10)
+                Picker("Design", selection: $glassDesign) {
+                    ForEach(AppIconCatalog.glassDesigns) { d in
+                        Text(d.title).tag(d.key)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text("On black, each with the halo ring. Halo is the ring on its own.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LazyVGrid(columns: columns, spacing: 18) {
+                    ForEach(AppIconCatalog.glasses) { g in
+                        glassTile(g)
+                    }
+                }
+
                 if let e = errorText {
                     Text(e)
                         .font(.caption)
@@ -149,18 +234,28 @@ struct AppIconPickerView: View {
             let c = AppIconCatalog.current()
             colour = c.colour
             big = c.big
+            glassDesign = c.glassDesign
             currentName = UIApplication.shared.alternateIconName
         }
     }
 
-    private func tile(_ d: AppIconDesign) -> some View {
+    private func favouriteTile(_ d: AppIconDesign) -> some View {
         let name: String? = AppIconCatalog.iconName(d.key, colour, big)
+        return tile(title: d.title, image: AppIconCatalog.previewName(d.key, colour, big), name: name)
+    }
+
+    private func glassTile(_ g: AppIconDesign) -> some View {
+        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, big)
+        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, big), name: name)
+    }
+
+    private func tile(title: String, image: String, name: String?) -> some View {
         let selected: Bool = name == currentName
         return Button {
             apply(name)
         } label: {
             VStack(spacing: 6) {
-                Image(AppIconCatalog.previewName(d.key, colour, big))
+                Image(image)
                     .resizable()
                     .interpolation(.high)
                     .frame(width: 66, height: 66)
@@ -170,7 +265,7 @@ struct AppIconPickerView: View {
                         RoundedRectangle(cornerRadius: 18, style: .continuous)
                             .stroke(selected ? Color.accentColor : Color.clear, lineWidth: 2.5)
                     )
-                Text(d.title)
+                Text(title)
                     .font(.caption)
                     .foregroundStyle(selected ? Color.primary : Color.secondary)
                     .lineLimit(1)
@@ -178,7 +273,7 @@ struct AppIconPickerView: View {
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(d.title + (selected ? ", in use" : ""))
+        .accessibilityLabel(title + (selected ? ", in use" : ""))
     }
 
     private func apply(_ name: String?) {
