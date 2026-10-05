@@ -251,7 +251,7 @@
       stage.addEventListener("pointermove", function (e) {
         var r = stage.getBoundingClientRect();
         var x = (e.clientX - r.left) / r.width - 0.5, y = (e.clientY - r.top) / r.height - 0.5;
-        dev.style.setProperty("--ty", (x * 12 - 6).toFixed(2) + "deg");
+        dev.style.setProperty("--ty", (x * 12).toFixed(2) + "deg");   // Midnight: centred, so no resting turn
         dev.style.setProperty("--tx", (-y * 9 + 3).toFixed(2) + "deg");
       });
       stage.addEventListener("pointerleave", function () {
