@@ -1012,7 +1012,31 @@ static void handle_request( void )
  * window in the session but ours. SendMessageTimeout, because WM_DEVICECHANGE
  * carries a pointer that Wine copies into the receiving process only for a sent
  * message; ABORTIFHUNG and a short timeout, so one stuck thread cannot stall the
- * poll loop. SDL answers with a re-scan 300 ms and 2 s later. */
+ * poll loop. SDL answers with a re-scan 300 ms and 2 s later.
+ *
+ * ml921: and DBT_DEVNODES_CHANGED to every top-level window, as Windows
+ * broadcasts on any plug or unplug. Unreal Engine 4 stops polling an empty
+ * XInput slot after its first look and checks again only on a WM_DEVICECHANGE
+ * to its game window (FXInputInterface's bNeedsControllerStateUpdate): Little
+ * Nightmares polled before the touch pad came on and never saw it. No pointer
+ * in lParam, so a posted message is enough and never stalls the loop. */
+struct devchange_ctx
+{
+    DWORD self;
+    int posted;
+};
+
+static BOOL CALLBACK devchange_top_window( HWND hwnd, LPARAM param )
+{
+    struct devchange_ctx *ctx = (struct devchange_ctx *)param;
+    DWORD pid = 0;
+
+    GetWindowThreadProcessId( hwnd, &pid );
+    if (pid != ctx->self && PostMessageW( hwnd, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0 ))
+        ctx->posted++;
+    return TRUE;
+}
+
 static void handle_devchange( void )
 {
     static const GUID hid_interface =
@@ -1052,8 +1076,15 @@ static void handle_devchange( void )
         else
             silent++;
     }
-    agent_log( "devchange %s: WM_DEVICECHANGE to %d message-only window(s), %d did not answer",
-               arrival ? "arrival" : "removal", sent, silent );
+    {
+        struct devchange_ctx ctx;
+        ctx.self = GetCurrentProcessId();
+        ctx.posted = 0;
+        EnumWindows( devchange_top_window, (LPARAM)&ctx );
+        agent_log( "devchange %s: WM_DEVICECHANGE to %d message-only window(s), %d did not answer; "
+                   "DBT_DEVNODES_CHANGED to %d top-level window(s)",
+                   arrival ? "arrival" : "removal", sent, silent, ctx.posted );
+    }
 }
 
 /* ml876: A GAME'S MESSAGE BOX, SHOWN BY THE APP AS AN ALERT.
