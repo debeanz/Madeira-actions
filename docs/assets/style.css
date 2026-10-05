@@ -777,3 +777,159 @@ body { background: #000; font-size: 16px; }
 .toggle { font-weight: 500; }
 .select { background-color: #0a0a0a; font-weight: 500; border-radius: 8px; }
 .report { background: #0a0a0a; border-radius: 14px; }
+
+/* ── Feature scenes (2026-10-05) ───────────────────────────────────────────
+   Each card shows a piece of the app as the app draws it -- the Games grid,
+   the ⋯ menu's settings rows (SheetRow), the Xbox touch layout, the Controls
+   page, the opened game's card, the in-game toolbar and its menu -- at small
+   size with real Steam artwork, instead of drawn stand-ins. */
+.mini.app { background: linear-gradient(180deg, #0e1117, #06080c); }
+.fx {
+  position: relative; width: 280px; height: 124px; color: #fff; text-align: left;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+}
+.fx img { display: block; }
+
+/* Games grid */
+.fx-top { position: absolute; left: 0; right: 0; top: 0; height: 18px; display: flex; align-items: center; gap: 4px; }
+.fx-top b { margin-right: auto; font-size: 13px; font-weight: 700; }
+.fx-top i { width: 21px; height: 17px; border-radius: 9px; background: #171c26; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08); }
+.fx-grid { position: absolute; left: 0; right: 0; top: 26px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.fx-grid figure { position: relative; margin: 0; min-width: 0; }
+.fx-grid img {
+  width: 100%; aspect-ratio: 2.14; object-fit: cover; border-radius: 5px; background: #171c26;
+  outline: 2px solid transparent; outline-offset: 1px; animation: fx-walk 7.2s infinite;
+}
+.fx-grid figure:nth-child(2) img { animation-delay: 0.9s; }
+.fx-grid figure:nth-child(3) img { animation-delay: 1.8s; }
+.fx-grid figure:nth-child(4) img { animation-delay: 2.7s; }
+.fx-grid figure:nth-child(5) img { animation-delay: 3.6s; }
+.fx-grid figure:nth-child(6) img { animation-delay: 4.5s; }
+.fx-grid figure:nth-child(7) img { animation-delay: 5.4s; }
+.fx-grid figure:nth-child(8) img { animation-delay: 6.3s; }
+@keyframes fx-walk {
+  0%, 12.5%, 100% { outline-color: transparent; transform: none; box-shadow: none; }
+  1.5%, 11% { outline-color: #1a9fff; transform: scale(1.06); box-shadow: 0 0 10px rgba(26, 159, 255, 0.5); }
+}
+.fx-grid figcaption { margin-top: 3px; font-size: 8.5px; font-weight: 600; color: rgba(255, 255, 255, 0.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fx-star {
+  position: absolute; left: 3px; top: 3px; width: 11px; height: 11px; border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55); color: #ffd60a; font-size: 7px; line-height: 11px; text-align: center;
+}
+
+/* ⋯ menu rows (SheetRow), shared by the settings and controller scenes */
+.fx-row {
+  position: absolute; left: 0; right: 0; height: 27px; display: flex; align-items: center; gap: 8px; padding: 0 9px;
+  border-radius: 8px; background: #171c26; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  font-size: 10.5px; font-weight: 500;
+}
+.fx-row svg { width: 12px; height: 12px; color: #1a9fff; flex: none; }
+.fx-row em { position: relative; margin-left: auto; font-style: normal; font-size: 10px; color: rgba(255, 255, 255, 0.62); font-variant-numeric: tabular-nums; }
+.fx-row.tall { height: 36px; }
+.fx-row.tall span { display: grid; gap: 1px; }
+.fx-row small { font-size: 7.5px; font-weight: 400; color: rgba(255, 255, 255, 0.62); }
+.fx-hdr { position: absolute; left: 4px; font-size: 7.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: rgba(255, 255, 255, 0.62); }
+.fx-sw { margin-left: auto; position: relative; width: 24px; height: 14px; border-radius: 7px; background: rgba(255, 255, 255, 0.18); animation: fx-sw 8s infinite; }
+.fx-sw::after { content: ""; position: absolute; left: 1.5px; top: 1.5px; width: 11px; height: 11px; border-radius: 50%; background: #fff; animation: fx-knob 8s infinite; }
+@keyframes fx-sw { 0%, 15%, 94%, 100% { background: rgba(255, 255, 255, 0.18); } 18%, 91% { background: #34c759; } }
+@keyframes fx-knob { 0%, 15%, 94%, 100% { transform: none; } 18%, 91% { transform: translateX(10px); } }
+.fx-own { animation: fx-own 8s infinite; }
+.fx-focus { animation: fx-own 8s infinite, fx-ring 8s infinite; }
+@keyframes fx-own { 0%, 15%, 94%, 100% { opacity: 0.45; } 18%, 91% { opacity: 1; } }
+@keyframes fx-ring { 0%, 34%, 70%, 100% { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06); } 37%, 67% { box-shadow: inset 0 0 0 1.5px #1a9fff; background: #1f2633; } }
+.fx-v1 { animation: fx-v1 8s infinite; }
+.fx-v2 { position: absolute; right: 0; top: 0; opacity: 0; animation: fx-v2 8s infinite; }
+@keyframes fx-v1 { 0%, 44%, 94%, 100% { opacity: 1; } 46%, 92% { opacity: 0; } }
+@keyframes fx-v2 { 0%, 44%, 94%, 100% { opacity: 0; } 46%, 92% { opacity: 1; } }
+
+/* Controls page: the pad's highlight moves down, A moves the checkmark */
+.fx-ck { margin-left: auto; width: 11px !important; height: 11px !important; color: #1a9fff; }
+.fx-r1 { animation: fx-r1 8s infinite; }
+.fx-r2 { animation: fx-r2 8s infinite; }
+@keyframes fx-r1 { 0%, 44%, 92%, 100% { box-shadow: inset 0 0 0 1.5px #1a9fff; background: #1f2633; } 46%, 90% { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06); background: #171c26; } }
+@keyframes fx-r2 { 0%, 44%, 92%, 100% { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06); background: #171c26; } 46%, 90% { box-shadow: inset 0 0 0 1.5px #1a9fff; background: #1f2633; } }
+.fx-c1 { animation: fx-c1 8s infinite; }
+.fx-c2 { opacity: 0; animation: fx-c2 8s infinite; }
+@keyframes fx-c1 { 0%, 58%, 98%, 100% { opacity: 1; } 60%, 96% { opacity: 0; } }
+@keyframes fx-c2 { 0%, 58%, 98%, 100% { opacity: 0; } 60%, 96% { opacity: 1; } }
+.fx-hint { position: absolute; left: 0; right: 0; text-align: center; font-size: 8.5px; color: rgba(255, 255, 255, 0.62); }
+.fx-hint i {
+  display: inline-grid; place-items: center; width: 11px; height: 11px; margin: 0 2px 0 8px; border-radius: 50%;
+  background: rgba(255, 255, 255, 0.62); color: #0e1117; font: 700 7px/1 inherit;
+}
+
+/* Touch controls over a game: Xbox layout, stick moving, A pressed, trackpad drag */
+.fx-game { position: absolute; inset: 0; border-radius: 8px; overflow: hidden; background: #0e1117; }
+.fx-game img { width: 100%; height: 100%; object-fit: cover; filter: brightness(0.5) saturate(1.1); }
+.fx-stick { position: absolute; left: 12px; bottom: 9px; width: 46px; height: 46px; border-radius: 50%; background: rgba(10, 10, 10, 0.42); box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.4); }
+.fx-stick::after { content: ""; position: absolute; left: 15px; top: 15px; width: 16px; height: 16px; border-radius: 50%; background: rgba(255, 255, 255, 0.85); animation: fx-nub 3.6s var(--out) infinite; }
+@keyframes fx-nub { 0%, 100% { transform: none; } 25% { transform: translate(9px, -4px); } 50% { transform: translate(-3px, -9px); } 75% { transform: translate(-9px, 3px); } }
+.fx-btn {
+  position: absolute; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
+  background: rgba(10, 10, 10, 0.42); box-shadow: inset 0 0 0 1.5px var(--rim); font-size: 9px; font-weight: 700;
+}
+.fx-btn.a { --rim: #34c759; right: 30px; bottom: 7px; animation: fx-press 3.6s 1.2s infinite; }
+.fx-btn.b { --rim: #ff453a; right: 8px; bottom: 29px; }
+.fx-btn.x { --rim: #0a84ff; right: 52px; bottom: 29px; }
+.fx-btn.y { --rim: #ffd60a; right: 30px; bottom: 51px; }
+@keyframes fx-press {
+  0%, 14%, 100% { transform: none; background: rgba(10, 10, 10, 0.42); }
+  5% { transform: scale(0.86); background: rgba(52, 199, 89, 0.6); box-shadow: inset 0 0 0 1.5px var(--rim), 0 0 10px rgba(52, 199, 89, 0.6); }
+}
+.fx-bump {
+  position: absolute; top: 8px; width: 32px; height: 14px; border-radius: 7px; text-align: center;
+  background: rgba(10, 10, 10, 0.42); box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.4); font-size: 7.5px; font-weight: 700; line-height: 14px;
+}
+.fx-bump.l { left: 12px; }
+.fx-bump.r { right: 12px; }
+.fx-touchpt { position: absolute; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px; border-radius: 50%; background: rgba(255, 255, 255, 0.28); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.5); opacity: 0; animation: fx-drag 3.6s infinite; }
+@keyframes fx-drag {
+  0%, 20% { opacity: 0; transform: translate(-22px, 6px) scale(0.6); }
+  28% { opacity: 1; transform: translate(-22px, 6px) scale(1); }
+  62% { opacity: 1; transform: translate(18px, -10px) scale(1); }
+  70%, 100% { opacity: 0; transform: translate(18px, -10px) scale(0.6); }
+}
+
+/* The opened game's card: Play pressed, it becomes Resume */
+.fx-32 { height: 128px; }
+.fx-card {
+  position: absolute; left: 50%; top: 0; width: 138px; margin-left: -69px; padding: 6px; display: grid; gap: 4px;
+  border-radius: 11px; background: #1f2633; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1), 0 6px 14px rgba(0, 0, 0, 0.5);
+}
+.fx-card img { width: 100%; aspect-ratio: 2.14; object-fit: cover; border-radius: 7px; background: #171c26; }
+.fx-card b { font-size: 11px; font-weight: 700; }
+.fx-card small { font-size: 6.5px; color: rgba(255, 255, 255, 0.62); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fx-card code { font-family: ui-monospace, Menlo, monospace; }
+.fx-cbtn { display: flex; gap: 5px; }
+.fx-play { position: relative; flex: 1; height: 20px; }
+.fx-play span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; border-radius: 7px; font-size: 8.5px; font-weight: 700; }
+.fx-play .p { background: #4cb944; box-shadow: inset 0 0 0 1.5px #1a9fff; animation: fx-p 6s infinite; }
+.fx-play .r { background: #1a9fff; opacity: 0; animation: fx-r 6s infinite; }
+@keyframes fx-p { 0%, 30% { opacity: 1; transform: none; } 34% { opacity: 1; transform: scale(0.94); background: #63d25a; } 38%, 92% { opacity: 0; transform: none; } 96%, 100% { opacity: 1; } }
+@keyframes fx-r { 0%, 36% { opacity: 0; } 40%, 90% { opacity: 1; } 94%, 100% { opacity: 0; } }
+.fx-more { width: 20px; height: 20px; border-radius: 7px; display: grid; place-items: center; background: #171c26; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12); font-size: 9px; font-weight: 700; }
+.fx-note { position: absolute; right: 0; bottom: 2px; font: 500 9px/1 var(--mono); color: rgba(255, 255, 255, 0.45); }
+
+/* In-game toolbar, its ⋯ menu, Save Log's toast */
+.fx-tool { position: absolute; right: 6px; top: 6px; display: flex; gap: 3px; padding: 3px; border-radius: 13px; background: rgba(23, 28, 38, 0.88); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1); }
+.fx-tool i { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; background: #1f2633; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08); color: #1a9fff; }
+.fx-tool svg { width: 10px; height: 10px; }
+.fx-tool i.dots { animation: fx-hot 7s infinite; }
+@keyframes fx-hot { 0%, 12%, 40%, 100% { background: #1f2633; } 14%, 38% { background: #2c3a55; } }
+.fx-menu {
+  position: absolute; right: 6px; top: 34px; width: 134px; padding: 3px 0; border-radius: 10px;
+  background: rgba(23, 28, 38, 0.96); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  opacity: 0; animation: fx-menu 7s infinite;
+}
+@keyframes fx-menu { 0%, 14% { opacity: 0; transform: translateY(-4px); } 18%, 38% { opacity: 1; transform: none; } 42%, 100% { opacity: 0; transform: translateY(-4px); } }
+.fx-menu span { display: flex; align-items: center; gap: 6px; height: 20px; padding: 0 9px; font-size: 8.5px; font-weight: 500; }
+.fx-menu svg { width: 9px; height: 9px; flex: none; }
+.fx-menu .save { animation: fx-tap 7s infinite; }
+@keyframes fx-tap { 0%, 29%, 37%, 100% { background: transparent; } 31%, 35% { background: rgba(255, 255, 255, 0.1); } }
+.fx-menu .close { color: #d94141; }
+.fx-toast {
+  position: absolute; right: 6px; top: 34px; padding: 4px 9px; border-radius: 99px; white-space: nowrap;
+  background: rgba(23, 28, 38, 0.88); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  font-size: 8.5px; font-weight: 600; opacity: 0; animation: fx-toast 7s infinite;
+}
+@keyframes fx-toast { 0%, 42% { opacity: 0; transform: translateY(-3px); } 46%, 84% { opacity: 1; transform: none; } 90%, 100% { opacity: 0; } }
