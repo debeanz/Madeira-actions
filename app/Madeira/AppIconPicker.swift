@@ -8,7 +8,8 @@ import UIKit
 // black pointer is the primary icon. IconPreviews holds a small square of each
 // for this screen, since an app icon set can't be loaded as an image.
 // ml925: the halo designs on black in twelve liquid-glass gradients
-// (AppIcon-g-<design>-<glass>[-big]).
+// (AppIcon-g-<design>-<glass>[-big]). ml926: on the Apple Watch app icon's
+// background instead: its grey ramp and an edge lit from the top-left.
 
 enum AppIconColour: String, CaseIterable, Identifiable {
     case dark, light, games
@@ -208,7 +209,7 @@ struct AppIconPickerView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                Text("On black, each with the halo ring. Halo is the ring on its own.")
+                Text("On a graphite tile with a lit edge, each with the halo ring. Halo is the ring on its own.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LazyVGrid(columns: columns, spacing: 18) {
