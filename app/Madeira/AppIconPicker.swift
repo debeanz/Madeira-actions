@@ -14,6 +14,8 @@ import UIKit
 // and gradients remade in Liquid Composer, a web version of Apple's Icon
 // Composer (AppIcon-r-... on black, AppIcon-rw-... on graphite), in their own
 // "iOS remake" section that follows the design and background picked above.
+// ml929: the pointer size is picked per section, next to its grid: one for
+// Favourites, one for Liquid glass (which iOS remake follows too).
 
 enum AppIconColour: String, CaseIterable, Identifiable {
     case dark, light, games
@@ -207,7 +209,8 @@ struct AppIconSettingsRow: View {
 
 struct AppIconPickerView: View {
     @State private var colour: AppIconColour = .dark
-    @State private var big = false
+    @State private var favouriteBig = false     // ml929: each section has its own pointer size;
+    @State private var glassBig = false         // iOS remake follows the Liquid glass one
     @State private var glassDesign = "splithalo"
     @State private var glassBackground: AppIconBackground = .graphite
     @State private var currentName: String? = UIApplication.shared.alternateIconName
@@ -218,21 +221,15 @@ struct AppIconPickerView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Picker("Pointer size", selection: $big) {
-                    Text("Normal pointer").tag(false)
-                    Text("Bigger pointer").tag(true)
-                }
-                .pickerStyle(.segmented)
-
                 Text("Favourites")
                     .font(.headline)
-                    .padding(.top, 6)
                 Picker("Colour", selection: $colour) {
                     ForEach(AppIconColour.allCases) { c in
                         Text(c.title).tag(c)
                     }
                 }
                 .pickerStyle(.segmented)
+                sizePicker($favouriteBig)
                 LazyVGrid(columns: columns, spacing: 18) {
                     ForEach(AppIconCatalog.designs) { d in
                         favouriteTile(d)
@@ -254,6 +251,7 @@ struct AppIconPickerView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                sizePicker($glassBig)
                 Text("Each with the halo ring. Halo is the ring on its own. Graphite is the Apple Watch icon's background.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -266,7 +264,7 @@ struct AppIconPickerView: View {
                 Text("iOS remake")
                     .font(.headline)
                     .padding(.top, 10)
-                Text("The same designs and gradients rebuilt in Liquid Composer, a web version of Apple's Icon Composer, with the ring and the pointer as glass layers. Uses the design and background picked above.")
+                Text("The same designs and gradients rebuilt in Liquid Composer, a web version of Apple's Icon Composer, with the ring and the pointer as glass layers. Uses the design, background and pointer size picked above.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LazyVGrid(columns: columns, spacing: 18) {
@@ -291,26 +289,38 @@ struct AppIconPickerView: View {
         .onAppear {
             let c = AppIconCatalog.current()
             colour = c.colour
-            big = c.big
+            if c.glass.isEmpty {
+                favouriteBig = c.big
+            } else {
+                glassBig = c.big
+            }
             glassDesign = c.glassDesign
             glassBackground = c.background
             currentName = UIApplication.shared.alternateIconName
         }
     }
 
+    private func sizePicker(_ selection: Binding<Bool>) -> some View {
+        Picker("Pointer size", selection: selection) {
+            Text("Normal pointer").tag(false)
+            Text("Bigger pointer").tag(true)
+        }
+        .pickerStyle(.segmented)
+    }
+
     private func favouriteTile(_ d: AppIconDesign) -> some View {
-        let name: String? = AppIconCatalog.iconName(d.key, colour, big)
-        return tile(title: d.title, image: AppIconCatalog.previewName(d.key, colour, big), name: name)
+        let name: String? = AppIconCatalog.iconName(d.key, colour, favouriteBig)
+        return tile(title: d.title, image: AppIconCatalog.previewName(d.key, colour, favouriteBig), name: name)
     }
 
     private func glassTile(_ g: AppIconDesign) -> some View {
-        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, big, glassBackground)
-        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, big, glassBackground), name: name)
+        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, glassBig, glassBackground)
+        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, glassBig, glassBackground), name: name)
     }
 
     private func remakeTile(_ g: AppIconDesign) -> some View {
-        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, big, glassBackground, remake: true)
-        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, big, glassBackground, remake: true), name: name)
+        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, glassBig, glassBackground, remake: true)
+        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, glassBig, glassBackground, remake: true), name: name)
     }
 
     private func tile(title: String, image: String, name: String?) -> some View {
