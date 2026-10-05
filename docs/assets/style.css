@@ -697,6 +697,21 @@ body { background: #000; font-size: 16px; }
 .hero .cta { justify-content: center; }
 .hero .fineprint { font: 400 12px/1.5 var(--mono); }
 .device-stage { width: min(820px, 100%); }
+/* The phone shows the app, so it keeps the app's own colours and font
+   (LauncherPalette: #0E1117 -> #06080C, #171C26 panels, #1F2633 card),
+   whatever the site's theme sets for the rest of the page. */
+.device-screen {
+  --bg-top: #0e1117;
+  --bg-bottom: #06080c;
+  --panel: #171c26;
+  --panel-raised: #1f2633;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --text: #ffffff;
+  --text-2: rgba(255, 255, 255, 0.62);
+  --text-3: rgba(255, 255, 255, 0.42);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
 .device-stage::after { background: radial-gradient(closest-side, rgba(255, 255, 255, 0.06), transparent); }
 .device { transform: rotateX(var(--tx, 5deg)) rotateY(var(--ty, 0deg)); }
 .hero-facts {
