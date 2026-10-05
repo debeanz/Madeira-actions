@@ -125,8 +125,9 @@ final class GameLibrary: ObservableObject {
     @Published private(set) var gameSettings: [String: GameSettings] = [:]
     /// ml893: game ids pinned to the top of the Games tab.
     @Published private(set) var favorites: Set<String> = []
-    /// ml919: DirectX 12 games started in their DirectX 11 mode (-dx11).
-    @Published private(set) var dx11Games: Set<String> = []
+    /// ml919: a DirectX 12 game's DirectX 11 mode (-dx11). ml920: on by
+    /// default, so this holds the games whose switch was turned OFF.
+    @Published private(set) var dx11OffGames: Set<String> = []
     /// ml893: seconds played per game id (from the game's start to its end).
     @Published private(set) var playSeconds: [String: Double] = [:]
     /// ml893: each game's folder size, measured when the Games tab sorts by size.
@@ -137,7 +138,8 @@ final class GameLibrary: ObservableObject {
         GameLibrary.dropRemovedValues()   // ml899, ml901
         gameSettings = GameLibrary.loadGameSettings()
         favorites = Set(defaults.stringArray(forKey: GameLibrary.favoritesKey) ?? [])
-        dx11Games = Set(defaults.stringArray(forKey: GameLibrary.dx11GamesKey) ?? [])   // ml919
+        dx11OffGames = Set(defaults.stringArray(forKey: GameLibrary.dx11OffKey) ?? [])   // ml920
+        defaults.removeObject(forKey: "madeira.launcher.dx11Games")   // ml919's list of games turned on
         if let raw = defaults.dictionary(forKey: GameLibrary.playSecondsKey) {
             var out: [String: Double] = [:]
             for (k, v) in raw {
@@ -406,7 +408,7 @@ final class GameLibrary: ObservableObject {
             d3d11Cache[exe.path] = probed
         }
         // ml919: a DirectX 12 game started in its DirectX 11 mode draws with D3D11 too.
-        return probed || (dx11Games.contains(g.id) && drawsWithDirect3D12(g))
+        return probed || (forcesDirectX11(g.id) && drawsWithDirect3D12(g))
     }
 
     // MARK: Direct3D 12 (ml919)
@@ -862,7 +864,7 @@ final class GameLibrary: ObservableObject {
         if h.remove(id) != nil { hidden = h }
         // ml893
         if favorites.contains(id) { toggleFavorite(id) }
-        if dx11Games.contains(id) { setForceDirectX11(false, for: id) }   // ml919
+        if dx11OffGames.contains(id) { setForceDirectX11(true, for: id) }   // ml919/ml920: forget it
         if playSeconds[id] != nil {
             playSeconds[id] = nil
             UserDefaults.standard.set(playSeconds, forKey: GameLibrary.playSecondsKey)
@@ -1554,18 +1556,21 @@ extension GameLibrary {
 
     // ml919: DirectX 11 mode, per game. Its own switch, not one of the settings
     // "Override Madeira settings" governs: Madeira has no DirectX 12 games
-    // setting to override.
-    static let dx11GamesKey = "madeira.launcher.dx11Games"
+    // setting to override. ml920: on by default (Madeira can't run DirectX 12),
+    // so what is stored is the games it was turned off for.
+    static let dx11OffKey = "madeira.launcher.dx11Off"
 
-    func forcesDirectX11(_ id: String) -> Bool { dx11Games.contains(id) }
+    /// Whether the game starts in its DirectX 11 mode if it is a DirectX 12
+    /// one (callers check drawsWithDirect3D12).
+    func forcesDirectX11(_ id: String) -> Bool { !dx11OffGames.contains(id) }
 
     /// Start a DirectX 12 game with -dx11, or not. Main thread.
     func setForceDirectX11(_ on: Bool, for id: String) {
-        var s = dx11Games
-        if on { s.insert(id) } else { s.remove(id) }
-        guard s != dx11Games else { return }
-        dx11Games = s
-        UserDefaults.standard.set(s.sorted(), forKey: GameLibrary.dx11GamesKey)
+        var s = dx11OffGames
+        if on { s.remove(id) } else { s.insert(id) }
+        guard s != dx11OffGames else { return }
+        dx11OffGames = s
+        UserDefaults.standard.set(s.sorted(), forKey: GameLibrary.dx11OffKey)
     }
 
     /// "3 h 20 min" / "12 min"; nil under a minute.
@@ -1781,9 +1786,17 @@ enum GraphicsProbe {
     /// root exe only starts) imports d3d12.dll -- delay-loaded counts, Unreal
     /// delay-loads its renderers -- or the D3D12 Agility SDK ships with it
     /// (D3D12/D3D12Core.dll).
+    ///
+    /// ml920: a Unity game counts only when it ships the Agility SDK (D3D12 in
+    /// its Graphics APIs). Its UnityPlayer.dll may name d3d12.dll among its
+    /// imports while the game draws with D3D11 -- and the DirectX 11 mode is
+    /// on by default, so a D3D11 game must never be taken for one.
     static func usesDirect3D12(exe: URL) -> Bool {
         let fm = FileManager.default
         let dir = exe.deletingLastPathComponent()
+        if GameResolutionDefault.isUnity(exe: exe) {
+            return fm.fileExists(atPath: dir.appendingPathComponent("D3D12/D3D12Core.dll").path)
+        }
         var folders: [URL] = [dir]
         for s in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] {
             let win64: URL = dir.appendingPathComponent(s).appendingPathComponent("Binaries/Win64")

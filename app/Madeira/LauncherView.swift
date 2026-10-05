@@ -1557,7 +1557,7 @@ private struct OptionsSheet: View {
         }
         // ml919: a DirectX 12 game's DirectX 11 mode, started with -dx11. The
         // game's own switch (Madeira has no setting for it to override);
-        // applies at the next launch.
+        // applies at the next launch. ml920: on until it is turned off.
         if library.drawsWithDirect3D12(g) {
             let dx11On: Bool = library.forcesDirectX11(g.id)
             let busy: Bool = busyGameIDs.contains(g.id)
