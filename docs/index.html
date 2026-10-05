@@ -25,7 +25,6 @@
     <nav class="nav-links" aria-label="Main">
       <a href="games.html">Compatibility</a>
       <a class="hide-s" href="#how">How it works</a>
-      <a class="hide-s" href="#install">Install</a>
       <a class="nav-gh" href="https://github.com/debeanz/Madeira-actions">
         <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
         GitHub
@@ -55,7 +54,6 @@
             <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.14v13.72a1 1 0 0 0 1.52.85l11-6.86a1 1 0 0 0 0-1.7l-11-6.86A1 1 0 0 0 8 5.14z"/></svg>
             See what runs
           </a>
-          <a class="btn btn-ghost" href="#install">Install guide</a>
         </div>
         <p class="fineprint">A research project — free and open source (GPL-3.0). Expect rough edges and per-game quirks.</p>
       </div>
@@ -245,48 +243,6 @@
     </div>
   </section>
 
-  <!-- ── Install ──────────────────────────────────────────────────────── -->
-  <section class="section" id="install">
-    <div class="wrap">
-      <div class="section-head reveal">
-        <span class="eyebrow">Install</span>
-        <h2 class="h2">Four steps to your first game</h2>
-        <p class="section-lede">
-          Games need JIT to run at speed, and iOS only allows it while a debugger is
-          attached — so Madeira can't be on the App Store. You sideload it.
-        </p>
-      </div>
-
-      <div class="steps">
-        <div class="step reveal" style="--d:0">
-          <h3>Get the app</h3>
-          <p>Every change is built by GitHub Actions. Download the newest <code>Madeira-0.1.x</code> artifact from the repository's <a href="https://github.com/debeanz/Madeira-actions/actions">Actions</a> tab while signed in to GitHub.</p>
-        </div>
-        <div class="step reveal" style="--d:1">
-          <h3>Sideload it</h3>
-          <p>Install the IPA with your Apple ID. A free account works, but it expires after 7 days — reinstalling keeps your games and saves.</p>
-        </div>
-        <div class="step reveal" style="--d:2">
-          <h3>Turn on JIT</h3>
-          <p>Install <a href="https://github.com/0-Blu/StikJIT">StikDebug</a>. When you start a game, Madeira asks it to attach.</p>
-        </div>
-        <div class="step reveal" style="--d:3">
-          <h3>Add a game</h3>
-          <p>In the Files app, put each game in its own folder on the C: drive — <code>Madeira › wine › drive_c</code>. It shows up in the Games tab.</p>
-        </div>
-      </div>
-
-      <div class="limits reveal">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
-        <ul>
-          <li><b>It's a research project.</b> Plenty of games run; some run slowly or not at all. Check the compatibility list first.</li>
-          <li><b>Direct3D only.</b> Games that need OpenGL or Vulkan don't run yet.</li>
-          <li><b>Bring your own games.</b> Madeira ships no games and no copy of Windows — you copy in games you own.</li>
-        </ul>
-      </div>
-    </div>
-  </section>
-
   <!-- ── FAQ ──────────────────────────────────────────────────────────── -->
   <section class="section" id="faq" style="padding-top:24px">
     <div class="wrap">
@@ -296,16 +252,44 @@
       </div>
       <div class="faq reveal">
         <details>
+          <summary>How can an iPhone run Windows games at all?</summary>
+          <p>Three translators work together inside one app. Wine answers the game's calls to Windows, FEX converts its x86 code to ARM64 while it runs, and DXMT turns its Direct3D graphics into Metal, which the iPhone's GPU draws. Even Wine's server runs as a thread inside the app.</p>
+        </details>
+        <details>
           <summary>Does it need a jailbreak?</summary>
           <p>No. It's an ordinary sideloaded app. The one special requirement is JIT, which StikDebug provides by attaching as a debugger.</p>
+        </details>
+        <details>
+          <summary>Why JIT, and why isn't it on the App Store?</summary>
+          <p>FEX writes new ARM64 code while the game runs, and iOS only lets an app do that while a debugger is attached. App Store apps can't have one, so Madeira is sideloaded and StikDebug attaches for it.</p>
         </details>
         <details>
           <summary>Which games work?</summary>
           <p>The <a href="games.html">compatibility list</a> has what players have reported. Direct3D 11 games are the best bet — Unity games like Untitled Goose Game run, and so does Undertale, a 32-bit GameMaker game.</p>
         </details>
         <details>
+          <summary>What about DirectX 12, OpenGL and Vulkan?</summary>
+          <p>Madeira draws with Direct3D 11 and Direct3D 9. Many DirectX 12 games also have a DirectX 11 mode, and Madeira starts them in it automatically. Games that only use DirectX 12, OpenGL or Vulkan don't run yet.</p>
+        </details>
+        <details>
+          <summary>How fast does it run?</summary>
+          <p>It depends on the game. Untitled Goose Game holds 60 fps on an iPhone 15 Pro Max, while bigger 3D games are limited by the iPhone's GPU. Every game has its own resolution and frame-rate cap, and DirectX 11 games can use MetalFX upscaling for a sharper picture.</p>
+        </details>
+        <details>
+          <summary>Can I play with a controller?</summary>
+          <p>Yes. Bluetooth controllers reach games as an Xbox controller, in 64-bit and 32-bit games alike, and for games without controller support each button can send a key instead. No controller? Use the on-screen Xbox pad, or a keyboard layout you arrange yourself.</p>
+        </details>
+        <details>
+          <summary>Do I need a copy of Windows?</summary>
+          <p>No. Wine stands in for Windows, so nothing from Microsoft is installed. Madeira ships no games either — you copy in games you own.</p>
+        </details>
+        <details>
           <summary>Where do my saves go?</summary>
           <p>Inside the app, in its Wine prefix — the same place a Windows PC would keep them. They survive reinstalling Madeira.</p>
+        </details>
+        <details>
+          <summary>Why does my iPhone get hot?</summary>
+          <p>A PC game works the phone hard. After a few minutes of a heavy game it warms up, and iOS slows the chip down to cool it, which can lower the frame rate. A lower resolution or a 30 fps cap keeps it cooler.</p>
         </details>
         <details>
           <summary>A game crashed. What now?</summary>
