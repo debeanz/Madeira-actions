@@ -1555,6 +1555,19 @@ private struct OptionsSheet: View {
                                           model.highlight = 0
                                       }))
         }
+        // ml919: a DirectX 12 game's DirectX 11 mode, started with -dx11. The
+        // game's own switch (Madeira has no setting for it to override);
+        // applies at the next launch.
+        if library.drawsWithDirect3D12(g) {
+            let dx11On: Bool = library.forcesDirectX11(g.id)
+            let busy: Bool = busyGameIDs.contains(g.id)
+            gameRows.append(OptionRow(id: "dx11", title: "DirectX 11 mode", systemImage: "cube",
+                                      destructive: false, checked: false,
+                                      disabled: busy,
+                                      note: "Starts the game with -dx11. Madeira can't run DirectX 12, so use this when the game also has a DirectX 11 mode.",
+                                      switchOn: dx11On,
+                                      action: { library.setForceDirectX11(!dx11On, for: g.id) }))
+        }
         gameRows.append(OptionRow(id: "rename", title: "Rename", systemImage: "pencil",
                                   destructive: false, checked: false,
                                   action: {

@@ -2307,7 +2307,8 @@ struct ContentView: View {
         }
         setenv("MADEIRA_SCREEN_W", String(screenW0), 1)
         setenv("MADEIRA_SCREEN_H", String(screenH0), 1)
-        let launchInSession: (String) -> Void = { args in
+        // ml919: resArgs = Unity's screen options (or ""), extraArgs = -dx11 (or "").
+        let launchInSession: (String, String) -> Void = { resArgs, extraArgs in
             // ml830: this game's own shader cache (or "off") goes to the agent with
             // the launch, because the runtime's environment was fixed when it started.
             let cache = ShaderCache.launchValue(for: game)
@@ -2317,11 +2318,15 @@ struct ContentView: View {
                          + ", TSO emulation " + (effectiveNoTSO ? "off" : "on")
                          + (perGame.noTSO != nil ? " for this game" : "")
                          + (monoSuspend.map { ", 32-bit .NET: MONO_THREADS_SUSPEND=\($0)" } ?? "") + ")")
-            if !args.isEmpty {
+            if !resArgs.isEmpty {
                 logStore.log("Games: \(game.title) — "
                              + (perGame.resolutionChosen == true ? "this game's resolution" : "first launch")
-                             + " \(screenW0)x\(screenH0) (Unity: \(args))")
+                             + " \(screenW0)x\(screenH0) (Unity: \(resArgs))")
             }
+            if !extraArgs.isEmpty {
+                logStore.log("Games: \(game.title) — DirectX 11 mode: " + extraArgs)
+            }
+            let args: String = resArgs.isEmpty ? extraArgs : (extraArgs.isEmpty ? resArgs : resArgs + " " + extraArgs)
             // ml837: args = GameResolutionDefault's Unity screen options, or "".
             SessionLauncher.shared.launch(exe: exePath, dir: game.dirWindowsPath, args: args, shaderCache: cache,
                                           noTSO: effectiveNoTSO, monoSuspend: monoSuspend,
@@ -2387,6 +2392,9 @@ struct ContentView: View {
                 // ml837: a Unity game with no saved resolution starts at the Settings
                 // size. Decided off main: it reads app.info and the prefix's user.reg.
                 let lastPlayed = GameLibrary.shared.game(withID: game.id)?.lastPlayed ?? game.lastPlayed
+                // ml919: this DirectX 12 game's DirectX 11 mode, if switched on.
+                let dx11Mode: Bool = GameLibrary.shared.forcesDirectX11(game.id)
+                    && GameLibrary.shared.drawsWithDirect3D12(game)
                 DispatchQueue.global(qos: .userInitiated).async {
                     var probe = game
                     probe.lastPlayed = lastPlayed
@@ -2398,10 +2406,17 @@ struct ContentView: View {
                     } else {
                         args = GameResolutionDefault.launchArgs(for: probe, width: screenW0, height: screenH0)
                     }
+                    // ml919: -dx11 (Unreal and most engines); Unity's own spelling too.
+                    let extra: String
+                    if dx11Mode, let exe = probe.exe {
+                        extra = GameResolutionDefault.isUnity(exe: exe) ? "-dx11 -force-d3d11" : "-dx11"
+                    } else {
+                        extra = ""
+                    }
                     DispatchQueue.main.async {
                         guard case .launching(let t2) = launcherSession, t2 == game.title,
                               launchingGame?.id == game.id else { return }
-                        launchInSession(args)
+                        launchInSession(args, extra)
                     }
                 }
             }

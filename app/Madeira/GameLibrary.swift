@@ -125,6 +125,8 @@ final class GameLibrary: ObservableObject {
     @Published private(set) var gameSettings: [String: GameSettings] = [:]
     /// ml893: game ids pinned to the top of the Games tab.
     @Published private(set) var favorites: Set<String> = []
+    /// ml919: DirectX 12 games started in their DirectX 11 mode (-dx11).
+    @Published private(set) var dx11Games: Set<String> = []
     /// ml893: seconds played per game id (from the game's start to its end).
     @Published private(set) var playSeconds: [String: Double] = [:]
     /// ml893: each game's folder size, measured when the Games tab sorts by size.
@@ -135,6 +137,7 @@ final class GameLibrary: ObservableObject {
         GameLibrary.dropRemovedValues()   // ml899, ml901
         gameSettings = GameLibrary.loadGameSettings()
         favorites = Set(defaults.stringArray(forKey: GameLibrary.favoritesKey) ?? [])
+        dx11Games = Set(defaults.stringArray(forKey: GameLibrary.dx11GamesKey) ?? [])   // ml919
         if let raw = defaults.dictionary(forKey: GameLibrary.playSecondsKey) {
             var out: [String: Double] = [:]
             for (k, v) in raw {
@@ -395,9 +398,29 @@ final class GameLibrary: ObservableObject {
     /// Direct3D 11). Probed once per executable, from its folder's files.
     func drawsWithDirect3D11(_ g: LauncherGame) -> Bool {
         guard let exe = g.exe else { return false }
-        if let known = d3d11Cache[exe.path] { return known }
-        let found: Bool = GraphicsProbe.usesDirect3D11(exe: exe)
-        d3d11Cache[exe.path] = found
+        let probed: Bool
+        if let known = d3d11Cache[exe.path] {
+            probed = known
+        } else {
+            probed = GraphicsProbe.usesDirect3D11(exe: exe)
+            d3d11Cache[exe.path] = probed
+        }
+        // ml919: a DirectX 12 game started in its DirectX 11 mode draws with D3D11 too.
+        return probed || (dx11Games.contains(g.id) && drawsWithDirect3D12(g))
+    }
+
+    // MARK: Direct3D 12 (ml919)
+
+    /// Per exe path: whether the game draws with Direct3D 12. Main thread.
+    private var d3d12Cache: [String: Bool] = [:]
+
+    /// ml919: whether the game is a DirectX 12 one, so its ⋯ menu offers the
+    /// DirectX 11 mode (-dx11). Probed once per executable.
+    func drawsWithDirect3D12(_ g: LauncherGame) -> Bool {
+        guard let exe = g.exe else { return false }
+        if let known = d3d12Cache[exe.path] { return known }
+        let found: Bool = GraphicsProbe.usesDirect3D12(exe: exe)
+        d3d12Cache[exe.path] = found
         return found
     }
 
@@ -839,6 +862,7 @@ final class GameLibrary: ObservableObject {
         if h.remove(id) != nil { hidden = h }
         // ml893
         if favorites.contains(id) { toggleFavorite(id) }
+        if dx11Games.contains(id) { setForceDirectX11(false, for: id) }   // ml919
         if playSeconds[id] != nil {
             playSeconds[id] = nil
             UserDefaults.standard.set(playSeconds, forKey: GameLibrary.playSecondsKey)
@@ -1528,6 +1552,22 @@ extension GameLibrary {
         UserDefaults.standard.set(f.sorted(), forKey: GameLibrary.favoritesKey)
     }
 
+    // ml919: DirectX 11 mode, per game. Its own switch, not one of the settings
+    // "Override Madeira settings" governs: Madeira has no DirectX 12 games
+    // setting to override.
+    static let dx11GamesKey = "madeira.launcher.dx11Games"
+
+    func forcesDirectX11(_ id: String) -> Bool { dx11Games.contains(id) }
+
+    /// Start a DirectX 12 game with -dx11, or not. Main thread.
+    func setForceDirectX11(_ on: Bool, for id: String) {
+        var s = dx11Games
+        if on { s.insert(id) } else { s.remove(id) }
+        guard s != dx11Games else { return }
+        dx11Games = s
+        UserDefaults.standard.set(s.sorted(), forKey: GameLibrary.dx11GamesKey)
+    }
+
     /// "3 h 20 min" / "12 min"; nil under a minute.
     static func playTimeText(_ seconds: Double) -> String? {
         let minutes = Int(seconds / 60)
@@ -1736,9 +1776,36 @@ enum GraphicsProbe {
         return false
     }
 
+    /// ml919: a game that draws with Direct3D 12: the exe, a DLL beside it, or
+    /// an Unreal Engine game's real exe (<Project>/Binaries/Win64, which the
+    /// root exe only starts) imports d3d12.dll -- delay-loaded counts, Unreal
+    /// delay-loads its renderers -- or the D3D12 Agility SDK ships with it
+    /// (D3D12/D3D12Core.dll).
+    static func usesDirect3D12(exe: URL) -> Bool {
+        let fm = FileManager.default
+        let dir = exe.deletingLastPathComponent()
+        var folders: [URL] = [dir]
+        for s in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] {
+            let win64: URL = dir.appendingPathComponent(s).appendingPathComponent("Binaries/Win64")
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: win64.path, isDirectory: &isDir), isDir.boolValue { folders.append(win64) }
+        }
+        var binaries: [URL] = [exe]
+        for f in folders {
+            if fm.fileExists(atPath: f.appendingPathComponent("D3D12/D3D12Core.dll").path) { return true }
+            for n in (try? fm.contentsOfDirectory(atPath: f.path)) ?? [] {
+                let l: String = n.lowercased()
+                if l.hasSuffix(".exe") || l.hasSuffix(".dll") { binaries.append(f.appendingPathComponent(n)) }
+            }
+        }
+        for b in binaries where importedDLLs(b, delayLoaded: true).contains("d3d12.dll") { return true }
+        return false
+    }
+
     /// The DLLs a PE file imports (lower-cased); [] when it is not a PE file.
     /// Mapped, not read: UnityPlayer.dll is tens of MB and only its headers matter.
-    static func importedDLLs(_ url: URL) -> [String] {
+    /// ml919: delayLoaded adds the delay-load imports (Direct3D 12 detection).
+    static func importedDLLs(_ url: URL, delayLoaded: Bool = false) -> [String] {
         guard let d = try? Data(contentsOf: url, options: .alwaysMapped), d.count > 0x40 else { return [] }
         let base: Int = d.startIndex
         func u16(_ o: Int) -> Int {
@@ -1759,7 +1826,8 @@ enum GraphicsProbe {
         let opt: Int = pe + 24
         let dirs: Int = opt + (u16(opt) == 0x20B ? 112 : 96)
         let importRVA: Int = u32(dirs + 8)
-        guard importRVA > 0, sectionCount > 0, sectionCount < 100 else { return [] }
+        let delayRVA: Int = delayLoaded ? u32(dirs + 13 * 8) : 0
+        guard importRVA > 0 || delayRVA > 0, sectionCount > 0, sectionCount < 100 else { return [] }
         var vas: [Int] = [], sizes: [Int] = [], raws: [Int] = []
         let table: Int = opt + optSize
         for i in 0..<sectionCount {
@@ -1774,12 +1842,8 @@ enum GraphicsProbe {
             }
             return nil
         }
-        guard var entry = fileOffset(importRVA) else { return [] }
-        var out: [String] = []
-        for _ in 0..<256 {
-            let nameRVA: Int = u32(entry + 12)
-            if nameRVA <= 0 { break }
-            guard let at = fileOffset(nameRVA) else { break }
+        func name(at rva: Int) -> String? {
+            guard let at = fileOffset(rva) else { return nil }
             var bytes: [UInt8] = []
             var p: Int = at
             while p >= 0, p < d.count, bytes.count < 64 {
@@ -1788,8 +1852,27 @@ enum GraphicsProbe {
                 bytes.append(b)
                 p += 1
             }
-            out.append(String(decoding: bytes, as: UTF8.self).lowercased())
-            entry += 20
+            return String(decoding: bytes, as: UTF8.self).lowercased()
+        }
+        var out: [String] = []
+        if importRVA > 0, var entry = fileOffset(importRVA) {
+            for _ in 0..<256 {
+                let nameRVA: Int = u32(entry + 12)
+                if nameRVA <= 0 { break }
+                guard let n = name(at: nameRVA) else { break }
+                out.append(n)
+                entry += 20
+            }
+        }
+        // ml919: IMAGE_DELAYLOAD_DESCRIPTOR, 32 bytes, DllNameRVA at +4 (RVA
+        // based when Attributes bit 0 is set, as every current linker writes).
+        if delayRVA > 0, var entry = fileOffset(delayRVA) {
+            for _ in 0..<256 {
+                let nameRVA: Int = u32(entry + 4)
+                if nameRVA <= 0 { break }
+                if u32(entry) & 1 == 1, let n = name(at: nameRVA) { out.append(n) }
+                entry += 32
+            }
         }
         return out
     }
