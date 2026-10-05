@@ -8,8 +8,9 @@ import UIKit
 // black pointer is the primary icon. IconPreviews holds a small square of each
 // for this screen, since an app icon set can't be loaded as an image.
 // ml925: the halo designs on black in twelve liquid-glass gradients
-// (AppIcon-g-<design>-<glass>[-big]). ml926: on the Apple Watch app icon's
-// background instead: its grey ramp and an edge lit from the top-left.
+// (AppIcon-g-<design>-<glass>[-big]). ml927: and on the Apple Watch app icon's
+// background, its grey ramp and an edge lit from the top-left
+// (AppIcon-gw-...), with a Black / Graphite choice.
 
 enum AppIconColour: String, CaseIterable, Identifiable {
     case dark, light, games
@@ -21,6 +22,21 @@ enum AppIconColour: String, CaseIterable, Identifiable {
         case .dark: return "Black"
         case .light: return "White"
         case .games: return "Navy"
+        }
+    }
+}
+
+/// ml927: the tile behind the liquid-glass designs; the raw value starts the asset name.
+enum AppIconBackground: String, CaseIterable, Identifiable {
+    case black = "g"
+    case graphite = "gw"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .black: return "Black"
+        case .graphite: return "Graphite"
         }
     }
 }
@@ -77,8 +93,8 @@ enum AppIconCatalog {
         return key + "-" + colour.rawValue + (big ? "-big" : "")
     }
 
-    static func glassTag(_ design: String, _ glass: String, _ big: Bool) -> String {
-        return "g-" + design + "-" + glass + (big ? "-big" : "")
+    static func glassTag(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground) -> String {
+        return background.rawValue + "-" + design + "-" + glass + (big ? "-big" : "")
     }
 
     /// nil is the primary icon: the plain pointer, black, normal size.
@@ -91,12 +107,12 @@ enum AppIconCatalog {
         return "IconPreview-" + tag(key, colour, big)
     }
 
-    static func glassIconName(_ design: String, _ glass: String, _ big: Bool) -> String {
-        return "AppIcon-" + glassTag(design, glass, big)
+    static func glassIconName(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground) -> String {
+        return "AppIcon-" + glassTag(design, glass, big, background)
     }
 
-    static func glassPreviewName(_ design: String, _ glass: String, _ big: Bool) -> String {
-        return "IconPreview-" + glassTag(design, glass, big)
+    static func glassPreviewName(_ design: String, _ glass: String, _ big: Bool, _ background: AppIconBackground) -> String {
+        return "IconPreview-" + glassTag(design, glass, big, background)
     }
 
     static func title(of key: String, in list: [AppIconDesign]) -> String {
@@ -110,6 +126,7 @@ enum AppIconCatalog {
         var design = "normal"           // a favourite, or ""
         var glassDesign = "splithalo"
         var glass = ""                  // set when a glass icon is in use
+        var background: AppIconBackground = .graphite
     }
 
     static func current() -> Current {
@@ -120,12 +137,13 @@ enum AppIconCatalog {
             c.big = true
             rest = String(rest.dropLast(4))
         }
-        if rest.hasPrefix("g-") {
-            let parts = rest.dropFirst(2).split(separator: "-")
+        for background in AppIconBackground.allCases where rest.hasPrefix(background.rawValue + "-") {
+            let parts = rest.dropFirst(background.rawValue.count + 1).split(separator: "-")
             if parts.count == 2 {
                 c.design = ""
                 c.glassDesign = String(parts[0])
                 c.glass = String(parts[1])
+                c.background = background
             }
             return c
         }
@@ -141,7 +159,7 @@ enum AppIconCatalog {
         let size = c.big ? " · Bigger" : ""
         if !c.glass.isEmpty {
             let design = c.glassDesign == "halo" ? "Halo" : title(of: c.glassDesign, in: glassDesigns) + " + Halo"
-            return design + " · " + title(of: c.glass, in: glasses) + size
+            return design + " · " + title(of: c.glass, in: glasses) + " · " + c.background.title + size
         }
         return title(of: c.design, in: designs) + " · " + c.colour.title + size
     }
@@ -171,6 +189,7 @@ struct AppIconPickerView: View {
     @State private var colour: AppIconColour = .dark
     @State private var big = false
     @State private var glassDesign = "splithalo"
+    @State private var glassBackground: AppIconBackground = .graphite
     @State private var currentName: String? = UIApplication.shared.alternateIconName
     @State private var errorText: String?
 
@@ -209,7 +228,13 @@ struct AppIconPickerView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                Text("On a graphite tile with a lit edge, each with the halo ring. Halo is the ring on its own.")
+                Picker("Background", selection: $glassBackground) {
+                    ForEach(AppIconBackground.allCases) { b in
+                        Text(b.title).tag(b)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text("Each with the halo ring. Halo is the ring on its own. Graphite is the Apple Watch icon's background.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LazyVGrid(columns: columns, spacing: 18) {
@@ -236,6 +261,7 @@ struct AppIconPickerView: View {
             colour = c.colour
             big = c.big
             glassDesign = c.glassDesign
+            glassBackground = c.background
             currentName = UIApplication.shared.alternateIconName
         }
     }
@@ -246,8 +272,8 @@ struct AppIconPickerView: View {
     }
 
     private func glassTile(_ g: AppIconDesign) -> some View {
-        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, big)
-        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, big), name: name)
+        let name: String? = AppIconCatalog.glassIconName(glassDesign, g.key, big, glassBackground)
+        return tile(title: g.title, image: AppIconCatalog.glassPreviewName(glassDesign, g.key, big, glassBackground), name: name)
     }
 
     private func tile(title: String, image: String, name: String?) -> some View {
