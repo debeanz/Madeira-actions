@@ -3616,11 +3616,6 @@ struct ContentView: View {
                     }
                 }
 
-                // ml924: try the icon designs without installing a new build
-                Section {
-                    AppIconSettingsRow()
-                }
-
                 // ml908: no Emulation section; Diagnostics (logging for a problem
                 // report) sits in About, above the version a report asks for.
                 Section("About") {
